@@ -15,7 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/appdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 )
 
 // Call is one model call as an agent's own session file records it.

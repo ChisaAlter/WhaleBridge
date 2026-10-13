@@ -1,4 +1,4 @@
-module github.com/yetone/magpie
+module github.com/ChisaAlter/WhaleBridge
 
 go 1.26.3
 

@@ -5,7 +5,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/yetone/magpie/internal/appdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 )
 
 // Migrate carries the files of an install that predates the name over:

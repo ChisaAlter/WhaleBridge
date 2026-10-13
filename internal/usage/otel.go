@@ -15,9 +15,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/yetone/magpie/internal/netproxy"
-	"github.com/yetone/magpie/internal/sessions"
-	"github.com/yetone/magpie/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/netproxy"
+	"github.com/ChisaAlter/WhaleBridge/internal/sessions"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 const otelQueueSize = 128

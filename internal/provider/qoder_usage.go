@@ -16,7 +16,7 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/yetone/magpie/internal/qoder"
+	"github.com/ChisaAlter/WhaleBridge/internal/qoder"
 )
 
 // Account endpoints use the device token, independently of the chat job token.

@@ -32,7 +32,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/yetone/magpie/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 )
 
 type zcodeBuiltin struct {

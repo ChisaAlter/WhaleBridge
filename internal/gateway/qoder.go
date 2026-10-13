@@ -24,8 +24,8 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
-	"github.com/yetone/magpie/internal/provider"
-	"github.com/yetone/magpie/internal/qoder"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/qoder"
 )
 
 // A Qoder subscription is served through the API the Qoder client talks to

@@ -46,7 +46,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // cursorToken and cursorVersion are the sign-in and the CLI version the

@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
-	"github.com/yetone/magpie/internal/sessions"
+	"github.com/ChisaAlter/WhaleBridge/internal/sessions"
 )
 
 // TitleLink contains only fingerprints. Native request IDs and account affinity

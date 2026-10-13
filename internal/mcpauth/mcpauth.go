@@ -34,10 +34,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/edit"
-	"github.com/yetone/magpie/internal/netproxy"
-	"github.com/yetone/magpie/internal/settings"
-	"github.com/yetone/magpie/internal/steady"
+	"github.com/ChisaAlter/WhaleBridge/internal/edit"
+	"github.com/ChisaAlter/WhaleBridge/internal/netproxy"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/steady"
 )
 
 // Client makes the sign-in's requests, through the proxy magpie's others

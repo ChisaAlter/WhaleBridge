@@ -5,9 +5,9 @@ import (
 	"reflect"
 	"time"
 
-	"github.com/yetone/magpie/internal/redact"
-	"github.com/yetone/magpie/internal/sessions"
-	"github.com/yetone/magpie/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/redact"
+	"github.com/ChisaAlter/WhaleBridge/internal/sessions"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 type sessionAvailability struct {

@@ -1,6 +1,6 @@
 package gateway
 
-import "github.com/yetone/magpie/internal/provider"
+import "github.com/ChisaAlter/WhaleBridge/internal/provider"
 
 // usageEncoder reads the encoder's chosen ID after it starts writing. Upstream
 // IDs can be absent or acquire a protocol prefix, so KStart.MsgID is not enough.

@@ -3,8 +3,8 @@ package gateway
 import (
 	"context"
 	"encoding/json"
-	"github.com/yetone/magpie/internal/plugin"
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"io"
 	"net/http"
 	"net/http/httptest"

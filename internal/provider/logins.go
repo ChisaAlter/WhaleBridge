@@ -25,11 +25,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/appdir"
-	"github.com/yetone/magpie/internal/edit"
-	"github.com/yetone/magpie/internal/filememo"
-	"github.com/yetone/magpie/internal/plugin"
-	"github.com/yetone/magpie/internal/steady"
+	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/edit"
+	"github.com/ChisaAlter/WhaleBridge/internal/filememo"
+	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
+	"github.com/ChisaAlter/WhaleBridge/internal/steady"
 )
 
 // Login is a remembered subscription account, without its secrets.

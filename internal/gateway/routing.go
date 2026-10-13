@@ -22,7 +22,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // usageHalfLife is how fast the tokens a key served stop counting against

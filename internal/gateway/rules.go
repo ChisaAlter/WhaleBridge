@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // ruleClock is the time a turn's rules look at (a rule's hours), and its

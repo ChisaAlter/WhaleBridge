@@ -4,7 +4,7 @@ import (
 	"math"
 	"testing"
 
-	"github.com/yetone/magpie/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 )
 
 func TestRecordPricePreservesCacheDurationAndContextTier(t *testing.T) {

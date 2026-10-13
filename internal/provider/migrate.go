@@ -39,9 +39,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/filememo"
-	"github.com/yetone/magpie/internal/plugin"
-	"github.com/yetone/magpie/internal/update"
+	"github.com/ChisaAlter/WhaleBridge/internal/filememo"
+	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
+	"github.com/ChisaAlter/WhaleBridge/internal/update"
 )
 
 // A migration's states.

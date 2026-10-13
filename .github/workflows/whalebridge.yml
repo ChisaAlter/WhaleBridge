@@ -1,0 +1,62 @@
+name: WhaleBridge
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: whalebridge-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020
+        with:
+          node-version-file: .nvmrc
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - run: node scripts/build.mjs
+      - run: go test -mod=readonly ./internal/catalog ./internal/settings ./internal/provider ./internal/usage ./internal/gateway ./internal/whalebridge
+      - run: go test -mod=readonly ./internal/agent -run '^(TestReasonixGatewayAndRestore|TestReasonixRestoreKeepsLaterUserEdits|TestReasonixConflictsAndReadErrorsLeaveFiles|TestReasonixRestoresAbsentAndEmptyDefault|TestAsideOfflineDisconnectRestoresWithoutDaemon|TestAsideOfflineImageRestoresFullSavedObject|TestAsideBrokenProviderFileIsNeverOverwritten)$'
+      - run: node scripts/qa-native.mjs
+      - run: npm install --global pnpm@11.25.0
+      - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: node node_modules/electron/install.js
+      - run: pnpm test:web
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        with:
+          name: WhaleBridge-windows-x64
+          path: .tmp/whalebridge-package/*
+          if-no-files-found: error
+          retention-days: 30
+  publish:
+    needs: windows
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request' && github.repository == 'ChisaAlter/WhaleBridge'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+        with:
+          name: WhaleBridge-windows-x64
+          path: component
+      - name: Publish component version once
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(node -p 'require("./component/WhaleBridge-component.json").version')
+          tag="whalebridge-v$version"
+          if gh release view "$tag" --json tagName >/dev/null 2>&1; then
+            echo "Component version already published"
+            exit 0
+          fi
+          printf '鲸桥 %s。默认接入鲸屿，也支持其他 Agent；源码、版本和组件发布独立维护。\n' "$version" > component-notes.txt
+          gh release create "$tag" component/WhaleBridge-win32-x64.exe component/WhaleBridge-component.json --target "$GITHUB_SHA" --title "鲸桥 $version" --notes-file component-notes.txt

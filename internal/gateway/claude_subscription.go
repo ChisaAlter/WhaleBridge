@@ -57,11 +57,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/yetone/magpie/internal/appdir"
-	"github.com/yetone/magpie/internal/netproxy"
-	"github.com/yetone/magpie/internal/proc"
-	"github.com/yetone/magpie/internal/provider"
-	"github.com/yetone/magpie/internal/wslrun"
+	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/netproxy"
+	"github.com/ChisaAlter/WhaleBridge/internal/proc"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/wslrun"
 )
 
 type subscriptionBridge struct {

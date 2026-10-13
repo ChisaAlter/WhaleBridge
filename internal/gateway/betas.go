@@ -11,7 +11,7 @@ import (
 
 	"github.com/tidwall/gjson"
 
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // Betas an agent asks of Anthropic's messages (the anthropic-beta header,

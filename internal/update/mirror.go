@@ -6,8 +6,8 @@ import (
 	"net/url"
 	"strings"
 
-	"github.com/yetone/magpie/internal/netproxy"
-	"github.com/yetone/magpie/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/netproxy"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // A network that can't reach GitHub can have a release's file come

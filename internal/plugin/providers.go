@@ -12,8 +12,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/settings"
-	"github.com/yetone/magpie/internal/steady"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/steady"
 )
 
 // Method is a way a plugin signs in: "oauth" (a browser, then a code

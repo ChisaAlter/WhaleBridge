@@ -9,7 +9,7 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/yetone/magpie/internal/appdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 )
 
 var codexFingerprintKey struct {

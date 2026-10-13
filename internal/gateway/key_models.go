@@ -7,8 +7,8 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/yetone/magpie/internal/access"
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/access"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // A gateway key may be held to some models (#882, access.Key.Models): it

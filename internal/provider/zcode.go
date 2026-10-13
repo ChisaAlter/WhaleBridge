@@ -53,7 +53,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 )
 
 // Where ZCode's coding plan and its sign-in are; vars so tests can point

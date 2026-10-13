@@ -30,10 +30,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/access"
-	"github.com/yetone/magpie/internal/provider"
-	"github.com/yetone/magpie/internal/settings"
-	"github.com/yetone/magpie/internal/usage"
+	"github.com/ChisaAlter/WhaleBridge/internal/access"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/usage"
 )
 
 // sums is what a key's calls came to in a window.

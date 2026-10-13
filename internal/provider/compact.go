@@ -3,8 +3,8 @@ package provider
 import (
 	"strings"
 
-	"github.com/yetone/magpie/internal/catalog"
-	"github.com/yetone/magpie/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // Where Codex and Claude Code compact a long conversation (#876): the

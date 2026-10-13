@@ -18,8 +18,8 @@ import (
 	"sync"
 	"unicode/utf8"
 
-	"github.com/yetone/magpie/internal/edit"
-	"github.com/yetone/magpie/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/edit"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 const Prefix = "sk-magpie-key-"

@@ -5,7 +5,7 @@ import (
 	"encoding/json"
 
 	"github.com/tidwall/gjson"
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // clinePin is body with its DeepSeek model pinned to DeepSeek's own API

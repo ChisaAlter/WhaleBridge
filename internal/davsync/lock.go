@@ -6,7 +6,7 @@ import (
 	"os"
 	"time"
 
-	"github.com/yetone/magpie/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // ErrBusy is a wait for another magpie's sync that ran out of time.

@@ -20,8 +20,8 @@ import (
 	"strconv"
 
 	"github.com/tidwall/gjson"
-	"github.com/yetone/magpie/internal/provider"
-	"github.com/yetone/magpie/internal/zed"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/zed"
 )
 
 // A Zed subscription is served through cloud.zed.dev/completions, the way the

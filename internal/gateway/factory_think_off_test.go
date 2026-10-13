@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // Factory's DeepSeek V4.1 Flash and Kimi K3 (Fireworks) and GLM-5.2

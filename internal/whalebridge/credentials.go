@@ -8,8 +8,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/yetone/magpie/internal/appdir"
-	"github.com/yetone/magpie/internal/steady"
+	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/steady"
 	"gopkg.in/yaml.v3"
 )
 

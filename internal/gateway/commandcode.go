@@ -44,7 +44,7 @@ import (
 	"time"
 
 	"github.com/tidwall/gjson"
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // cmdGenerate says whether an account is asked at /alpha/generate, where,

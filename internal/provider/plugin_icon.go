@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/plugin"
+	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
 )
 
 // PluginIcon is the icon a plugin's provider shows: the picture its plugin

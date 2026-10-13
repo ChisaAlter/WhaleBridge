@@ -14,7 +14,7 @@ package gateway
 import (
 	"sync"
 
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // wrr is each weighted provider's round: every key's current weight, and

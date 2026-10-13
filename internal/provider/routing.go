@@ -15,7 +15,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 )
 
 // The routings besides the default, smart, in order.

@@ -4,7 +4,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/yetone/magpie/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 )
 
 // StartModelRefresh restores the catalog/bootstrap work the native

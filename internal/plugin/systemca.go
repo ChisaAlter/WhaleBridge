@@ -10,7 +10,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/yetone/magpie/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 )
 
 // caEnv has Bun trust what this machine trusts. Bun checks TLS against

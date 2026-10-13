@@ -4,7 +4,7 @@ import (
 	"context"
 	"runtime"
 
-	"github.com/yetone/magpie/internal/plugin"
+	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
 )
 
 func init() {

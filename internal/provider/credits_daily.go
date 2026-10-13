@@ -31,7 +31,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/filememo"
+	"github.com/ChisaAlter/WhaleBridge/internal/filememo"
 )
 
 // DailyCredits is what an account's credits went to day by day.

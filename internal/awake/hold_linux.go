@@ -4,7 +4,7 @@ import (
 	"os/exec"
 	"syscall"
 
-	"github.com/yetone/magpie/internal/proc"
+	"github.com/ChisaAlter/WhaleBridge/internal/proc"
 )
 
 // takeHold runs systemd-inhibit holding idle and sleep off around a sleep

@@ -3,9 +3,9 @@ package whalebridge
 import (
 	"fmt"
 
-	"github.com/yetone/magpie/internal/gateway"
-	"github.com/yetone/magpie/internal/provider"
-	"github.com/yetone/magpie/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 	"os"
 
 	"slices"
@@ -81,6 +81,11 @@ func syncDSH() error {
 func Disconnect(home string) error {
 	if home == "" {
 		return fmt.Errorf("缺少 DSH 数据目录")
+	}
+	mutations.Lock()
+	defer mutations.Unlock()
+	if err := disconnectManagedAgents(); err != nil {
+		return err
 	}
 	dshWrites.Lock()
 	defer dshWrites.Unlock()

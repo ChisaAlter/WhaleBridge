@@ -19,10 +19,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/catalog"
-	"github.com/yetone/magpie/internal/codexcat"
-	"github.com/yetone/magpie/internal/proc"
-	"github.com/yetone/magpie/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/codexcat"
+	"github.com/ChisaAlter/WhaleBridge/internal/proc"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // codexClientVersion is the Codex CLI version the models list is asked for

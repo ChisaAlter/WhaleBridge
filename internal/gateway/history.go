@@ -21,9 +21,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/provider"
-	"github.com/yetone/magpie/internal/steady"
-	"github.com/yetone/magpie/internal/usage"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/steady"
+	"github.com/ChisaAlter/WhaleBridge/internal/usage"
 )
 
 const (

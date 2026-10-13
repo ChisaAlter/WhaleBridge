@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 )
 
 // ClineVersion is the Cline desktop release magpie says it is to the Cline

@@ -1,6 +1,6 @@
 package gateway
 
-import "github.com/yetone/magpie/internal/provider"
+import "github.com/ChisaAlter/WhaleBridge/internal/provider"
 
 // claudeFastBeta is the beta Claude's fast mode (speed "fast") is asked
 // under.

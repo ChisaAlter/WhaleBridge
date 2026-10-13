@@ -7,7 +7,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/yetone/magpie/internal/appdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 )
 
 func codexConfigPath() string {

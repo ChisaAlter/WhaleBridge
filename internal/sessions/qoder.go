@@ -4,7 +4,7 @@ import (
 	"os"
 	"path/filepath"
 
-	"github.com/yetone/magpie/internal/appdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 )
 
 // Qoder's CLI (qodercli, and qoderclicn for the China site: one build)

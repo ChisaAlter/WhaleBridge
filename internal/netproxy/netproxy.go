@@ -20,7 +20,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // Install routes http.DefaultTransport (and so http.DefaultClient) through

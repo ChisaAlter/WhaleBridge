@@ -39,7 +39,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 )
 
 // MiMoID is the MiMo subscription's id, as a provider and in logins.json.

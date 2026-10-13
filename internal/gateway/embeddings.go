@@ -11,8 +11,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/provider"
-	"github.com/yetone/magpie/internal/usage"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/usage"
 )
 
 // retrieveTimeout bounds an embeddings or rerank call: a vendor answers

@@ -20,8 +20,8 @@ import (
 	"strings"
 
 	"github.com/tidwall/jsonc"
-	"github.com/yetone/magpie/internal/appdir"
-	"github.com/yetone/magpie/internal/plugin"
+	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
 	_ "modernc.org/sqlite"
 )
 

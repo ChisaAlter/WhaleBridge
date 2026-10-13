@@ -27,8 +27,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/plugin"
-	"github.com/yetone/magpie/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // qoderCampaignURLs are the campaigns of each site, by the plugin's

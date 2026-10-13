@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 
-	"github.com/yetone/magpie/internal/edit"
+	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"gopkg.in/yaml.v3"
 )
 

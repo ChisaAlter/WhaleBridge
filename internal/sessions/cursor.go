@@ -15,7 +15,7 @@ import (
 
 	"net/url"
 
-	"github.com/yetone/magpie/internal/appdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 )
 
 // Cursor's CLI (cursor-agent) keeps a chat in a folder of its own under its

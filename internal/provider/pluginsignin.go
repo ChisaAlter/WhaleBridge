@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/plugin"
+	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
 )
 
 // StartPluginSignIn begins signing in to a plugin's provider (OpenCode's

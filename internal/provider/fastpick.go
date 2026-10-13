@@ -6,7 +6,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/yetone/magpie/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // An agent's pick of a model may be sent in its vendor's fast mode (#954),

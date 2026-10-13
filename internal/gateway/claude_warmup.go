@@ -9,8 +9,8 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/yetone/magpie/internal/netproxy"
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/netproxy"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // claudeProxy is the proxy a Claude Code run on an account's behalf goes

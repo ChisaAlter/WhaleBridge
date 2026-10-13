@@ -4,8 +4,8 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/yetone/magpie/internal/omarchy"
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/omarchy"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // siteOrigins are the pages that may read the Omarchy theme: usemagpie.ai,

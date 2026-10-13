@@ -18,16 +18,17 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/appdir"
-	"github.com/yetone/magpie/internal/catalog"
-	"github.com/yetone/magpie/internal/davsync"
-	"github.com/yetone/magpie/internal/edit"
-	"github.com/yetone/magpie/internal/gateway"
-	"github.com/yetone/magpie/internal/netproxy"
-	"github.com/yetone/magpie/internal/provider"
-	"github.com/yetone/magpie/internal/sessions"
-	"github.com/yetone/magpie/internal/settings"
-	"github.com/yetone/magpie/internal/usage"
+	"github.com/ChisaAlter/WhaleBridge/internal/agent"
+	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/davsync"
+	"github.com/ChisaAlter/WhaleBridge/internal/edit"
+	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
+	"github.com/ChisaAlter/WhaleBridge/internal/netproxy"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/sessions"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/usage"
 )
 
 //go:embed assets/*
@@ -78,15 +79,21 @@ func Run(version string) error {
 		return fmt.Errorf("鲸桥网关密钥文件无效")
 	}
 	os.Setenv("WHALEBRIDGE_GATEWAY_TOKEN", token)
+	gateway.Token = token
 	key, err := secret()
 	if err != nil {
 		return err
 	}
 	netproxy.Install()
 	gateway.Version = version
-	usage.Agents = func() []usage.Known {
-		return []usage.Known{{ID: "dsh", Names: []string{"dsh", "deepseek-harness"}, UA: []string{"deepseek-harness"}}}
+	gateway.StandIn = agent.StandIn
+	clients := []usage.Known{{ID: "dsh", Names: []string{"dsh", "deepseek-harness"}, UA: []string{"deepseek-harness"}}}
+	for _, a := range agent.Clients() {
+		if externalAgent(a) {
+			clients = append(clients, usage.Known{ID: a.ID, Names: append([]string{a.ID}, a.Aliases...), UA: a.UA})
+		}
 	}
+	usage.Agents = func() []usage.Known { return clients }
 	// Supplier accounting covers calls served by this component. Native
 	// client session discovery is outside WhaleBridge's management scope.
 	usage.LogCalls = func(time.Time) []sessions.Call { return nil }
@@ -110,6 +117,7 @@ func Run(version string) error {
 	if err := syncDSH(); err != nil {
 		return err
 	}
+	syncManagedAgents()
 	stopCatalogSync := watchDSHCatalog(ctx)
 	defer stopCatalogSync()
 	server := gateway.New()
@@ -125,6 +133,7 @@ func Run(version string) error {
 	cookieName := "magpie_web_" + strings.Split(listener.Addr().String(), ":")[1]
 	mux := http.NewServeMux()
 	accountRoutes(mux)
+	agentRoutes(mux)
 	mux.HandleFunc("GET /api/whalebridge/status", func(w http.ResponseWriter, r *http.Request) {
 		models, _ := provider.CatalogFor("dsh")
 		writeJSON(w, map[string]any{"models": len(models), "defaultModel": isDefault(), "version": version, "gateway": gateway.URL(), "pid": os.Getpid(), "catalog": catalog.Status(), "syncError": dshSyncError()})
@@ -139,7 +148,7 @@ func Run(version string) error {
 		}
 		active, ok := server.WhaleBridgeMaintenance(b.On)
 		if !ok {
-			http.Error(w, "DSH 有正在生成的回复，请完成后再操作", 409)
+			http.Error(w, "Agent 有正在生成的回复，请完成后再操作", 409)
 			return
 		}
 		writeJSON(w, map[string]any{"active": active})
@@ -459,7 +468,9 @@ func patchHeaders(p *provider.Provider, changes map[string]*string) error {
 func syncConfiguration() error {
 	mutations.Lock()
 	defer mutations.Unlock()
-	return syncDSH()
+	err := syncDSH()
+	syncManagedAgents()
+	return err
 }
 
 var catalogSyncState struct {
@@ -515,7 +526,9 @@ func mutate(fn func(http.ResponseWriter, *http.Request) error) http.HandlerFunc 
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		if err := syncDSH(); err != nil {
+		err := syncDSH()
+		syncManagedAgents()
+		if err != nil {
 			http.Error(w, "配置已保存，但 DSH 渠道同步失败: "+err.Error(), 500)
 			return
 		}

@@ -13,7 +13,7 @@ const visibilityPending = new Map();
 const foldedChannels = new Set();
 let messageTimer;
 let quotaRows=[],subscriptionSettings={},providerLiveTimer,healthTimer,quotaReadSequence=0;
-const pageNames = {overview:'接入概览',providers:'供应商与账号',models:'模型管理',routing:'路由组',usage:'用量统计',help:'使用说明',settings:'全局设置'};
+const pageNames = {overview:'接入概览',agents:'Agent 接入',providers:'供应商与账号',models:'模型管理',routing:'路由组',usage:'用量统计',help:'使用说明',settings:'全局设置'};
  const routes = {'':'智能','order':'按顺序','rotate':'轮换','usage':'最少用量','pace':'按剩余额度','weight':'权重','manual':'固定模型'};
 async function api(path, body, headersCallback) {
  const response = await fetch(`/api/${path}`, body === undefined ? {} : {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(body)});
@@ -101,7 +101,7 @@ function overview() {
  <div class="stats">${stat('已配置供应商',total,`${active} 个已启用`,'providers')}${stat('可用模型',models,state.syncError?'等待同步到鲸屿桌面端':'已同步到鲸屿桌面端','models')}${stat('路由组',state.groups?.length || 0,'多个模型，共用一个入口','routing')}</div>
  <div class="section-head"><div><h2>从接入到对话，只需三步</h2><p>已有配置可以随时调整，保存后自动同步。</p></div>${button('查看说明','go-help','','text-button')}</div>
  <div class="steps"><article class="step"><div class="step-head"><span class="step-number">01 / 连接来源</span>${total?icon('check'):icon('providers')}</div><h3>添加供应商或登录订阅</h3><p>填写供应商的 API 密钥，或通过支持的供应商登录流程接入订阅账号。</p>${button(`${total?'管理供应商':'开始添加'} ${icon('arrow')}`,total?'go-providers':'add-provider')}</article><article class="step"><div class="step-head"><span class="step-number">02 / 选择模型</span>${models?icon('check'):icon('models')}</div><h3>整理桌面端的模型列表</h3><p>保留常用模型，隐藏暂时不用的模型。多个模型也可以组合为一个路由组。</p>${button(`管理模型 ${icon('arrow')}`,'go-models')}</article><article class="step"><div class="step-head"><span class="step-number">03 / 开始使用</span>${icon('overview')}</div><h3>在鲸屿中选择「鲸桥」</h3><p>回到鲸屿桌面端，打开对话的模型选择器，选择「鲸桥」渠道下的模型。</p>${button(`查看使用方法 ${icon('arrow')}`,'go-help')}</article></div>
- <div class="support-grid"><div><h3>一个地方，管理多种模型来源</h3><p>API 供应商和订阅账号可以同时接入。用路由组分配请求，在用量统计中查看调用次数和 Token 消耗。</p></div><div><h3>关闭窗口，模型服务仍继续</h3><p>鲸桥在后台为桌面端提供服务。在启动器首页可开启或关闭鲸桥，更新、回滚和卸载在「组件」页的管理菜单操作。</p></div></div>
+ <div class="support-grid"><div><h3>默认接入鲸屿，也支持其他 Agent</h3><p>鲸屿保持自动接入。在「Agent 接入」中可连接上游支持的其他 Agent，并按各自的配置选择模型与思考等级。</p>${button('管理 Agent 接入','go-agents','','text-button')}</div><div><h3>关闭窗口，模型服务仍继续</h3><p>鲸桥在后台为桌面端提供服务。在启动器首页可开启或关闭鲸桥，更新、回滚和卸载在「组件」页的管理菜单操作。</p></div></div>
  <details class="advanced"><summary>连接信息与同步</summary><div class="advanced-body"><dl><dt>桌面端渠道</dt><dd>鲸桥 · WhaleBridge</dd><dt>本地网关</dt><dd><code>${escape(state.gateway)}/v1</code></dd><dt>同步方式</dt><dd>配置保存后自动同步；不会替换已有供应商或当前默认模型。</dd></dl><div class="actions-bar">${button(`${icon('refresh')}重新同步模型`,'sync','','text-button')}</div></div></details>`;
 }
 function providerAvatar(p){const file=String(p.icon || '').startsWith('file:')?String(p.icon).slice(5):'';return file?`<img class="provider-avatar provider-image" src="/api/icons/${encodeURIComponent(file)}" alt="">`:`<span class="provider-avatar" aria-hidden="true">${escape(Array.from(p.name || p.id)[0].toUpperCase())}</span>`;}
@@ -246,7 +246,7 @@ function handleGroupMemberChange(e){
  }
 }
 function helpPage() {
- return heading('认识鲸桥','模型接入、账号管理和日常使用，一次了解。')+`<p class="help-intro">鲸桥是鲸屿的可选模型连接组件。它把 API 供应商和支持的订阅账号集中到一个渠道，让你在鲸屿桌面端选择模型、发起对话；同时管理模型列表、请求路由和通过鲸桥产生的用量。</p><div class="help-grid"><article class="help-card"><h3>${icon('providers')}接入 API 供应商</h3><p>在「供应商与账号」点击「添加供应商」，选择预设或填写兼容接口地址，再输入 API 密钥。模型 ID 可手动填写，也可以在保存后刷新供应商模型。</p></article><article class="help-card"><h3>${icon('account')}接入订阅账号</h3><p>选择「订阅账号」并按供应商指引登录。不同订阅支持的模型和登录方式不同；部分供应商需要认证工具或适配器，界面会说明。登录结果用于鲸桥接入。</p></article><article class="help-card"><h3>${icon('models')}在鲸屿中使用</h3><p>回到鲸屿桌面端，打开对话的模型选择器，在「鲸桥」渠道下选择模型。新增或隐藏模型会自动同步；已有默认模型不会因安装鲸桥被替换。</p></article><article class="help-card"><h3>${icon('routing')}按需配置路由</h3><p>路由组把多个模型合为一个可选模型。你可以按顺序、轮换或用量等策略分配请求。它是可选功能，直接选择供应商模型也能正常对话。</p></article></div><div class="section-head"><h2>使用前后，你可能想知道</h2></div><div class="panel"><details class="faq" open><summary>鲸桥提供模型或免费额度吗？</summary><p>鲸桥负责连接和管理模型。你需要自己的 API 密钥或支持的订阅账号，模型可用范围和费用由对应供应商决定。用量页的费用是按模型目录价格估算，最终以供应商账单为准。</p></details><details class="faq"><summary>窗口关了，鲸屿还能继续对话吗？</summary><p>可以。关闭设置窗口后，鲸桥进程继续在后台服务。若在启动器中停止组件，通过鲸桥的模型会暂时不可用；重新启动组件后恢复。</p></details><details class="faq"><summary>添加后，在桌面端找不到模型怎么办？</summary><p>先确认供应商已启用、密钥或账号已配置，并刷新该供应商的模型。在「模型管理」确认模型的显示开关已打开。需要时，可在概览的「连接信息与同步」中重新同步模型。</p></details><details class="faq"><summary>配置和请求会发到哪里？</summary><p>鲸桥的配置和凭据保存在本机，管理界面和连接网关只监听本机地址。对话请求会按你选择的模型发送给对应供应商；订阅登录按供应商的流程完成。</p></details><details class="faq"><summary>如何更新或卸载？会影响对话记录吗？</summary><p>在鲸屿启动器的「组件」页操作。卸载会移除「鲸桥」渠道，并可选择保留或删除鲸桥的配置与用量；不会删除鲸屿的聊天记录。如果默认模型来自鲸桥，卸载后需要重新选择模型。</p></details></div><div class="actions-bar">${button('管理供应商','go-providers','','primary')}${button('查看模型','go-models')}</div>`;
+ return heading('认识鲸桥','模型接入、账号管理和日常使用，一次了解。')+`<p class="help-intro">鲸桥是鲸屿的可选模型连接组件。鲸屿默认自动接入，其他 Agent 可在「Agent 接入」中按需连接。它把 API 供应商和支持的订阅账号集中到一个渠道，同时管理模型列表、请求路由和通过鲸桥产生的用量。</p><div class="help-grid"><article class="help-card"><h3>${icon('providers')}接入 API 供应商</h3><p>在「供应商与账号」点击「添加供应商」，选择预设或填写兼容接口地址，再输入 API 密钥。模型 ID 可手动填写，也可以在保存后刷新供应商模型。</p></article><article class="help-card"><h3>${icon('account')}接入订阅账号</h3><p>选择「订阅账号」并按供应商指引登录。不同订阅支持的模型和登录方式不同；部分供应商需要认证工具或适配器，界面会说明。登录结果用于鲸桥接入。</p></article><article class="help-card"><h3>${icon('models')}在鲸屿中使用</h3><p>回到鲸屿桌面端，打开对话的模型选择器，在「鲸桥」渠道下选择模型。新增或隐藏模型会自动同步；已有默认模型不会因安装鲸桥被替换。其他 Agent 在「Agent 接入」中选择后点击接入，模型与思考等级修改后点击应用。</p></article><article class="help-card"><h3>${icon('routing')}按需配置路由</h3><p>路由组把多个模型合为一个可选模型。你可以按顺序、轮换或用量等策略分配请求。它是可选功能，直接选择供应商模型也能正常对话。</p></article></div><div class="section-head"><h2>使用前后，你可能想知道</h2></div><div class="panel"><details class="faq" open><summary>鲸桥提供模型或免费额度吗？</summary><p>鲸桥负责连接和管理模型。你需要自己的 API 密钥或支持的订阅账号，模型可用范围和费用由对应供应商决定。用量页的费用是按模型目录价格估算，最终以供应商账单为准。</p></details><details class="faq"><summary>窗口关了，鲸屿还能继续对话吗？</summary><p>可以。关闭设置窗口后，鲸桥进程继续在后台服务。若在启动器中停止组件，通过鲸桥的模型会暂时不可用；重新启动组件后恢复。</p></details><details class="faq"><summary>添加后，在桌面端找不到模型怎么办？</summary><p>先确认供应商已启用、密钥或账号已配置，并刷新该供应商的模型。在「模型管理」确认模型的显示开关已打开。需要时，可在概览的「连接信息与同步」中重新同步模型。</p></details><details class="faq"><summary>配置和请求会发到哪里？</summary><p>鲸桥的配置和凭据保存在本机，管理界面和连接网关只监听本机地址。对话请求会按你选择的模型发送给对应供应商；订阅登录按供应商的流程完成。</p></details><details class="faq"><summary>如何更新或卸载？会影响对话记录吗？</summary><p>在鲸屿启动器的「组件」页操作。卸载会移除「鲸桥」渠道，并可选择保留或删除鲸桥的配置与用量；不会删除鲸屿的聊天记录。如果默认模型来自鲸桥，卸载后需要重新选择模型。</p></details></div><div class="actions-bar">${button('管理供应商','go-providers','','primary')}${button('查看模型','go-models')}</div>`;
 }
 function renderModelsPage(){
  let html=heading('模型管理','整理鲸屿可选模型；参数与价格在供应商工作台中编辑。',button(`${icon('refresh')}更新模型目录`,'refresh-catalog'));
@@ -256,23 +256,27 @@ function renderModelsPage(){
 async function render(){
  if(!state)return;
  const epoch=++renderEpoch;clearTimeout(providerLiveTimer);
+ $('#narrow-page').value=tab;
  document.querySelectorAll('[data-tab]').forEach(b=>{const selected=b.dataset.tab===tab;b.setAttribute('aria-selected',String(selected));if(selected)b.setAttribute('aria-current','page');else b.removeAttribute('aria-current');});
  $('#page-label').textContent=pageNames[tab];$('#content').setAttribute('aria-busy','true');
  let html='';
  if(tab==='overview')html=overview();
+ else if(tab==='agents')html=await window.WhaleBridgeAgents.render(epoch);
  else if(tab==='providers')html=providers();
  else if(tab==='models')html=renderModelsPage();
  else if(tab==='routing')html=routingPage();
  else if(tab==='help')html=helpPage();
  else if(tab==='usage'||tab==='settings')html=await window.renderBridgeGlobalPage(tab,epoch);
  if(epoch!==renderEpoch)return;
+ if(tab==='agents' && !html)return;
  $('#content').innerHTML=html;$('#content').setAttribute('aria-busy','false');
  if($('#model-list')){modelList();$('#model-search').addEventListener('input',e=>{modelQuery=e.target.value;modelList();});}
  bindProviderAndGroupPages();
+ if(tab==='agents')window.WhaleBridgeAgents.bind(epoch);
  if(tab==='usage'||tab==='settings')await window.bindBridgeGlobalPage(tab,epoch);
  if(tab==='providers')startProviderLive(epoch);
 }
-async function go(next){tab=next;message('');await render();$('#main').scrollTo({top:0});}
+async function go(next){if(tab==='agents' && next!=='agents')window.WhaleBridgeAgents.leave();tab=next;message('');await render();$('#main').scrollTo({top:0});}
 function field(name,label,value='',type='text',hint='') { return `<label for="f-${name}">${label}</label><input id="f-${name}" name="${name}" type="${type}" value="${escape(value)}" autocomplete="${type==='password'?'new-password':'off'}" ${hint?`placeholder="${escape(hint)}"`:''}>`; }
 function text(name,label,value='',hint='') { return `<label for="f-${name}">${label}</label><textarea id="f-${name}" name="${name}" placeholder="${escape(hint)}">${escape(value)}</textarea>`; }
 function routing(value,group=false){return `<label for="f-routing">请求分配策略</label><select id="f-routing" name="routing">${Object.entries(routes).filter(([v])=>group?v!=='weight':v!=='manual').map(([v,l])=>`<option value="${v}" ${v===value?'selected':''}>${l}</option>`).join('')}</select><p class="form-hint">按顺序优先使用列表靠前的模型；轮换会在模型间依次分配请求。</p>`;}
@@ -633,6 +637,7 @@ $('#confirm-form').onsubmit=e=>{e.preventDefault();$('#confirmation').close('acc
 $('#close-confirm').onclick=$('#cancel-confirm').onclick=()=>$('#confirmation').close();
 $('#dismiss-message').onclick=()=>message('');
 $('#refresh').addEventListener('click',load);
+$('#narrow-page').addEventListener('change',event=>go(event.target.value).catch(error=>message(error.message,true)));
 for(const b of document.querySelectorAll('[data-tab]'))b.addEventListener('click',()=>go(b.dataset.tab).catch(e=>message(e.message,true)));
 // All navigational actions share one delegated handler, including footer help.
 $('.workspace').addEventListener('click',async e=>{

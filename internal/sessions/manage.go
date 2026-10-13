@@ -12,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // Managing sessions: every session of one agent, to look through and pick

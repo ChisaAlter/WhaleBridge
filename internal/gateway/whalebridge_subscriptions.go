@@ -3,8 +3,8 @@ package gateway
 import (
 	"context"
 
-	"github.com/yetone/magpie/internal/plugin"
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // StartWhaleBridgeSubscriptions runs the gateway's subscription maintenance.

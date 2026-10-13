@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"github.com/yetone/magpie/internal/agentenv"
-	"github.com/yetone/magpie/internal/testenv"
+	"github.com/ChisaAlter/WhaleBridge/internal/agentenv"
+	"github.com/ChisaAlter/WhaleBridge/internal/testenv"
 )
 
 // standInsEnv names the folder of a test binary's stand-in CLIs, for a

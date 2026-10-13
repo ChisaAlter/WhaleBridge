@@ -49,7 +49,7 @@ func otelAttributes(r Record) []otelAttribute {
 func otelEnvelope(signal string, data any) map[string]any {
 	return map[string]any{"resource" + signal: []any{map[string]any{
 		"resource":       map[string]any{"attributes": []otelAttribute{otelString("service.name", "magpie")}},
-		"scope" + signal: []any{map[string]any{"scope": map[string]any{"name": "github.com/yetone/magpie"}, map[string]string{"Spans": "spans", "Metrics": "metrics"}[signal]: data}},
+		"scope" + signal: []any{map[string]any{"scope": map[string]any{"name": "github.com/ChisaAlter/WhaleBridge"}, map[string]string{"Spans": "spans", "Metrics": "metrics"}[signal]: data}},
 	}}}
 }
 

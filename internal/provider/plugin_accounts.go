@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/plugin"
+	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
 )
 
 // A plugin's provider is signed in to as many times as the user likes, as

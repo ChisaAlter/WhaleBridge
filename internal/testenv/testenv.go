@@ -25,7 +25,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/yetone/magpie/internal/agentenv"
+	"github.com/ChisaAlter/WhaleBridge/internal/agentenv"
 )
 
 const (

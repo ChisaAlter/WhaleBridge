@@ -27,7 +27,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/appdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 )
 
 // cursorBase is Cursor's API; a var so tests can point it elsewhere.

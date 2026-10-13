@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/appdir"
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // OpenCode keeps a session as rows, not a file of lines: since 1.2 in its

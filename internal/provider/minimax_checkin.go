@@ -36,8 +36,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/plugin"
-	"github.com/yetone/magpie/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // MiniMaxCodeID is the MiniMax Code plugin's provider (the China site),

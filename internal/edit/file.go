@@ -13,8 +13,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/filememo"
-	"github.com/yetone/magpie/internal/steady"
+	"github.com/ChisaAlter/WhaleBridge/internal/filememo"
+	"github.com/ChisaAlter/WhaleBridge/internal/steady"
 )
 
 // Read returns the file contents, or (nil, nil) when the file does not exist.

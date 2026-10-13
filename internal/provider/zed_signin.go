@@ -25,7 +25,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/zed"
+	"github.com/ChisaAlter/WhaleBridge/internal/zed"
 )
 
 func startZedSignIn(s *signInFlow) error {

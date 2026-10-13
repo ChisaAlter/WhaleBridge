@@ -22,9 +22,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/settings"
-	"github.com/yetone/magpie/internal/steady"
-	"github.com/yetone/magpie/internal/update"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/steady"
+	"github.com/ChisaAlter/WhaleBridge/internal/update"
 )
 
 // Updates is what magpie's last look at npm found for the plugins.

@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/agentenv"
+	"github.com/ChisaAlter/WhaleBridge/internal/agentenv"
 )
 
 // UserPath gives the desktop app the PATH a terminal of the user's has. One

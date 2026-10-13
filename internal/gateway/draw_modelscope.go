@@ -18,7 +18,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // isModelScope is a provider at ModelScope's API-Inference, a preset's or

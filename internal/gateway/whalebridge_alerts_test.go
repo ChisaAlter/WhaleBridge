@@ -4,7 +4,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 func TestWhaleBridgeNativeAlertClaimKeepsHistory(t *testing.T) {

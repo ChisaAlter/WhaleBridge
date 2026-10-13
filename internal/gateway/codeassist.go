@@ -7,8 +7,8 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/yetone/magpie/internal/catalog"
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // ---- Google Code Assist (provider side) --------------------------------------

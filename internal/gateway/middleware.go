@@ -3,8 +3,8 @@ package gateway
 import (
 	"net/http"
 
-	"github.com/yetone/magpie/internal/middleware"
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/middleware"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // serveAgent is serve for a request an agent sent: the gateway middleware

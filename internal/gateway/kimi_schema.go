@@ -5,7 +5,7 @@ import (
 	"strings"
 
 	"github.com/tidwall/gjson"
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // kimiToolEnumTypes is body with a type written into each schema of its

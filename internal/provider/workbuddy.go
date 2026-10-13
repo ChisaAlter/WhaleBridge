@@ -55,7 +55,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 )
 
 // Where WorkBuddy's plan and its sign-in are; vars so tests can point them

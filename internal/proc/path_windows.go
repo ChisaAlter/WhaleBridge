@@ -7,7 +7,7 @@ import (
 
 	"golang.org/x/sys/windows/registry"
 
-	"github.com/yetone/magpie/internal/appdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 )
 
 // UserPath has nothing to do on Windows: an app started from the Start menu

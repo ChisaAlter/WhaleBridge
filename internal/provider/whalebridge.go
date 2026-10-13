@@ -1,6 +1,6 @@
 package provider
 
-import "github.com/yetone/magpie/internal/plugin"
+import "github.com/ChisaAlter/WhaleBridge/internal/plugin"
 
 // Subscription choices are provider/authentication backends, not client
 // configuration adapters. Their credentials are still served to DSH.

@@ -8,7 +8,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/yetone/magpie/internal/agentenv"
+	"github.com/ChisaAlter/WhaleBridge/internal/agentenv"
 )
 
 // homeVar is the variable Go's os.UserHomeDir reads the home folder from.

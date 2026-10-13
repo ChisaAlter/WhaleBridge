@@ -1,4 +1,4 @@
-// WhaleBridge is the DSH component derived from Magpie.
+// WhaleBridge is the model gateway component derived from Magpie.
 package main
 
 import (
@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/yetone/magpie/internal/claudebridge"
-	"github.com/yetone/magpie/internal/provider"
-	"github.com/yetone/magpie/internal/whalebridge"
+	"github.com/ChisaAlter/WhaleBridge/internal/claudebridge"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/whalebridge"
 )
 
 var version = "dev"

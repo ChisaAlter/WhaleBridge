@@ -24,7 +24,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 )
 
 // cursorPickerSkip are left out of the CLI's picker as it leaves them out.

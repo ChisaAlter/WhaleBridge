@@ -14,8 +14,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/netproxy"
-	"github.com/yetone/magpie/internal/proc"
+	"github.com/ChisaAlter/WhaleBridge/internal/netproxy"
+	"github.com/ChisaAlter/WhaleBridge/internal/proc"
 )
 
 // agentCLI is a CLI a subscription runs through: how to find it, and the

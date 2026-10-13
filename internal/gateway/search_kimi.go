@@ -9,7 +9,7 @@ import (
 	"io"
 	"net/http"
 
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // A Kimi Code plan searches the web with its own key, as kimi-cli's

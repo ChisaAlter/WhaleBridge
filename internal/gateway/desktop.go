@@ -12,8 +12,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/yetone/magpie/internal/provider"
-	"github.com/yetone/magpie/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // Claude Desktop, pointed at a third-party gateway, keeps a model only when

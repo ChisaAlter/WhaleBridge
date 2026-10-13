@@ -4,16 +4,18 @@
   <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
   <title>鲸桥 · WhaleBridge</title><link rel="icon" href="/whale-head.png">
   <link rel="stylesheet" href="/tokens.css"><link rel="stylesheet" href="/scrollbar.css"><link rel="stylesheet" href="/style.css">
-  <script src="/app.js" defer></script><script src="/accounts.js" defer></script><script src="/global.js" defer></script>
+  <script src="/app.js" defer></script><script src="/agents.js" defer></script><script src="/accounts.js" defer></script><script src="/global.js" defer></script>
 </head>
 <body>
   <div class="window-drag" aria-hidden="true"></div>
   <div class="app-shell">
     <aside class="sidebar">
       <a class="brand" href="/" aria-label="鲸桥首页"><img src="/whale-head.png" alt="鲸屿" width="40" height="40"><span><strong>鲸桥</strong><small>WHALEBRIDGE</small></span></a>
+      <div class="narrow-page-select"><label for="narrow-page">页面选择</label><select id="narrow-page"><option value="overview">接入概览</option><option value="agents">Agent 接入</option><option value="providers">供应商与账号</option><option value="models">模型管理</option><option value="routing">路由组</option><option value="usage">用量统计</option><option value="settings">全局设置</option><option value="help">使用说明</option></select></div>
       <div class="sidebar-label">鲸屿 · 模型连接组件</div>
       <nav aria-label="组件设置">
         <button data-tab="overview" aria-current="page" aria-selected="true"><svg class="icon" aria-hidden="true"><use href="/icons.svg#overview"></use></svg><span>接入概览</span></button>
+        <button data-tab="agents" aria-selected="false"><svg class="icon" aria-hidden="true"><use href="/icons.svg#account"></use></svg><span>Agent 接入</span></button>
         <button data-tab="providers" aria-selected="false"><svg class="icon" aria-hidden="true"><use href="/icons.svg#providers"></use></svg><span>供应商与账号</span><span class="nav-count" id="provider-count"></span></button>
         <button data-tab="models" aria-selected="false"><svg class="icon" aria-hidden="true"><use href="/icons.svg#models"></use></svg><span>模型管理</span><span class="nav-count" id="model-count"></span></button>
         <button data-tab="routing" aria-selected="false"><svg class="icon" aria-hidden="true"><use href="/icons.svg#routing"></use></svg><span>路由组</span></button>

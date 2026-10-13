@@ -1,0 +1,392 @@
+package agent
+
+import (
+	"encoding/json"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+)
+
+func TestZCode(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Chat: "https://api.deepseek.com/v1", Key: "k", Models: []string{"pro"}}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, ".zcode", "v2", "config.json")
+	os.MkdirAll(filepath.Dir(path), 0o755)
+	os.WriteFile(path, []byte(`{"provider":{"builtin:bigmodel":{"name":"Bigmodel","kind":"anthropic","enabled":true}}}`), 0o644)
+	read := func() map[string]any {
+		var c struct {
+			Provider map[string]map[string]any `json:"provider"`
+		}
+		b, _ := os.ReadFile(path)
+		if err := json.Unmarshal(b, &c); err != nil {
+			t.Fatalf("%v\n%s", err, b)
+		}
+		if c.Provider["builtin:bigmodel"] == nil {
+			t.Fatalf("ZCode's own provider went: %s", b)
+		}
+		return c.Provider["magpie"]
+	}
+
+	a := zcode(home)
+	if !a.Detected() {
+		t.Fatal("not detected")
+	}
+	f := a.Field("provider")
+	if f.Get() != "" {
+		t.Fatalf("get: %q", f.Get())
+	}
+	if err := f.Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	m := read()
+	opts, _ := m["options"].(map[string]any)
+	models, _ := m["models"].(map[string]any)
+	pro, _ := models["deepseek/pro"].(map[string]any)
+	if m["kind"] != "anthropic" || m["enabled"] != true || m["source"] != "custom" || opts["apiKey"] != "magpie" ||
+		opts["baseURL"] == "" || pro == nil || pro["limit"] == nil || pro["modalities"] == nil {
+		t.Fatalf("magpie provider: %v", m)
+	}
+	if f.Get() != "magpie" {
+		t.Fatalf("get: %q", f.Get())
+	}
+	// ZCode 3.14 reads provider_config.json
+	rules := filepath.Join(home, ".zcode", "v2", "provider_config.json")
+	os.WriteFile(rules, []byte(`{"schemaVersion":1,"config":{"providerConfigRules":{"providerRules":[{"providerId":"mine","config":{}}]},"modelConfigRules":{"providerModelRules":[],"manualProviderModelRules":[{"providerId":"magpie","modelId":"deepseek/pro","config":{"enabled":true}}]}},"other":1}`), 0o600)
+	if err := f.Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	type rulesDoc struct {
+		Other  int `json:"other"`
+		Config struct {
+			ProviderConfigRules struct {
+				ProviderRules []map[string]any `json:"providerRules"`
+			} `json:"providerConfigRules"`
+			ModelConfigRules struct {
+				ProviderModelRules       []map[string]any `json:"providerModelRules"`
+				ManualProviderModelRules []map[string]any `json:"manualProviderModelRules"`
+			} `json:"modelConfigRules"`
+		} `json:"config"`
+	}
+	readRules := func() rulesDoc {
+		var d rulesDoc
+		b, _ := os.ReadFile(rules)
+		if err := json.Unmarshal(b, &d); err != nil {
+			t.Fatalf("%v\n%s", err, b)
+		}
+		if d.Other != 1 || len(d.Config.ProviderConfigRules.ProviderRules) == 0 || d.Config.ProviderConfigRules.ProviderRules[0]["providerId"] != "mine" {
+			t.Fatalf("ZCode's own rules went: %s", b)
+		}
+		return d
+	}
+	d := readRules()
+	pr := d.Config.ProviderConfigRules.ProviderRules
+	if len(pr) != 2 {
+		t.Fatalf("provider rules: %v", pr)
+	}
+	cfg, _ := pr[1]["config"].(map[string]any)
+	access, _ := cfg["access"].(map[string]any)
+	api, _ := cfg["api"].(map[string]any)
+	if pr[1]["providerId"] != "magpie" || pr[1]["enabled"] != true || cfg["group"] != "standard-personal" ||
+		access["type"] != "api-key" || access["apiKey"] != "magpie" || api["type"] != "anthropic-messages" || api["baseUrl"] == "" ||
+		len(cfg["personalModelIds"].([]any)) != 1 {
+		t.Fatalf("magpie rule: %v", pr[1])
+	}
+	// a model set by hand in ZCode keeps its manual rule, and gets no second one
+	if len(d.Config.ModelConfigRules.ManualProviderModelRules) != 1 || len(d.Config.ModelConfigRules.ProviderModelRules) != 0 {
+		t.Fatalf("model rules: %+v", d.Config.ModelConfigRules)
+	}
+
+	// a provider added later reaches ZCode's picker
+	if err := provider.Save(provider.Provider{ID: "kimi", Name: "Kimi", Chat: "https://api.moonshot.cn/v1", Key: "k", Models: []string{"k2"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if models, _ := read()["models"].(map[string]any); models["kimi/k2"] == nil {
+		t.Fatalf("not synced: %v", models)
+	}
+	if d := readRules(); len(d.Config.ProviderConfigRules.ProviderRules[1]["config"].(map[string]any)["personalModelIds"].([]any)) != 2 ||
+		len(d.Config.ModelConfigRules.ProviderModelRules) != 1 || d.Config.ModelConfigRules.ProviderModelRules[0]["modelId"] != "kimi/k2" {
+		t.Fatalf("rules not synced: %+v", d.Config)
+	}
+
+	if err := f.Set(""); err != nil {
+		t.Fatal(err)
+	}
+	if read() != nil || f.Get() != "" {
+		t.Fatal("magpie provider left behind")
+	}
+	if d := readRules(); len(d.Config.ProviderConfigRules.ProviderRules) != 1 || len(d.Config.ModelConfigRules.ManualProviderModelRules) != 0 {
+		t.Fatalf("magpie rules left behind: %+v", d.Config)
+	}
+	// nothing to sync into a config that has no magpie provider
+	if err := a.Sync(); err != nil || read() != nil {
+		t.Fatal("sync added the provider")
+	}
+}
+
+// What the user did in ZCode stays: magpie turned off stays off, in both
+// files; its rule stays where it is among theirs; and a rule they removed
+// isn't put back when magpie syncs.
+func TestZCodeKeepsUserChoices(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Chat: "https://api.deepseek.com/v1", Key: "k", Models: []string{"pro"}}); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, ".zcode", "v2", "config.json")
+	rules := filepath.Join(home, ".zcode", "v2", "provider_config.json")
+	os.MkdirAll(filepath.Dir(path), 0o755)
+	os.WriteFile(path, []byte(`{"provider":{"magpie":{"name":"magpie","kind":"anthropic","enabled":false}}}`), 0o644)
+	os.WriteFile(rules, []byte(`{"schemaVersion":1,"config":{"providerConfigRules":{"providerRules":[
+	  {"providerId":"a","config":{}},{"providerId":"magpie","enabled":false,"config":{}},{"providerId":"b","config":{}}]}}}`), 0o600)
+	a := zcode(home)
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	ids := func() (out []string, on []any) {
+		var d struct {
+			Config struct {
+				ProviderConfigRules struct {
+					ProviderRules []map[string]any `json:"providerRules"`
+				} `json:"providerConfigRules"`
+			} `json:"config"`
+		}
+		b, _ := os.ReadFile(rules)
+		json.Unmarshal(b, &d)
+		for _, r := range d.Config.ProviderConfigRules.ProviderRules {
+			out = append(out, r["providerId"].(string))
+			on = append(on, r["enabled"])
+		}
+		return out, on
+	}
+	if got, on := ids(); len(got) != 3 || got[1] != "magpie" || on[1] != false {
+		t.Fatalf("rules %v %v", got, on)
+	}
+	var c struct {
+		Provider map[string]map[string]any `json:"provider"`
+	}
+	b, _ := os.ReadFile(path)
+	json.Unmarshal(b, &c)
+	if c.Provider["magpie"]["enabled"] != false || c.Provider["magpie"]["models"] == nil {
+		t.Fatalf("config.json: %s", b)
+	}
+
+	// removed in ZCode: not put back
+	os.WriteFile(rules, []byte(`{"schemaVersion":1,"config":{"providerConfigRules":{"providerRules":[{"providerId":"a","config":{}}]}}}`), 0o600)
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := ids(); len(got) != 1 {
+		t.Fatalf("magpie put back: %v", got)
+	}
+}
+
+// ZCode is told how long a reply may be and which reasoning levels a model
+// takes, in both files; without them its model dialog shows 32000 tokens
+// and thinking only on or off. A vendor's output that is really its window
+// is capped, and a model whose output and levels aren't known gets neither.
+func TestZCodeOutputAndReasoning(t *testing.T) {
+	home := syncHome(t)
+	os.WriteFile(catalog.CachePath(), []byte(`{"zai":{"models":{"glm-4.6":{"id":"glm-4.6","name":"GLM-4.6","limit":{"context":204800,"output":500000},
+	  "reasoning_options":[{"type":"effort","values":["none","low","high","max"]}]}}}}`), 0o644)
+	catalog.Reset()
+	path := filepath.Join(home, ".zcode", "v2", "config.json")
+	rules := filepath.Join(home, ".zcode", "v2", "provider_config.json")
+	os.MkdirAll(filepath.Dir(path), 0o755)
+	os.WriteFile(path, []byte(`{"provider":{"builtin:zai":{"models":{"GLM-5-Turbo":{"reasoning":{"enabled":true,"variants":["enabled","off"],"defaultVariant":"enabled"},"limit":{"context":200000,"output":64000}}}}}}`), 0o644)
+	os.WriteFile(rules, []byte(`{"schemaVersion":1,"config":{"providerConfigRules":{"providerRules":[]},"modelConfigRules":{"providerModelRules":[{"providerId":"mine","modelId":"x","config":{"optionSpecs":{"maxOutputTokens":{"max":7}}}}],"manualProviderModelRules":[]}}}`), 0o600)
+	if err := zcode(home).Field("provider").Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	b, _ := os.ReadFile(path)
+	for _, want := range []string{
+		`"limit":{"context":204800,"output":128000}`,
+		`"reasoning":{"defaultVariant":"high","enabled":true,"variants":["disabled","low","high","max"]}`,
+		`"GLM-5-Turbo":{"reasoning":{"enabled":true,"variants":["enabled","off"],"defaultVariant":"enabled"},"limit":{"context":200000,"output":64000}}`,
+	} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("config.json lacks %s: %s", want, b)
+		}
+	}
+	b, _ = os.ReadFile(rules)
+	for _, want := range []string{
+		`"optionSpecs":{"maxOutputTokens":{"max":128000},"reasoningLevel":{"values":["disabled","low","high","max"]}}`,
+		`{"config":{"optionSpecs":{"maxOutputTokens":{"max":7}}},"modelId":"x","providerId":"mine"}`,
+	} {
+		if !strings.Contains(string(b), want) {
+			t.Fatalf("provider_config.json lacks %s: %s", want, b)
+		}
+	}
+
+	os.WriteFile(catalog.CachePath(), []byte(`{"zai":{"models":{"glm-4.6":{"id":"glm-4.6","name":"GLM-4.6","limit":{"context":204800}}}}}`), 0o644)
+	catalog.Reset()
+	if err := zcode(home).Sync(); err != nil {
+		t.Fatal(err)
+	}
+	b, _ = os.ReadFile(path)
+	c, _ := os.ReadFile(rules)
+	if strings.Contains(string(b), "128000") || strings.Contains(string(b), `"disabled"`) ||
+		strings.Contains(string(c), "128000") || strings.Contains(string(c), "reasoningLevel") {
+		t.Fatalf("unknown output or levels written:\n%s\n%s", b, c)
+	}
+}
+
+func TestZCodeDefaultLevel(t *testing.T) {
+	for _, c := range []struct {
+		in   []string
+		want string
+	}{
+		{[]string{"low", "medium", "high"}, "medium"},
+		{[]string{"disabled", "low", "high", "max"}, "high"},
+		{[]string{"low", "high"}, "high"},
+		{[]string{"disabled"}, "disabled"},
+	} {
+		if got := zcodeDefaultLevel(c.in); got != c.want {
+			t.Errorf("%v: %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// A provider the user pointed at a magpie on another machine (a NAS) keeps
+// that address and key through a sync, in both of ZCode's files; one on
+// loopback follows the gateway, and connecting it in magpie points it here.
+func TestZCodeKeepsRemoteAddress(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Chat: "https://api.deepseek.com/v1", Key: "k", Models: []string{"pro"}}); err != nil {
+		t.Fatal(err)
+	}
+	a := zcode(home)
+	if err := a.Fields[0].Set(magpieID); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(home, ".zcode", "v2", "config.json")
+	rules := filepath.Join(home, ".zcode", "v2", "provider_config.json")
+	addr := func() (string, string, string, string) {
+		t.Helper()
+		var c struct {
+			Provider map[string]struct {
+				Options map[string]string `json:"options"`
+			} `json:"provider"`
+		}
+		b, _ := os.ReadFile(path)
+		json.Unmarshal(b, &c)
+		var r struct {
+			Config struct {
+				ProviderConfigRules struct {
+					ProviderRules []struct {
+						ProviderID string `json:"providerId"`
+						Config     struct {
+							Access map[string]string `json:"access"`
+							API    map[string]string `json:"api"`
+						} `json:"config"`
+					} `json:"providerRules"`
+				} `json:"providerConfigRules"`
+			} `json:"config"`
+		}
+		b, _ = os.ReadFile(rules)
+		json.Unmarshal(b, &r)
+		var base, key string
+		for _, p := range r.Config.ProviderConfigRules.ProviderRules {
+			if p.ProviderID == magpieID {
+				base, key = p.Config.API["baseUrl"], p.Config.Access["apiKey"]
+			}
+		}
+		o := c.Provider[magpieID].Options
+		return o["baseURL"], o["apiKey"], base, key
+	}
+
+	// as the user would in ZCode: both files, from what they hold now
+	point := func(base, key string) {
+		t.Helper()
+		was, wasKey, _, _ := addr()
+		b, _ := os.ReadFile(path)
+		s := strings.ReplaceAll(string(b), was, base)
+		os.WriteFile(path, []byte(strings.ReplaceAll(s, `"apiKey": "`+wasKey+`"`, `"apiKey": "`+key+`"`)), 0o644)
+		b, _ = os.ReadFile(rules)
+		s = strings.ReplaceAll(string(b), was, base)
+		os.WriteFile(rules, []byte(strings.ReplaceAll(s, `"apiKey":"`+wasKey+`"`, `"apiKey":"`+key+`"`)), 0o600)
+		if b, k, rb, rk := addr(); b != base || k != key || rb != base || rk != key {
+			t.Fatalf("pointing at %s: config %s %s, rules %s %s", base, b, k, rb, rk)
+		}
+	}
+	point("http://192.168.1.20:3425", "nas-key")
+	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Chat: "https://api.deepseek.com/v1", Key: "k", Models: []string{"pro", "flash"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if b, k, rb, rk := addr(); b != "http://192.168.1.20:3425" || k != "nas-key" || rb != b || rk != k {
+		t.Fatalf("a sync moved the NAS address: config %s %s, rules %s %s", b, k, rb, rk)
+	}
+	if b, _ := os.ReadFile(rules); !strings.Contains(string(b), "flash") {
+		t.Fatalf("the sync didn't bring the new model: %s", b)
+	}
+
+	point("http://localhost:4000", "old")
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if b, k, rb, rk := addr(); b != gateway.URL() || k != gateway.Token || rb != b || rk != k {
+		t.Fatalf("a loopback address didn't follow the gateway: config %s %s, rules %s %s", b, k, rb, rk)
+	}
+
+	point("https://nas.example:8443", "nas-key")
+	if err := a.Fields[0].Set(magpieID); err != nil {
+		t.Fatal(err)
+	}
+	if b, k, rb, rk := addr(); b != gateway.URL() || k != gateway.Token || rb != b || rk != k {
+		t.Fatalf("connecting in magpie kept the NAS address: config %s %s, rules %s %s", b, k, rb, rk)
+	}
+
+	// ZCode's own settings change one file only (Discord, 悠悠哥: the NAS
+	// address kept going back to this machine's magpie): a sync carries the
+	// NAS address to the other one rather than taking it back
+	only := func(file, base, key string) {
+		t.Helper()
+		was, wasKey, _, _ := addr()
+		b, _ := os.ReadFile(file)
+		s := strings.ReplaceAll(string(b), was, base)
+		s = strings.ReplaceAll(s, `"apiKey": "`+wasKey+`"`, `"apiKey": "`+key+`"`)
+		os.WriteFile(file, []byte(strings.ReplaceAll(s, `"apiKey":"`+wasKey+`"`, `"apiKey":"`+key+`"`)), 0o644)
+	}
+	for _, file := range []string{rules, path} {
+		if err := a.Fields[0].Set(magpieID); err != nil {
+			t.Fatal(err)
+		}
+		only(file, "http://10.0.0.8:3425", "nas-key")
+		if err := a.Sync(); err != nil {
+			t.Fatal(err)
+		}
+		if b, k, rb, rk := addr(); b != "http://10.0.0.8:3425" || k != "nas-key" || rb != b || rk != k {
+			t.Fatalf("a NAS address in %s alone was taken back: config %s %s, rules %s %s", filepath.Base(file), b, k, rb, rk)
+		}
+	}
+
+	for base, want := range map[string]bool{"http://192.168.1.20:3425": true, "https://nas.lan": true, "http://127.0.0.1:3425": false,
+		"http://localhost:3425": false, "http://[::1]:3425": false, "http://0.0.0.0:3425": false, "": false, "nas:3425": false} {
+		if onAnotherMachine(base) != want {
+			t.Errorf("onAnotherMachine(%q) = %v, want %v", base, !want, want)
+		}
+	}
+}

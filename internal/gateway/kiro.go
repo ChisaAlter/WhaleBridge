@@ -32,7 +32,7 @@ import (
 	"regexp"
 	"strings"
 
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // kiroAuth and kiroRuntime are the account's credentials and where its

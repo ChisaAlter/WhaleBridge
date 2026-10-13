@@ -6,8 +6,8 @@ import (
 	"net/http"
 	"os"
 
-	"github.com/yetone/magpie/internal/redact"
-	"github.com/yetone/magpie/internal/usage"
+	"github.com/ChisaAlter/WhaleBridge/internal/redact"
+	"github.com/ChisaAlter/WhaleBridge/internal/usage"
 )
 
 // Recent-call bodies are diagnostics, not an unbounded traffic log. Keeping the

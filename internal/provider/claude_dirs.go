@@ -20,7 +20,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/proc"
+	"github.com/ChisaAlter/WhaleBridge/internal/proc"
 	"golang.org/x/text/unicode/norm"
 )
 

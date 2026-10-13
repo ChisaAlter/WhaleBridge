@@ -30,8 +30,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/redact"
-	"github.com/yetone/magpie/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/redact"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // Putter is a bucket the archive is written to.

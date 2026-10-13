@@ -28,23 +28,23 @@ import (
 
 	"github.com/tidwall/gjson"
 
-	"github.com/yetone/magpie/internal/awake"
+	"github.com/ChisaAlter/WhaleBridge/internal/awake"
 
-	"github.com/yetone/magpie/internal/netproxy"
-	"github.com/yetone/magpie/internal/plugin"
-	"github.com/yetone/magpie/internal/provider"
-	"github.com/yetone/magpie/internal/redact"
-	"github.com/yetone/magpie/internal/settings"
-	"github.com/yetone/magpie/internal/usage"
+	"github.com/ChisaAlter/WhaleBridge/internal/netproxy"
+	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/redact"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/usage"
 )
 
 // DefaultAddr is where the gateway listens unless Settings' port or
 // MAGPIE_ADDR says otherwise.
 const DefaultAddr = "127.0.0.1:3425"
 
-// Token is the bearer token agents are told to use. The gateway only
-// listens on loopback and accepts anything, but agents insist on one.
-const Token = "magpie"
+// Token is the credential written by the client adapters. WhaleBridge sets it
+// to its persisted private gateway key before any adapter reads or writes.
+var Token = "magpie"
 
 // TokenFor is the token an agent that says nothing of itself in its
 // User-Agent is told to use, so the gateway still knows it: Alma's requests

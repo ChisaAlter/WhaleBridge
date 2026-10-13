@@ -9,7 +9,7 @@ import (
 	"sync"
 	"unicode"
 
-	"github.com/yetone/magpie/internal/usage"
+	"github.com/ChisaAlter/WhaleBridge/internal/usage"
 )
 
 // A request passed on to another computer's magpie (a Remote magpie

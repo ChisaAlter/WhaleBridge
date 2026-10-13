@@ -7,7 +7,7 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // Bound a single body and its read time without limiting how long a client

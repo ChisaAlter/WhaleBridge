@@ -8,7 +8,7 @@ import (
 	"path/filepath"
 	"slices"
 
-	"github.com/yetone/magpie/internal/filememo"
+	"github.com/ChisaAlter/WhaleBridge/internal/filememo"
 )
 
 // SessionIdentity is an account's public identity, without its credentials.

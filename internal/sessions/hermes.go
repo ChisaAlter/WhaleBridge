@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/appdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 )
 
 // Hermes stores canonical, non-overlapping input/cache buckets. Reasoning is

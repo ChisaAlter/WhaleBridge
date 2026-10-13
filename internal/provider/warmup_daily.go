@@ -27,7 +27,7 @@ package provider
 import (
 	"time"
 
-	"github.com/yetone/magpie/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // dailySlack is how late a day's start is still sent: a machine that

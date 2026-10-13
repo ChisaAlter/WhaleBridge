@@ -23,7 +23,7 @@ package provider
 import (
 	"slices"
 
-	"github.com/yetone/magpie/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // CodexCredits says whether the Codex account user spends its credits

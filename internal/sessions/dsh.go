@@ -13,7 +13,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/yetone/magpie/internal/appdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 )
 
 // DeepSeek Harness (dsh) keeps a session in a folder of its own, under

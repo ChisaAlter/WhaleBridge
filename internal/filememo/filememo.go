@@ -8,7 +8,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/steady"
+	"github.com/ChisaAlter/WhaleBridge/internal/steady"
 )
 
 type entry struct {

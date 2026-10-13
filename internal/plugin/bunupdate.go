@@ -23,9 +23,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/catalog"
-	"github.com/yetone/magpie/internal/steady"
-	"github.com/yetone/magpie/internal/update"
+	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/steady"
+	"github.com/ChisaAlter/WhaleBridge/internal/update"
 )
 
 // bunSettle is how long a Bun release is out before magpie takes it.

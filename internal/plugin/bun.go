@@ -18,8 +18,8 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/yetone/magpie/internal/catalog"
-	"github.com/yetone/magpie/internal/source"
+	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/source"
 )
 
 // BunVersion is the Bun magpie downloads to run plugins with the first

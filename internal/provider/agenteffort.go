@@ -6,7 +6,7 @@ import (
 	"slices"
 	"strings"
 
-	"github.com/yetone/magpie/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // An agent whose own config can't carry a reasoning effort (Cursor Private

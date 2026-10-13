@@ -28,7 +28,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/proc"
+	"github.com/ChisaAlter/WhaleBridge/internal/proc"
 )
 
 // CodexDaemonRestart is the command that restarts Codex's app-server, for

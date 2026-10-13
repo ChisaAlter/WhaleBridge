@@ -11,14 +11,14 @@ import (
 	"strings"
 	"time"
 
-	"github.com/yetone/magpie/internal/backup"
-	"github.com/yetone/magpie/internal/catalog"
-	"github.com/yetone/magpie/internal/davsync"
-	"github.com/yetone/magpie/internal/fx"
-	"github.com/yetone/magpie/internal/gateway"
-	"github.com/yetone/magpie/internal/provider"
-	"github.com/yetone/magpie/internal/settings"
-	"github.com/yetone/magpie/internal/usage"
+	"github.com/ChisaAlter/WhaleBridge/internal/backup"
+	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/davsync"
+	"github.com/ChisaAlter/WhaleBridge/internal/fx"
+	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/usage"
 )
 
 var globalSettingKeys = strings.Fields("proxy currency chineseUnits searcher searchFirst vision imageGen redact redactPersonal redactWords redactRules plainNames plainOwnNames memberModel fullContext compactAt quotaLeft usageAlert balanceAlert resetReminder requestArchive requestArchiveMaxMB")

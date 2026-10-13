@@ -4,7 +4,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/yetone/magpie/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // WhaleBridgeQuotaNotice is an alert emitted by subscription maintenance.

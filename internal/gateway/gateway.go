@@ -1221,7 +1221,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 	// turnedAway and record twice.
 	logged := func() {
 		rec := usage.Record{Time: start, Agent: call.Agent, Via: call.Via, Provider: call.Provider, Model: call.Model, Requested: call.Model,
-			Millis: call.Millis, Status: call.Status, Rejected: true, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind, Endpoint: endpointOf(r, from, ""), Archive: call.archiveName()}
+			Millis: call.Millis, Status: call.Status, Rejected: true, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind, Endpoint: endpointOf(r, from, "", provider.Provider{}, ""), Archive: call.archiveName()}
 		failedWith(&rec, call.Status, call.Error, "")
 		withBodies(&rec, &call)
 		appendUsage(r, rec)
@@ -1626,8 +1626,9 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		telemetry.routeID = tr.ID
 	}
 	var skipped []string
-	sent := ""       // the reasoning the last try's model was asked for
-	where := ""      // the last try's provider.Where, for the usage
+	sent := ""  // the reasoning the last try's model was asked for
+	where := "" // the last try's provider.Where, for the usage
+	var lastTried provider.Provider
 	again := 0       // times the last one left has been tried again
 	resealed := 0    // what of the conversation another account sealed was taken out: its reasoning, then its compaction
 	repicked := 0    // times Copilot's Auto was asked again for a model the account is served
@@ -1677,6 +1678,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 		}
 		call.Provider, call.To, call.Usage = c.p.ID, "", Usage{}
 		model = c.model
+		lastTried = c.p
 		where = c.p.Where()
 		providerKeyID, providerKeyName = "", ""
 		if c.p.Account == nil && c.p.Key != "" {
@@ -2018,7 +2020,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 					Input: call.Usage.Input, Output: call.Usage.Output, CacheRead: call.Usage.CacheRead,
 					CacheWrite: call.Usage.CacheWrite, CacheWrite1h: call.Usage.CacheWrite1h, Reasoning: call.Usage.Reasoning, Effort: sent, Millis: time.Since(began).Milliseconds(), Status: call.Status,
 					TTFT: try.TTFT, FirstText: try.FirstText, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
-					RequestID: call.Usage.RequestID, Endpoint: endpointOf(r, from, call.To), Archive: call.archiveName()}
+					RequestID: call.Usage.RequestID, Endpoint: endpointOf(r, from, call.To, c.p, c.model), Archive: call.archiveName()}
 				failedWith(&rec, call.Status, call.Error, call.Usage.ErrType)
 				// what this account answered is its refusal, the reply
 				// captured so far being no one's yet
@@ -2055,7 +2057,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 					Input: call.Usage.Input, Output: call.Usage.Output, CacheRead: call.Usage.CacheRead,
 					CacheWrite: call.Usage.CacheWrite, CacheWrite1h: call.Usage.CacheWrite1h, Reasoning: call.Usage.Reasoning, Effort: sent, Millis: time.Since(began).Milliseconds(), Status: call.Status,
 					TTFT: try.TTFT, FirstText: try.FirstText, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
-					RequestID: call.Usage.RequestID, Endpoint: endpointOf(r, from, call.To), Archive: call.archiveName()}
+					RequestID: call.Usage.RequestID, Endpoint: endpointOf(r, from, call.To, c.p, c.model), Archive: call.archiveName()}
 				failedWith(&rec, call.Status, call.Error, call.Usage.ErrType)
 				// what this account answered is its refusal, the reply
 				// captured so far being no one's yet
@@ -2355,7 +2357,7 @@ func (s *Server) serve(w http.ResponseWriter, r *http.Request, from provider.Pro
 			Input: call.Usage.Input, Output: call.Usage.Output, CacheRead: call.Usage.CacheRead,
 			CacheWrite: call.Usage.CacheWrite, CacheWrite1h: call.Usage.CacheWrite1h, Reasoning: call.Usage.Reasoning, Effort: sent, Millis: call.Millis, Status: call.Status,
 			TTFT: call.TTFT, FirstText: call.FirstText, Sent: sentMs, Session: sessionOf(r.Header), NativeSession: nativeSessionOf(r.Header), Kind: call.Kind,
-			RequestID: call.Usage.RequestID, ResponseID: call.Usage.ResponseID, Endpoint: endpointOf(r, from, call.To), Stop: call.Usage.Stop, Archive: call.archiveName()}
+			RequestID: call.Usage.RequestID, ResponseID: call.Usage.ResponseID, Endpoint: endpointOf(r, from, call.To, lastTried, model), Stop: call.Usage.Stop, Archive: call.archiveName()}
 		failedWith(&rec, call.Status, call.Error, call.Usage.ErrType)
 		withBodies(&rec, &call)
 		appendUsage(r, rec)
@@ -2474,7 +2476,7 @@ func (s *Server) attempt(w http.ResponseWriter, r *http.Request, from provider.P
 	// field. A client that asked for one JSON body is translated, which
 	// reads that SSE and writes the JSON. Relaying it would hand the client
 	// the data: lines under a 200.
-	if relay && from == provider.Gemini && !streamOf(body) {
+	if relay && from == provider.Gemini && !streamOf(body) && !p.IsVertex() {
 		relay = false
 	}
 	if relay {
@@ -2626,6 +2628,10 @@ func (s *Server) forwardOnce(ctx context.Context, p provider.Provider, to provid
 	body = toolOneOfAsAnyOf(p, to, body)
 	body = kimiToolEnumTypes(p, to, body)
 	body = clinePin(p, to, body)
+	if to == provider.Gemini && !p.FactoryGemini() {
+		// Native Gemini and Vertex put the model in the request path.
+		body = withoutFields(body, "model")
+	}
 	if to == provider.Anthropic {
 		body = s.bodyBetas(p, body)
 		body = s.withoutRefusedShapes(p, body)
@@ -2778,6 +2784,7 @@ func codexClientHeader(k string) bool {
 // written, when the provider serves the model on another of its endpoints
 // but not this one.
 func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.Provider, proto provider.Protocol, model string, body []byte, u *Usage) (status int, msg string, done bool) {
+	geminiWhole := proto == provider.Gemini && !streamOf(body)
 	body = rewriteModel(body, provider.UpstreamNameIn(wiresOf(r.Context()), p.ID, model))
 	searchFn := false // Codex's tool search sent as a function
 	switch proto {
@@ -2860,7 +2867,10 @@ func (s *Server) passthrough(w http.ResponseWriter, r *http.Request, p provider.
 	if e := fitFor(p, model, asked); asked != "" && e != asked {
 		body = withBodyEffort(proto, body, e)
 	}
-	path := pathOf(proto)
+	path := upstreamPath(p, proto, provider.UpstreamNameIn(wiresOf(r.Context()), p.ID, model))
+	if proto == provider.Gemini && p.IsVertex() && geminiWhole {
+		path = provider.VertexWholePath(provider.UpstreamNameIn(wiresOf(r.Context()), p.ID, model))
+	}
 	if proto == provider.Anthropic && p.Account == nil && fromClaudeCode(r.Header) && r.URL.Query().Get("beta") == "true" {
 		path += "?beta=true" // as Claude Code asks it
 	}
@@ -3263,6 +3273,9 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			r.Effort, req = e, &r
 		}
 	}
+	if p.IsVertex() {
+		req = vertexEffort(req, p.Efforts(model))
+	}
 	// the names in force, read once however many endpoints the request is
 	// built for below
 	wires := wiresOf(ctx)
@@ -3302,7 +3315,7 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			r := *req
 			r.GeminiCompat, req = want, &r
 		}
-		body, err := build(to, req, model, p.Host(), p.RejectsTemperature(model))
+		body, err := buildFor(p, to, req, model)
 		if err != nil {
 			return nil, to, err
 		}
@@ -3325,7 +3338,7 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			// about
 			body = rewriteModel(body, wire)
 		}
-		path := pathOf(to)
+		path := upstreamPath(p, to, provider.UpstreamNameIn(wires, p.ID, model))
 		if req.Resume && to == provider.Chat && chatPrefill(p.Host(), model) == "prefix" {
 			// DeepSeek serves its prefix mode under /beta, beside the /v1
 			// the base carries
@@ -3354,7 +3367,7 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			s.markUnfit(p.ID, thinkingConfigField, to)
 			continue
 		}
-		if offEffort(req.Effort) && res.StatusCode == http.StatusBadRequest && effortLevelsNamed.Match(b) {
+		if offEffort(req.Effort) && res.StatusCode == http.StatusBadRequest && (effortLevelsNamed.Match(b) || p.IsVertex() && geminiRefusedLevel(b) != "") {
 			// reasoning turned off, which the model refuses naming the
 			// levels it takes (Command Code's `expected one of "low"|…`
 			// for Claude Code's auto mode classifier, #394): asked again
@@ -3363,6 +3376,14 @@ func (s *Server) forwardTranslated(ctx context.Context, p provider.Provider, to 
 			r := *req
 			r.Effort, req = onEffort(p, model), &r
 			continue
+		}
+		if p.IsVertex() && res.StatusCode == http.StatusBadRequest && vertexSignatureRefused.Match(b) {
+			// A conversation moved between APIs may carry another API's
+			// signature. Google's documented skip value is used once.
+			if r, had := withoutSignatures(req); had {
+				req = r
+				continue
+			}
 		}
 		if forcesTool(req.ToolChoice) && res.StatusCode == http.StatusBadRequest && toolChoiceRefused.Match(b) {
 			// a model that can't be made to call a tool (#668): asked
@@ -3863,6 +3884,18 @@ func pathOf(proto provider.Protocol) string {
 	return "/v1/messages"
 }
 
+// upstreamPath keeps Factory's generate route and uses Google's model path
+// for a native Gemini or Vertex provider.
+func upstreamPath(p provider.Provider, proto provider.Protocol, model string) string {
+	if proto == provider.Gemini && p.IsVertex() {
+		return provider.VertexPath(model)
+	}
+	if proto == provider.Gemini && !p.FactoryGemini() {
+		return provider.GeminiPath(model, true)
+	}
+	return pathOf(proto)
+}
+
 // parse is shared by translated routes and account/subscription backends.
 // Only the allowlist contracts below promise a required callable function:
 // other protocols have server, custom and MCP tools the IR cannot render.
@@ -3909,6 +3942,13 @@ func requiredAllowlist(proto provider.Protocol, body []byte) bool {
 		return json.Unmarshal(body, &q) == nil && strings.EqualFold(q.ToolConfig.FunctionCallingConfig.Mode, "ANY") && len(q.ToolConfig.FunctionCallingConfig.AllowedFunctionNames) > 0
 	}
 	return false
+}
+
+func buildFor(p provider.Provider, proto provider.Protocol, r *Request, model string) ([]byte, error) {
+	if proto == provider.Gemini && p.IsVertex() {
+		return buildVertex(r, model)
+	}
+	return build(proto, r, model, p.Host(), p.RejectsTemperature(model))
 }
 
 func build(proto provider.Protocol, r *Request, model, host string, rejectTemp bool) ([]byte, error) {

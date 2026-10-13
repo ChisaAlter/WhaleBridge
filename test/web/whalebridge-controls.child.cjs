@@ -14,6 +14,14 @@ let globalSettings = {}, modelPrices = {'*/fixture-b':{input:11,output:12,cache_
 let heldPath, releaseRequest, rejectRequest=false, failureText='requested operation failed', loginStatus="installing";
 const loginIds=[];
 const provider = { id:'qa', name:'QA supplier', modelCount:1, models:['qa-model'], chat:'http://127.0.0.1:9999/v1' };
+const sourcePresets=[
+ {id:'deepseek',name:'DeepSeek',kind:'vendor',chat:'https://api.deepseek.com',note:'官方 API'},
+ {id:'clinepass',name:'ClinePass',kind:'relay',chat:'https://api.cline.bot/api/v1',note:'open coding models, $9.99/month',only:'cline-pass/',models:['cline-pass/qa-model']},
+ {id:'qa-plan',name:'QA Cloud',kind:'vendor',regions:[{id:'api',name:'Pay as you go',chat:'https://qa.invalid/v1'},{id:'coding',name:'Coding Plan',chat:'https://qa.invalid/coding/v1'}]},
+ {id:'google-vertex',name:'Google Vertex AI',kind:'vendor',note:'Google Cloud project and credentials',headerHints:['X-Vertex-AI-LLM-Request-Type','X-Vertex-AI-LLM-Shared-Request-Type']},
+ {id:'qa-local',name:'Local QA model service',kind:'local',noKey:true,note:'运行在本机的模型服务'},
+ {id:'qa-sponsored',name:'QA upstream sponsor',kind:'partner',chat:'https://sponsor.invalid/v1',notes:{zh:'中文赞助目录说明',en:'Sponsored vendor note'}},
+];
 const catalog = () => installed
  ? [{id:'cursor-adapter',pid:'cursor',name:'Cursor',plugin:true,methods:[{type:'oauth',label:'OAuth'}]}]
  : [{id:'claude',name:'Claude'},{id:'cursor',name:'Cursor',package:'@fixture/cursor'}];
@@ -28,7 +36,8 @@ const server = http.createServer(async (req,res) => {
  let bytes='';for await (const chunk of req)bytes+=chunk;
  const body=bytes?JSON.parse(bytes):undefined;calls.push({path:u.pathname,body});
  if(u.pathname===heldPath){await new Promise(resolve=>releaseRequest=resolve);if(rejectRequest){res.writeHead(500);res.end(failureText);return;}}
- if(u.pathname==='/api/state')return json({version:'controls-test',providers:[provider,{...provider,id:'qa2',name:'Second supplier',account:true}],models:[{id:'qa/qa-model',name:'QA'}],hidden:[],groups:[{id:'qa-group',name:'QA group',members:['qa/qa-model'],routing:'order'}],presets:[]});
+ if(u.pathname==='/api/state')return json({version:'controls-test',providers:[provider,{...provider,id:'qa2',name:'Second supplier',account:true}],models:[{id:'qa/qa-model',name:'QA'}],hidden:[],groups:[{id:'qa-group',name:'QA group',members:['qa/qa-model'],routing:'order'}],presets:sourcePresets});
+ if(u.pathname==='/api/provider/presets')return json(sourcePresets);
  if(u.pathname==='/api/subscriptions') { if(catalogHeld){releaseCatalog=()=>json(catalog());return;}return json(catalog()); }
  if(u.pathname==='/api/subscription/adapter') {
   assert.equal(req.headers.accept,'application/x-ndjson');res.writeHead(200,{'Content-Type':'application/x-ndjson'});
@@ -72,12 +81,67 @@ async function run(){
  const screenshot=async name=>{if(!process.env.WHALEBRIDGE_QA_SCREENSHOTS)return;await js(`Promise.all(document.getAnimations().filter(a=>a.effect.getTiming().iterations!==Infinity).map(a=>a.finished))`);await js(`new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))`);fs.mkdirSync(process.env.WHALEBRIDGE_QA_SCREENSHOTS,{recursive:true});fs.writeFileSync(path.join(process.env.WHALEBRIDGE_QA_SCREENSHOTS,name+'.png'),(await win.webContents.capturePage()).toPNG());};
  const resize=async(width,height)=>{win.setContentSize(width,height);try{await wait(`innerWidth===${width}&&innerHeight===${height}`);}catch(error){const observed={requested:{width,height},contentBounds:win.getContentBounds(),windowBounds:win.getBounds(),renderer:await js(`({width:innerWidth,height:innerHeight,dpr:devicePixelRatio})`)};if(process.env.WHALEBRIDGE_QA_SCREENSHOTS){fs.writeFileSync(path.join(process.env.WHALEBRIDGE_QA_SCREENSHOTS,'resize-unsettled.json'),JSON.stringify(observed,null,2));await screenshot('resize-unsettled');}throw Error(error.message+' '+JSON.stringify(observed));}};
  const close=()=>js(`new Promise(r=>{const d=document.querySelector('#editor');d.addEventListener('close',r,{once:true});d.close();})`);
- const subscribe=async()=>{releaseInstall=undefined;await click('[data-action="subscription"]');await wait(`document.querySelector('#editor').open&&editor?.type==='subscription'&&!editor.closed&&document.querySelector('#f-agent option[value="cursor"]')`);await js(`document.querySelector('#f-agent').value='cursor';document.querySelector('#f-agent').dispatchEvent(new Event('change'))`);};
+ const addProvider=async()=>{await click('[data-action="add-provider"]');await wait(`document.querySelector('#editor').open&&document.querySelector('[data-source-command="custom"]')`);await click('[data-source-command="custom"]');await wait(`editor?.type==='provider'&&!editor.closed`);};
+ const subscribe=async()=>{releaseInstall=undefined;await click('[data-action="subscription"]');await wait(`document.querySelector('#editor').open&&!editor.loading&&document.querySelector('[data-source-key="subscription:cursor"]')`);await click('[data-source-key="subscription:cursor"]');await wait(`editor?.type==='subscription'&&!editor.closed&&document.querySelector('#f-agent option[value="cursor"]')`);};
  const installStarted=async()=>{const end=Date.now()+7000;while(!releaseInstall&&Date.now()<end)await new Promise(r=>setTimeout(r,20));assert.ok(releaseInstall,'installation request reached backend');};
  try{
   await win.loadURL(`http://127.0.0.1:${server.address().port}/`);await wait(`document.querySelector('#content').getAttribute('aria-busy')==='false'`);
   await js(`(()=>{const actual=api;window.__qaApiSettled=Object.create(null);api=async function(...args){const key='/api/'+args[0].split('?')[0],row=window.__qaApiSettled[key]??={fulfilled:0,rejected:0,settled:0};try{const result=await actual.apply(this,args);row.fulfilled++;return result;}catch(error){row.rejected++;throw error;}finally{row.settled++;}};})()`);
   const focused=['ownership-and-messages','messages-only'].includes(process.env.WHALEBRIDGE_QA_FOCUS),messagesOnly=process.env.WHALEBRIDGE_QA_FOCUS==='messages-only';
+  if(!focused){
+   const writesBefore=calls.filter(c=>c.body!==undefined).length;
+   const search=async value=>{await js(`(()=>{const q=document.querySelector('#source-search');q.value=${JSON.stringify(value)};q.dispatchEvent(new Event('input',{bubbles:true}));})()`);};
+   const scope=async value=>{await js(`(()=>{const s=document.querySelector('#source-scope');s.value=${JSON.stringify(value)};s.dispatchEvent(new Event('change',{bubbles:true}));})()`);};
+   await click('[data-action="add-provider"]');await wait(`editor?.type==='sources'&&!editor.loading`);
+   assert.equal(await js(`document.querySelector('#source-scope').value`),'all');
+   assert.equal(await js(`document.querySelector('#save').hidden`),true);
+   assert.equal(await js(`document.activeElement.id`),'source-search');
+   assert.equal(await js(`document.querySelectorAll('[data-source-pick]').length`),sourcePresets.length+catalog().length,'all actual catalog entries are reachable');
+   await search('中文赞助');assert.equal(await js(`document.querySelectorAll('[data-source-pick]').length`),1);assert.match(await js(`document.querySelector('#source-results').textContent`),/上游赞助供应商.*由供应商赞助的目录条目.*中文赞助目录说明/s);
+   await search('Sponsored vendor note');assert.equal(await js(`document.querySelectorAll('[data-source-pick]').length`),1,'English note is searchable while Chinese is displayed');
+   await search('本机');assert.equal(await js(`document.querySelectorAll('[data-source-pick]').length`),1);assert.match(await js(`document.querySelector('#source-results').textContent`),/API 密钥可选/);
+   await search('nothing-matches-this-source');assert.match(await js(`document.querySelector('#source-results').textContent`),/没有匹配.*自定义接口.*适配器/s);
+   assert.equal(await js(`document.activeElement.id`),'source-search','typing preserves keyboard focus');
+   await search('ClinePass');await js(`document.querySelector('#source-search').dispatchEvent(new KeyboardEvent('keydown',{key:'ArrowDown',bubbles:true,cancelable:true}))`);assert.equal(await js(`document.activeElement.dataset.sourceKey`),'preset:clinepass');
+   await click('[data-source-key="preset:clinepass"]');await wait(`editor?.type==='provider'`);
+   assert.equal(await js(`document.querySelector('#f-preset').value`),'clinepass');assert.equal(await js(`document.querySelector('#f-chat').value`),'https://api.cline.bot/api/v1');assert.equal(await js(`document.querySelector('#f-key').disabled`),false);assert.equal(await js(`document.querySelector('#f-agent')`),null,'a ClinePass key does not open a pretend OAuth login');
+   await click('[data-source-command="back"]');await wait(`editor?.type==='sources'&&!editor.loading`);assert.equal(await js(`document.querySelector('#source-search').value`),'ClinePass');
+   await search('Vertex');assert.match(await js(`document.querySelector('#source-results').textContent`),/Google Cloud 凭据/);await click('[data-source-key="preset:google-vertex"]');await wait(`editor?.type==='provider'`);
+   assert.equal(await js(`document.querySelector('#f-vertexProject').required&&!document.querySelector('#f-vertexProject').disabled`),true);assert.equal(await js(`document.querySelector('#f-vertexLocation').value`),'global');assert.equal(await js(`document.querySelector('#f-key').disabled&&document.querySelector('#provider-api-auth').hidden`),true);
+   await click('#save');assert.equal(await js(`document.querySelector('#f-vertexProject').checkValidity()`),false,'a project is required before saving Vertex');
+   await js(`document.querySelector('#f-vertexProject').value='qa-vertex-project';document.querySelector('#f-vertexLocation').value='us-central1';document.querySelector('#f-vertexCredentials').value='C:/qa-only/dummy-vertex-credentials.json'`);
+   await click('#editor-nav [data-section-target="headers"]');await click('[data-action="add-header"]');
+   await js(`document.querySelector('#header-list .header-row:last-child .header-name').value='X-QA-Required'`);
+   await click('#save');await wait(`!document.querySelector('#form-error').hidden&&!document.querySelector('#save').disabled`);
+   assert.equal(await js(`document.querySelector('#form-error').textContent`),'请填写 HTTP Header X-QA-Required 的值');
+   assert.equal(calls.filter(c=>c.body!==undefined).length,writesBefore,'a manually added named header with no value still blocks the original save');
+   await click('#header-list .header-row:last-child [data-action="remove-header"]');
+   assert.deepEqual(await js(`[...document.querySelectorAll('#header-list .header-name')].map(i=>i.value)`),sourcePresets.find(p=>p.id==='google-vertex').headerHints,'both official optional header hints remain in the form');
+   await click('#editor-nav [data-section-target="connection"]');await click('#save');await wait(`editor?.type==='connection-success'&&!document.querySelector('#save').disabled`);
+   const vertexSaves=calls.filter(c=>c.path==='/api/provider'&&c.body!==undefined);assert.equal(vertexSaves.length,1,'valid Vertex settings reach the actual provider POST once');
+   assert.equal(vertexSaves[0].body.preset,'google-vertex');assert.deepEqual(vertexSaves[0].body.vertex,{project:'qa-vertex-project',location:'us-central1',credentials:'C:/qa-only/dummy-vertex-credentials.json',impersonate:''});assert.deepEqual(vertexSaves[0].body.headers,{},'blank official header hints are omitted from the saved headers');
+   assert.equal(calls.filter(c=>c.body!==undefined).length,writesBefore+1,'only the explicit valid Vertex save writes');
+   await close();await click('[data-action="add-provider"]');await wait(`editor?.type==='sources'&&!editor.loading`);await search('Vertex');await click('[data-source-key="preset:google-vertex"]');await wait(`editor?.type==='provider'`);
+   await js(`document.querySelector('#f-preset').value='deepseek';document.querySelector('#f-preset').dispatchEvent(new Event('change',{bubbles:true}))`);assert.equal(await js(`document.querySelector('#f-key').disabled||document.querySelector('#provider-api-auth').hidden||document.querySelector('#provider-api-endpoints').hidden`),false);assert.equal(await js(`document.querySelector('#f-vertexProject').required`),false);assert.equal(await js(`document.querySelector('#f-vertexProject').disabled`),true);
+   await close();await click('[data-action="subscription"]');await wait(`editor?.type==='sources'&&!editor.loading`);assert.equal(await js(`document.querySelector('#source-scope').value`),'plans');assert.ok(await js(`document.querySelector('[data-source-key="preset:clinepass"]')&&document.querySelector('[data-source-key="preset:qa-plan"]')&&document.querySelector('[data-source-key="subscription:claude"]')`));assert.equal(await js(`!!document.querySelector('[data-source-key="preset:deepseek"]')`),false);
+   await scope('all');assert.ok(await js(`document.querySelector('[data-source-key="preset:deepseek"]')`));
+   await click('[data-source-command="adapters"]');await wait(`editor?.type==='adapters'`);assert.equal(await js(`document.querySelector('#adapter-search-query').closest('.editor-section').hidden`),false,'the more-sources action opens actual adapter discovery');
+   await click('[data-source-command="back"]');await wait(`editor?.type==='sources'&&!editor.loading`);await click('[data-source-key="subscription:claude"]');await wait(`editor?.type==='subscription'&&document.querySelector('#f-agent')`);assert.equal(await js(`document.querySelector('#f-agent').value`),'claude');
+   assert.equal(calls.filter(c=>c.body!==undefined).length,writesBefore+1,'browsing and choosing a source add no writes after the one explicit Vertex save');
+   for(const [action,expectedScope] of [['add-provider','all'],['subscription','plans']]){
+    const presetReads=calls.filter(c=>c.path==='/api/provider/presets').length,subscriptionReads=calls.filter(c=>c.path==='/api/subscriptions').length;
+    await click('#cancel-editor');
+    assert.equal(await js(`document.querySelector('#editor').open`),false,'the original close click closes the dialog synchronously');
+    await click(`[data-action="${action}"]`);
+    await wait(`document.querySelector('#editor').open&&editor?.type==='sources'&&!editor.closed&&!editor.loading&&document.querySelector('[data-source-key="preset:clinepass"]')`);
+    assert.equal(await js(`document.querySelector('#source-scope').value`),expectedScope,'immediate reopen retains the original button scope');
+    assert.equal(calls.filter(c=>c.path==='/api/provider/presets').length,presetReads+1,'the reopened directory completes its actual preset GET');
+    assert.equal(calls.filter(c=>c.path==='/api/subscriptions').length,subscriptionReads+1,'the reopened directory completes its actual subscriptions GET');
+    assert.equal(calls.filter(c=>c.body!==undefined).length,writesBefore+1,'closing and immediately reopening sources add no writes or sign-in after the one explicit Vertex save');
+   }
+   await close();
+   if(process.env.WHALEBRIDGE_QA_FOCUS==='sources-only'){console.log('WHALEBRIDGE_CONTROLS_RESULT:'+JSON.stringify({sourceCatalog:true,sourceSearch:true,sourceKeyboard:true,sourceScopes:true,sourceClinePass:true,sourceVertex:true,sourceVertexSave:true,sourceRequiredHeaderValidation:true,sourceSponsor:true,sourceAdapters:true,sourceNoAutomaticWrites:true,sourceImmediateReopen:true}));return;}
+  }
   const changeProxy=mode=>js(`(()=>{const p=document.querySelector('#global-form [name="proxyMode"]');p.value=${JSON.stringify(mode)};p.dispatchEvent(new Event('change',{bubbles:true}));})()`);
   let heldApiBaseline=0;
   const held=async()=>{const end=Date.now()+7000;while(!releaseRequest&&Date.now()<end)await new Promise(r=>setTimeout(r,20));assert.ok(releaseRequest,'request reached backend');heldApiBaseline=await js(`window.__qaApiSettled[${JSON.stringify(heldPath)}]?.settled||0`);};
@@ -95,7 +159,7 @@ async function run(){
   assert.equal(await js(`document.querySelector('#f-agent').disabled||document.querySelector('#save').disabled`),false);await close();
   failing=false;await subscribe();await click('[data-action="install-adapter"]');await wait(`document.querySelector('[data-action="install-adapter"] .button-spinner')`);await installStarted();releaseStage();catalogHeld=true;releaseInstall();await wait(`document.querySelector('[data-action="install-adapter"]').textContent==='安装中'`);
   while(!releaseCatalog)await new Promise(r=>setTimeout(r,20));
-  await close();await click('[data-action="add-provider"]');await wait(`editor?.type==='provider'`);releaseCatalog();catalogHeld=false;
+  const completeInstallCatalog=releaseCatalog;catalogHeld=false;await close();await addProvider();completeInstallCatalog();
   await wait(`document.querySelector('#editor-title').textContent==='添加供应商'`);assert.equal(await js(`document.querySelector('#adapter-progress').hidden`),true);await close();
   await click('[data-tab="providers"]');await wait(`document.querySelector('details.menu summary')`);
   for(const scheme of ['light','dark']){nativeTheme.themeSource=scheme;
@@ -164,7 +228,7 @@ async function run(){
   const screenshotPair=async(name,selector)=>{for(const [width,height,label] of [[1120,780,'normal'],[380,520,'narrow']]){await resize(width,height);if(selector)await js(`document.querySelector(${JSON.stringify(selector)}).scrollIntoView({block:'center'})`);await screenshot(name+'-'+label);}await resize(1120,780);};
   const section=async key=>{await click(`[data-global-section="${key}"]`);await wait(`document.querySelector('[data-global-section="${key}"]').getAttribute('aria-selected')==='true'&&document.querySelector('#content').getAttribute('aria-busy')==='false'`);};
   if(!messagesOnly){
-  const providerDraft=async(name,id)=>{await click('[data-tab="providers"]');await wait(`document.querySelector('[data-action="add-provider"]')`);await click('[data-action="add-provider"]');await wait(`document.querySelector('#editor').open&&document.querySelector('#f-name')&&document.querySelector('#f-id')`);await type('#f-name',name);await type('#f-id',id);};
+  const providerDraft=async(name,id)=>{await click('[data-tab="providers"]');await wait(`document.querySelector('[data-action="add-provider"]')`);await addProvider();await wait(`document.querySelector('#f-name')&&document.querySelector('#f-id')`);await type('#f-name',name);await type('#f-id',id);};
   const assertProviderDraft=async(name,id)=>assert.deepEqual(await js(`({open:document.querySelector('#editor').open,title:document.querySelector('#editor-title').textContent,name:document.querySelector('#f-name')?.value,id:document.querySelector('#f-id')?.value,enabled:!document.querySelector('#save').disabled,errorHidden:document.querySelector('#form-error').hidden})`),{open:true,title:'添加供应商',name,id,enabled:true,errorHidden:true});
   const quotas=async()=>{await click('[data-tab="usage"]');await wait(`document.querySelector('[data-global-section="quotas"]')`);await click('[data-global-section="quotas"]');await wait(`document.querySelector('[data-action="quota-settings"]')`);};
   for(const [action,savePath,name,id] of [['subscription-settings','/api/subscription/settings','Subscription return draft','subscription-return'],['quota-settings','/api/accounts/settings','Account return draft','account-return']]){

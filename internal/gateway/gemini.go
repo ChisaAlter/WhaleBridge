@@ -92,10 +92,21 @@ type gRequest struct {
 // {parts:[{text}]}. droid sends no stream field; Factory answers SSE either
 // way, and a client that asked for JSON is given it after the fact.
 func buildGemini(r *Request, model string) ([]byte, error) {
+	req, err := geminiRequest(r, model, "gemini")
+	if err != nil {
+		return nil, err
+	}
+	req["model"] = model
+	return json.Marshal(req)
+}
+
+// geminiRequest is the request inside the Code Assist envelope, without
+// the envelope's model and Google's internal stream field.
+func geminiRequest(r *Request, model, agent string) (map[string]any, error) {
 	var wrap struct {
 		Request map[string]any `json:"request"`
 	}
-	if err := json.Unmarshal(buildCodeAssistSent(r, model, "gemini"), &wrap); err != nil {
+	if err := json.Unmarshal(buildCodeAssistSent(r, model, agent), &wrap); err != nil {
 		return nil, err
 	}
 	if wrap.Request == nil {
@@ -104,9 +115,8 @@ func buildGemini(r *Request, model string) ([]byte, error) {
 	if si, ok := wrap.Request["systemInstruction"].(map[string]any); ok {
 		delete(si, "role")
 	}
-	wrap.Request["model"] = model
 	delete(wrap.Request, "stream")
-	return json.Marshal(wrap.Request)
+	return wrap.Request, nil
 }
 
 // geminiCamel spells a Gemini request's fields in camelCase. Google's API

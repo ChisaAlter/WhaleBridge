@@ -1,7 +1,7 @@
 package provider
 
 // Search APIs answer a model's web search when no provider can (#419):
-// Tavily, Brave Search, Exa, Firecrawl, a SearXNG of the user's. They are
+// Tavily, Brave Search, Exa, Firecrawl, You.com, a SearXNG of the user's. They are
 // kept in providers.json beside the providers, their keys with theirs.
 
 import (
@@ -14,7 +14,9 @@ import (
 // SearchAPI is a web search API the user gave magpie a key to.
 type SearchAPI struct {
 	Vendor string `json:"vendor"` // one of SearchVendors
-	Key    string `json:"key,omitempty"`
+	// Key is its key, or several separated by commas (Keys), each tried
+	// when the one before is refused (#1477).
+	Key string `json:"key,omitempty"`
 	// URL is where it is: a SearXNG's own, or another address for one of
 	// the others (a Firecrawl run by the user); empty is the vendor's.
 	URL string `json:"url,omitempty"`
@@ -25,7 +27,15 @@ type SearchVendor struct {
 	ID, Name string
 	Base     string // its address, "" for one the user runs
 	KeysURL  string // where its keys are made
+	// KeyOptional: it answers with no key too (a SearXNG; You.com's free
+	// search, YouFreeSearch)
+	KeyOptional bool
 }
+
+// YouFreeSearch is You.com's search that takes no key (#1626): 100
+// searches a day for each address, then 429. With a key, You.com is
+// asked at its Base, ydc-index.io, instead.
+const YouFreeSearch = "https://api.you.com/v1/agents/search"
 
 // SearchVendors are the search APIs magpie can ask, in the order offered.
 var SearchVendors = []SearchVendor{
@@ -33,7 +43,8 @@ var SearchVendors = []SearchVendor{
 	{ID: "brave", Name: "Brave Search", Base: "https://api.search.brave.com", KeysURL: "https://api-dashboard.search.brave.com/app/keys"},
 	{ID: "exa", Name: "Exa", Base: "https://api.exa.ai", KeysURL: "https://dashboard.exa.ai/api-keys"},
 	{ID: "firecrawl", Name: "Firecrawl", Base: "https://api.firecrawl.dev", KeysURL: "https://www.firecrawl.dev/app/api-keys"},
-	{ID: "searxng", Name: "SearXNG"},
+	{ID: "you", Name: "You.com", Base: "https://ydc-index.io", KeysURL: "https://you.com/platform", KeyOptional: true},
+	{ID: "searxng", Name: "SearXNG", KeyOptional: true},
 }
 
 // SearchVendorOf is the vendor by its id.
@@ -43,6 +54,28 @@ func SearchVendorOf(id string) (SearchVendor, bool) {
 		return SearchVendor{}, false
 	}
 	return SearchVendors[i], true
+}
+
+// Keys are the keys in Key: one, or several the user gave separated by
+// commas, spaces or lines, each once, in the order given.
+func (a SearchAPI) Keys() []string {
+	var out []string
+	for _, k := range strings.FieldsFunc(a.Key, func(r rune) bool { return r == ',' || r == ';' || r == ' ' || r == '\t' || r == '\n' || r == '\r' }) {
+		if !slices.Contains(out, k) {
+			out = append(out, k)
+		}
+	}
+	return out
+}
+
+// MaskedKey is Key as shown: each of its keys masked (Mask), so a list of
+// them shows no more of any one than a single key does.
+func (a SearchAPI) MaskedKey() string {
+	ks := a.Keys()
+	for i, k := range ks {
+		ks[i] = Mask(k)
+	}
+	return strings.Join(ks, ", ")
 }
 
 // Name is the vendor's name.
@@ -63,15 +96,16 @@ func (a SearchAPI) Base() string {
 }
 
 // Ready is whether it can be asked: a vendor magpie knows, at an address,
-// with a key (a SearXNG may need none).
+// with a key where it needs one (a SearXNG, You.com, may not).
 func (a SearchAPI) Ready() bool {
-	_, known := SearchVendorOf(a.Vendor)
-	return known && a.Base() != "" && (a.Key != "" || a.Vendor == "searxng")
+	v, known := SearchVendorOf(a.Vendor)
+	return known && a.Base() != "" && (a.Key != "" || v.KeyOptional)
 }
 
 // check says what is wrong with a search API the user gives.
 func (a SearchAPI) check() error {
-	if _, ok := SearchVendorOf(a.Vendor); !ok {
+	v, ok := SearchVendorOf(a.Vendor)
+	if !ok {
 		var ids []string
 		for _, v := range SearchVendors {
 			ids = append(ids, v.ID)
@@ -83,11 +117,16 @@ func (a SearchAPI) check() error {
 		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
 			return fmt.Errorf("%s: %q is not an http:// or https:// address", a.Name(), a.URL)
 		}
+		// the API's own paths go after it (/search), so it can't end in a
+		// query or a fragment
+		if u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+			return fmt.Errorf("%s: %q has a ?query or #fragment; give its base URL alone", a.Name(), a.URL)
+		}
 	}
 	if a.Vendor == "searxng" && a.URL == "" {
 		return fmt.Errorf("SearXNG needs its address, as url=https://…")
 	}
-	if a.Key == "" && a.Vendor != "searxng" {
+	if a.Key == "" && !v.KeyOptional {
 		return fmt.Errorf("%s needs its API key", a.Name())
 	}
 	return nil
@@ -106,7 +145,7 @@ func StoredSearchAPIs() []SearchAPI { return load().Searches }
 // where it is; a change with no key keeps the key it has.
 func SetSearchAPI(a SearchAPI) error {
 	a.Vendor = strings.ToLower(strings.TrimSpace(a.Vendor))
-	a.Key, a.URL = strings.TrimSpace(a.Key), strings.TrimSpace(a.URL)
+	a.Key, a.URL = strings.Join(a.Keys(), ","), strings.TrimSpace(a.URL)
 	f, err := read()
 	if err != nil {
 		return err

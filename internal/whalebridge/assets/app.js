@@ -312,6 +312,14 @@ function configurePreset(pr,apply=false){
  }
  $('#preset-note').innerHTML=pr?`<div class="preset-summary"><strong>${escape(pr.name)}</strong><p>${escape(pr.note || '使用此供应商的 API 密钥接入。')}</p>${pr.noKey?`<p class="caption">${pr.keyHint?'仅使用免费模型可留空密钥；调用付费模型请配置密钥。':'本地服务可留空 API 密钥；启用认证的服务仍需提供凭据。'}</p>`:''}</div>`:'';
  $('#f-key')?.setAttribute('placeholder',p.keySet?`${p.keyMasked || '已保存'} · 留空保留`:pr?.noKey?'可选：无需认证或仅用免费模型时留空':'每行、空格或逗号分隔');
+ const vertex=pr?.id==='google-vertex';
+ $('#provider-api-auth')?.toggleAttribute('hidden',vertex);
+ $('#vertex-fields').hidden=!vertex;
+ for(const control of $('#vertex-fields').querySelectorAll('input'))control.disabled=!vertex;
+ $('#f-vertexProject').required=vertex;
+ if($('#f-key'))$('#f-key').disabled=vertex;
+ $('#provider-api-endpoints').hidden=vertex;
+ for(const control of $('#provider-api-endpoints').querySelectorAll('input,select'))control.disabled=vertex;
  $('#f-region')?.addEventListener('change',e=>{const r=regions.find(r=>r.id===e.target.value);if(r)fill(r);else updateWorkspace(pr);});
  $('#f-decide').oninput=()=>updateWorkspace(pr,regions.find(r=>r.id===$('#f-region')?.value));
  $('#f-workspace').oninput=()=>{const r=regions.find(r=>r.id===$('#f-region')?.value),template=r?.decide || pr?.decide || '';if(template.includes('{WorkspaceId}'))$('#f-decide').value=template.replace('{WorkspaceId}',$('#f-workspace').value.trim());};
@@ -330,7 +338,7 @@ function updateWorkspace(pr,region){
  if(input.value.trim())$('#f-decide').value=template.replace('{WorkspaceId}',input.value.trim());
 }
 function headerRow(name='',saved=false,hint=false){
- const row=document.createElement('div');row.className='header-row';row.dataset.saved=saved?name:'';
+ const row=document.createElement('div');row.className='header-row';row.dataset.saved=saved?name:'';row.dataset.hint=hint?'1':'';
  row.innerHTML=`<input class="header-name" aria-label="Header 名称" placeholder="Header 名称" value="${escape(name)}" ${saved?'readonly':''}><input class="header-value" type="password" autocomplete="new-password" aria-label="${escape(name || 'Header')} 值" placeholder="${saved?'已保存 · 留空保留':hint?'可选，填写后保存':'Header 值'}"><button type="button" class="icon-button danger" data-action="remove-header" aria-label="移除 ${escape(name || 'Header')}">${icon('trash')}</button>`;
  return row;
 }
@@ -358,21 +366,22 @@ function capacityPicks(kind,p){
  const maximum=kind==='contexts'?(p.available || []).map(normalizeModel).filter(m=>m.max>Number(m.listed || m.context || 0)): [];
  return `<div class="capacity-picks">${usual.map(v=>button(v,'capacity-pick',JSON.stringify({kind,value:v}),'text-button')).join('')}${maximum.length?button('每个模型支持的最高值','capacity-pick',JSON.stringify({kind,value:maximum.map(m=>`${m.id}=${m.max}`).join('\n')}),'text-button'):''}</div>`;
 }
-function openProvider(id,mode='edit'){
- const source=state.providers.find(p=>p.id===id),p=source?{...source,models:[...(source.models || [])]}:{id:'',name:'',models:[],routing:''};
+function openProvider(id,mode='edit',presetId=''){
+ const source=state.providers.find(p=>p.id===id),p=source?{...source,models:[...(source.models || [])]}:{id:'',name:'',preset:presetId,models:[],routing:''};
  if(mode==='another'){for(const k of Object.keys(p))delete p[k];Object.assign(p,{id:'',preset:source.preset,models:[],name:''});}
  if(mode==='copy'){p.id='';p.name=`${p.name} 副本`;}
  editor={type:'provider',data:p,removedHeaders:[],available:availableModels(p),modelPrefs:{},copyOf:mode==='copy'?source.id:'',from:mode==='edit'?p.id:'',section:'connection'};
- const pr=state.presets.find(x=>x.id===p.preset),account=!!p.account;
+ const pr=state.presets.find(x=>x.id===p.preset) || p.presetInfo,account=!!p.account;
  $('#editor-title').textContent=p.id?`${p.name} · 供应商设置`:mode==='copy'?'复制供应商':'添加供应商';
  const connection=(!p.id?selectField('preset','供应商预设',[['','自定义兼容接口'],...state.presets.map(x=>[x.id,x.name])],p.preset):'')+
   '<div id="preset-note"></div>'+`<div class="form-grid"><div>${field('name','显示名称',p.name,'text','例如：我的 DeepSeek')}</div><div>${field('id','供应商 ID',p.id,'text','留空自动生成')}</div></div>`+
-  (account?'<p class="form-hint">此供应商的身份与认证接口由订阅登录维护。</p>':field('key','API 密钥（支持粘贴多个）','','password',p.keySet?'留空保留':'每行、空格或逗号分隔')+`<div class="credential-tools">${button('显示密钥','show-provider-key',source?.id || '')}<div id="provider-links" class="external-links"></div></div>`)+
+  (account?'<p class="form-hint">此供应商的身份与认证接口由订阅登录维护。</p>':`<div id="provider-api-auth">${field('key','API 密钥（支持粘贴多个）','','password',p.keySet?'留空保留':'每行、空格或逗号分隔')}<div class="credential-tools">${button('显示密钥','show-provider-key',source?.id || '')}<div id="provider-links" class="external-links"></div></div></div>`)+
+  `<div id="vertex-fields" hidden>${field('vertexProject','Google Cloud 项目 ID',p.vertex?.project || '','text','例如 my-cloud-project')}${field('vertexLocation','位置',p.vertex?.location || 'global','text','global、us、eu 或具体地区，如 us-central1')}${field('vertexCredentials','Google 凭据文件',p.vertex?.credentials || '','text','留空使用 Application Default Credentials')}${field('vertexImpersonate','代用服务账号（可选）',p.vertex?.impersonate || '','text','服务账号邮箱')}<p class="form-hint">使用 Google Cloud 授权凭据。可先在自己的终端运行 <code>gcloud auth application-default login</code>；请求费用计入上述项目。</p></div>`+
   '<div id="provider-region"></div><div id="preset-endpoint" hidden></div>'+
   `<div id="workspace-field" hidden>${field('workspace','Workspace ID','','text','API 密钥所属工作空间，如 ws-…')}<p class="form-hint">工作空间与所选地区一起生成决策接口地址。</p></div>`+
-  selectField('baseAPI','探测首选接口',[['chat','Chat Completions'],['responses','Responses'],['anthropic','Anthropic Messages'],['decide','路由决策']],p.baseAPI || (p.responses&&!p.chat?'responses':'chat'))+
+  '<div id="provider-api-endpoints">'+selectField('baseAPI','探测首选接口',[['chat','Chat Completions'],['responses','Responses'],['anthropic','Anthropic Messages'],['decide','路由决策']],p.baseAPI || (p.responses&&!p.chat?'responses':'chat'))+
   `<div class="form-grid endpoint-grid"><div>${field('chat','Chat Completions 地址',p.chat,'url','https://api.example.com/v1')}</div><div>${field('responses','Responses 地址',p.responses,'url')}</div><div>${field('anthropic','Anthropic Messages 地址',p.anthropic,'url')}</div><div>${field('decide','路由决策地址',p.decide,'url')}</div></div>`+
-  `<div class="actions-bar">${button('检查连接','test-provider',source?.id || '')}${button('检测协议','detect-provider',source?.id || '')}</div><div class="inline-result" id="provider-test-result" role="status"></div>`;
+  `</div><div class="actions-bar">${button('检查连接','test-provider',source?.id || '')}${button('检测协议','detect-provider',source?.id || '')}</div><div class="inline-result" id="provider-test-result" role="status"></div>`;
  const models=`<div class="actions-bar compact-actions">${button('全选','models-all')}${button('恢复默认选择','models-none')}${button('只选免费','models-free')}${button('刷新模型','fetch-edit-models',source?.id || '')}${source?button('清除目录缓存','unfetch-edit-models',source.id):''}</div><div class="search provider-model-search">${icon('search')}<input id="provider-model-search" type="search" aria-label="筛选供应商模型" placeholder="搜索名称或 ID"></div><p id="model-selection-summary" class="form-hint"></p><div id="provider-model-chips" class="model-chips"></div>${text('models','自定义 / 明确选择的模型 ID',(p.models || []).join('\n'),'每行一个；留空跟随供应商默认选择')}<p class="form-hint">默认选择会跟随目录变化；单模型参数可独立修改，不需要改成明确选择。</p>${checkField('unlisted','仅通过路由组使用',p.unlisted,'隐藏直接入口，路由组仍可使用这些模型。')}<div id="model-settings"></div><div class="actions-bar">${button('测试当前模型','test-selected-models')}${button('检测当前模型协议','detect-selected-models')}</div><div id="selected-model-results" class="inline-result" role="status"></div>`;
  const allocation=routing(p.routing)+selectField('affinity','缓存与会话保持',[['','自动 · 按缓存有效期'],['session','整个会话'],['turn','同一轮对话'],['off','每次重新分配']],p.affinity)+checkField('sink','仍有额度的身份被限流后排到队尾',p.sink)+
   `<div id="pin-upstream">${checkField('pinUpstream','DeepSeek 仅走官方上游',p.pinUpstream,'仅适用于 ClinePass；官方不可用时此请求失败，保留官方缓存。')}</div>`+text('fallback','故障转移模型（按顺序）',(p.fallback || []).join('\n'),'供应商ID/模型ID，每行一个');
@@ -399,7 +408,7 @@ function openProvider(id,mode='edit'){
  $('#f-proxyMode').onchange=e=>{$('#proxy-address').hidden=e.target.value!=='custom';$('#f-proxy').required=e.target.value==='custom';};$('#f-proxy').required=$('#f-proxyMode').value==='custom';
  for(const name of p.headerNames || [])$('#header-list')?.append(headerRow(name,true));
  const hints=pr=>{for(const name of pr?.headerHints || [])if(![...document.querySelectorAll('.header-name')].some(i=>i.value.toLowerCase()===name.toLowerCase()))$('#header-list')?.append(headerRow(name,false,true));};
- hints(pr);configurePreset(pr,mode==='another');
+ hints(pr);configurePreset(pr,mode==='another'||!!presetId);
  const pin=pr=>$('#pin-upstream').hidden=!(pr?.id==='clinepass'||p.cline||/cline/i.test(p.preset || '')||/cline\./i.test(p.chat || ''));
  pin(pr);$('#f-preset')?.addEventListener('change',e=>{const chosen=state.presets.find(x=>x.id===e.target.value);configurePreset(chosen,true);hints(chosen);pin(chosen);});
  if(!account){
@@ -491,10 +500,11 @@ function providerInput(data){
  for(const k of ['off','unlisted','searches','unredacted','pinUpstream','sink','clearBalanceToken'])input[k]=k==='off'?!!p.off:!!$(`#f-${k}`)?.checked;
  input.maxConcurrency=data.maxConcurrency===''?null:Number(data.maxConcurrency);for(const k of ['queueLimit','queueWait','priceRate'])input[k]=Number(data[k] || 0);
  if(p.account||!data.key)delete input.key;if(!data.balanceToken)delete input.balanceToken;
+ if((data.preset || p.preset)==='google-vertex')input.vertex={project:data.vertexProject?.trim() || '',location:data.vertexLocation?.trim() || 'global',credentials:data.vertexCredentials?.trim() || '',impersonate:data.vertexImpersonate?.trim() || ''};
  input.icon=data.providerIcon===undefined?p.icon || '':data.providerIcon;delete input.providerIcon;
  if(!!data.teamOrg!==!!data.teamProject)throw new Error('团队套餐请同时填写组织 ID 和项目 ID。');
  input.zhipuTeam=data.teamOrg?{org:data.teamOrg.trim(),project:data.teamProject.trim()}:{};
- for(const k of ['proxyMode','region','workspace','endpoint','teamOrg','teamProject'])delete input[k];
+ for(const k of ['proxyMode','region','workspace','endpoint','teamOrg','teamProject','vertexProject','vertexLocation','vertexCredentials','vertexImpersonate'])delete input[k];
  return input;
 }
 function groupModelChoices(){
@@ -573,7 +583,7 @@ function activateEditorSection(id){
 function configureEditorSections(){
  const sections=[...$('#fields').querySelectorAll(':scope > .editor-section')], nav=$('#editor-nav');
  nav.hidden=sections.length<2;nav.innerHTML=sections.length<2?'':sections.map(s=>`<button type="button" data-section-target="${escape(s.dataset.section)}" aria-selected="false">${escape(s.dataset.title)}</button>`).join('');
- $('#editor').classList.toggle('workbench',sections.length>1||['accounts','keys','adapters','health','quota-history'].includes(editor.type));
+ $('#editor').classList.toggle('workbench',sections.length>1||['sources','accounts','keys','adapters','health','quota-history'].includes(editor.type));
  if(sections.length>1)activateEditorSection(sections.some(s=>s.dataset.section===editor.section)?editor.section:sections[0].dataset.section);
 }
 function checkEditorValidity(){
@@ -585,7 +595,8 @@ function checkEditorValidity(){
 }
 function showEditor(){
  $('#form-error').hidden=true;$('#adapter-progress').hidden=true;$('#save').hidden=false;buttonBusy.delete($('#save'));$('#save').removeAttribute('aria-label');$('#save').removeAttribute('aria-busy');$('#save').style.minWidth='';$('#save').textContent='保存';$('#save').disabled=false;
- $('#cancel-editor').textContent=['accounts','keys','adapters','health'].includes(editor.type)?'关闭':'取消';
+ $('#cancel-editor').textContent=['sources','accounts','keys','adapters','health'].includes(editor.type)?'关闭':'取消';
+ $('#editor-note').textContent=editor.type==='sources'?'选择来源后配置认证，保存后接入':'保存后同步模型与路由';
  configureEditorSections();
  decorateSelects();
  if(!$('#editor').open)$('#editor').showModal();
@@ -604,7 +615,7 @@ $('#edit-form').addEventListener('invalid',e=>{const details=e.target.closest('d
 $('#edit-form').addEventListener('submit',async e=>{
   e.preventDefault();const current=editor;if(!checkEditorValidity())return;
  if(current.type==='connection-success'){$('#editor').close();await go('providers');return;}
- if(['accounts','adapters','health','quota-history','export','import-result'].includes(current.type))return;
+ if(['sources','accounts','adapters','health','quota-history','export','import-result'].includes(current.type))return;
  const busy=startButtonBusy($('#save'),current.type==='subscription'?'登录中':current.type==='provider-import'?(current.preview?'导入中':'预览中'):'保存中');$('#form-error').hidden=true;const data=Object.fromEntries(new FormData(e.target));
  try {
   if(current.type==='subscription'){await beginSubscription(data);return;}
@@ -649,10 +660,11 @@ $('.workspace').addEventListener('click',async e=>{
  if(waiting[action])begin(waiting[action]);
  try{
   if(action.startsWith('go-')){await go(action.slice(3));return;}
-  if(action==='subscription'){await openSubscription();return;}
+  if(action==='subscription'){await openSourcePicker('plans');return;}
   if(action==='accounts'){await openAccounts(id);return;}
   if(action==='keys'){await openKeys(id);return;}
-  if(action==='add-provider'||action==='edit-provider'){openProvider(id);return;}
+  if(action==='add-provider'){await openSourcePicker();return;}
+  if(action==='edit-provider'){openProvider(id);return;}
   if(action==='copy-provider'||action==='another-provider'){openProvider(id,action==='copy-provider'?'copy':'another');return;}
   if(action==='import-provider'){editor={type:'provider-import'};$('#editor-title').textContent='导入供应商';$('#fields').innerHTML=text('source','供应商配置或分享链接','','粘贴供应商导出 JSON 或支持的导入链接')+'<p class="form-hint">导入会添加供应商，保留现有配置。</p>';$('#f-source').required=true;showEditor();$('#save').textContent='导入';return;}
   if(action==='export-provider'){await exportProvider(id);return;}
@@ -811,7 +823,7 @@ async function startProviderLive(epoch){try{const [upstream,lanes]=await Promise
 function healthView(upstream,lanes){const vendors=upstreamVendors(upstream);return `<div class="panel">${vendors.map(v=>`<div class="row"><div class="text"><h3>${escape(v.name || v.vendor)}</h3><p class="caption">${escape(healthLevels[v.level] || '公开状态未知')}${v.read?` · ${escape(dateText(v.read))}`:''}</p>${v.error?`<p class="inline-error">${escape(v.error)}</p>`:''}${(v.parts || []).map(p=>`<p class="caption">${escape(p.name)} · ${escape(p.status)}</p>`).join('')}${(v.incidents || []).map(i=>`<p>${externalLink(i.url,i.name)}</p>`).join('')}${externalLink(v.page,'打开供应商状态页')}</div></div>`).join('') || '<p class="empty-inline">已配置供应商没有可读取的公开状态页。</p>'}</div><div class="form-section"><h3>当前请求与排队</h3><div class="table-wrap"><table><thead><tr><th>密钥 / 账号</th><th>处理中</th><th>排队</th><th>并发限制</th></tr></thead><tbody>${liveLaneRows(lanes)}</tbody></table></div></div>`;}
 async function refreshHealth(current){try{const [upstream,lanes]=await Promise.all([api('upstream'),api('lanes')]);if(current!==editor||current.closed)return;$('#health-status').innerHTML=healthView(upstream,lanes);$('#health-error').hidden=true;}catch(error){if(current===editor&&!current.closed){$('#health-error').textContent=`运行状态未能读取：${error.message}`;$('#health-error').hidden=false;}}finally{if(current===editor&&!current.closed)healthTimer=setTimeout(()=>refreshHealth(current),3000);}}
 async function openProviderHealth(){const [upstream,lanes]=await Promise.all([api('upstream'),api('lanes')]);clearTimeout(healthTimer);editor={type:'health'};const current=editor;$('#editor-title').textContent='供应商运行状态';$('#fields').innerHTML='<p class="form-hint">供应商自己的 API 服务状态；鲸桥请求与排队实时更新。</p><p id="health-error" class="inline-error" hidden></p><div id="health-status">'+healthView(upstream,lanes)+'</div>';showEditor();$('#save').hidden=true;healthTimer=setTimeout(()=>refreshHealth(current),3000);}
-$('#editor').addEventListener('close',()=>clearTimeout(healthTimer));
+$('#editor').addEventListener('beforetoggle',event=>{if(event.newState==='closed')clearTimeout(healthTimer);});
 function adapterRows(items,installed=false){
  return `<div class="management-table-wrap"><table class="management-table"><thead><tr><th>供应商适配器</th><th>${installed?'版本与状态':'来源'}</th><th>管理</th></tr></thead><tbody>${items.map(p=>{
   const ref=JSON.stringify({id:p.id,package:p.package}),summary=typeof p.summary==='object'?(p.summary?.zh || p.summary?.en || ''):p.summary || p.description || '';

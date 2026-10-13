@@ -11,7 +11,7 @@ const writes = [], queries = [], errors = [];
 let fail = false;
 const data = {
   settings: { searcher: 'missing/model', vision: 'missing/vision', imageGen: 'missing/image' },
-  searchVendors: [{ id: 'tavily', name: 'Tavily', base: 'https://api.tavily.test', keysURL: 'https://keys.test' }],
+  searchVendors: [{ id: 'tavily', name: 'Tavily', base: 'https://api.tavily.test', keysURL: 'https://keys.test' }, { id: 'you', name: 'You.com', base: 'https://ydc-index.io', keyOptional: true }],
   searches: [], searchers: [{ id: 'relay', name: 'Search relay', small: 'gpt', models: [{ id: 'relay/gpt', name: 'Search model' }] }],
   searcherUnused: 'gone', autoSearcher: 'Search relay · Search model', searcher: 'Search relay · Search model',
   visionModels: [{ id: 'relay/vision', name: 'Vision model' }], drawingModels: [{ id: 'codex/gpt-image-2', name: 'GPT Image 2' }],
@@ -29,7 +29,11 @@ const server = http.createServer(async (req, res) => {
       if (fail) { res.writeHead(400); return res.end('fixture save rejected'); }
       if (url.pathname === '/api/global/settings') Object.assign(data.settings, body);
       if (url.pathname === '/api/model-price') data.modelPrices[body.id] = body.price;
-      if (url.pathname === '/api/search/save') data.searches = [{ vendor: body.vendor, ready: true, keySet: true, keyMasked: '***' }];
+      if (url.pathname === '/api/search/save') {
+        const old = data.searches.find(search => search.vendor === body.vendor);
+        const keySet = Boolean(body.key || old?.keySet);
+        data.searches = data.searches.filter(search => search.vendor !== body.vendor).concat({ vendor: body.vendor, ready: true, url: body.url || '', keySet, keyMasked: keySet ? '***' : '' });
+      }
       return json({ ok: true });
     }
     if (url.pathname === '/api/state') return json({ version: 'global-qa', providers: [], presets: [], models: [], hidden: [], groups: [] });
@@ -69,9 +73,23 @@ async function run() {
     const saved = writes.find(w => w.path === '/api/global/settings').body;
     assert.equal(saved.searcher, 'relay/gpt'); assert.equal(saved.vision, 'missing/vision'); assert.equal(saved.imageGen, 'missing/image');
     assert.equal('searcherChoice' in saved, false);
+    await click('[data-global="edit-search"][data-id="you"]');
+    assert.equal(await js(`document.querySelector('#search-edit-form h3').textContent`), 'You.com');
+    assert.ok(await js(`document.querySelector('#search-edit-form [name=key]').placeholder.includes('可留空使用免费搜索')`));
+    await click('#search-edit-form [type=submit]'); await wait(`document.querySelector('[data-global="remove-search"][data-id="you"]')`);
+    assert.ok(await js(`document.querySelector('[data-global="remove-search"][data-id="you"]').closest('.row').textContent.includes('You.com 免费搜索')`));
+    assert.equal(await js(`document.querySelector('[data-global="show-search"][data-id="you"]')`), null);
+    assert.equal(await js(`document.querySelector('[data-global="copy-search"][data-id="you"]')`), null);
+    assert.equal(writes.find(w => w.path === '/api/search/save').body.key, '');
+    await click('[data-global="edit-search"][data-id="you"]'); await fill('#search-edit-form [name=key]', 'you-first,you-second');
+    await click('#search-edit-form [type=submit]'); await wait(`document.querySelector('[data-global="show-search"][data-id="you"]')`);
+    assert.equal(writes.filter(w => w.path === '/api/search/save').at(-1).body.key, 'you-first,you-second');
+    await click('[data-global="edit-search"][data-id="you"]');
+    assert.ok(await js(`document.querySelector('#search-edit-form [name=key]').placeholder.includes('留空保留已保存密钥')`));
+    await click('#close-search-edit');
     await click('[data-global="edit-search"][data-id="tavily"]'); await fill('#search-edit-form [name=key]', 'search-key');
-    await click('#search-edit-form [type=submit]'); await wait(`document.querySelector('[data-global="show-search"]')`);
-    assert.equal(writes.find(w => w.path === '/api/search/save').body.vendor, 'tavily');
+    await click('#search-edit-form [type=submit]'); await wait(`document.querySelector('[data-global="show-search"][data-id="tavily"]')`);
+    assert.equal(writes.filter(w => w.path === '/api/search/save').at(-1).body.vendor, 'tavily');
     await section('privacy'); assert.equal(await js(`document.querySelector('#f-redactWords').value`), 'private draft');
     data.fx={rate:0};await section('connection');
     assert.ok(await js(`document.querySelector('#content').textContent.includes('人民币汇率暂不可用')`));
@@ -105,11 +123,31 @@ async function run() {
     await click('[data-tab="settings"]'); await ready(); await section('tools');
     fail = true; await click('#global-form [type=submit]'); await wait(`document.querySelector('#message-text').textContent==='fixture save rejected'`);
     assert.equal(await js(`document.querySelector('#global-form [type=submit]').disabled`), false); fail = false;
-    for (const width of [1120, 420]) {
-      win.setContentSize(width, 800); await js(`new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))`);
+    const searchLayouts=[],layoutWrites=writes.length;
+    await click('#dismiss-message');
+    for (const width of [1120, 380]) {
+      const height=width<=600?600:780;win.setContentSize(width,height);await wait(`Math.abs(innerWidth-${width})<=1&&Math.abs(innerHeight-${height})<=1`);await js(`new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)))`);
       assert.ok(await js(`document.documentElement.scrollWidth<=innerWidth+1`), `global page overflows at ${width}`);
       await js(`document.querySelector('#f-searcher').focus()`); assert.equal(await js(`document.activeElement.id`), 'f-searcher');
+      const geometry=await js(`(()=>{const row=document.querySelector('[data-global="show-search"][data-id="you"]').closest('.row'),text=row.querySelector('.text'),actions=row.querySelector('.actions'),caption=text.querySelector('.caption'),r=row.getBoundingClientRect(),css=getComputedStyle(row);return {viewport:{width:innerWidth,height:innerHeight},row:r.toJSON(),text:text.getBoundingClientRect().toJSON(),actions:actions.getBoundingClientRect().toJSON(),availableWidth:r.width-parseFloat(css.paddingLeft)-parseFloat(css.paddingRight)-parseFloat(css.borderLeftWidth)-parseFloat(css.borderRightWidth),caption:caption.textContent,captionHeight:caption.getBoundingClientRect().height,lineHeight:parseFloat(getComputedStyle(caption).lineHeight),buttons:[...actions.querySelectorAll('button')].map(b=>({action:b.dataset.global,text:b.textContent,rect:b.getBoundingClientRect().toJSON()}))};})()`);
+      const actual={requested:{width,height},contentBounds:win.getContentBounds(),...geometry};searchLayouts.push(actual);
+      assert.ok(Math.abs(geometry.viewport.width-actual.contentBounds.width)<=1&&Math.abs(geometry.viewport.height-actual.contentBounds.height)<=1,JSON.stringify(actual));
+      assert.ok(geometry.caption.includes('已配置')&&geometry.caption.includes('***'),'the configured You row displays its masked key state');
+      assert.equal(geometry.buttons.length,4,'configured You retains edit, reveal, copy and remove actions');
+      if(geometry.viewport.width<=600){
+        assert.ok(geometry.text.width>=geometry.availableWidth-1&&geometry.text.width>=240,'narrow search description receives a readable full row: '+JSON.stringify(actual));
+        assert.ok(geometry.actions.top>=geometry.text.bottom,'narrow actions sit below the complete description: '+JSON.stringify(actual));
+        assert.ok(geometry.captionHeight<=geometry.lineHeight*4,'masked description is readable rather than a vertical stream: '+JSON.stringify(actual));
+      }else{
+        assert.ok(geometry.actions.left>=geometry.text.right&&geometry.actions.top<geometry.text.bottom&&geometry.actions.bottom>geometry.text.top,'desktop description and actions retain their horizontal row: '+JSON.stringify(actual));
+      }
+      for(const {action} of geometry.buttons){
+        const target=await js(`(()=>{const b=document.querySelector('[data-global="'+${JSON.stringify(action)}+'"][data-id="you"]');b.scrollIntoView({block:'center'});b.focus();const r=b.getBoundingClientRect(),hit=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);return {focused:document.activeElement===b,enabled:!b.disabled,hit:hit===b||b.contains(hit),rect:r.toJSON(),width:innerWidth,height:innerHeight};})()`);
+        assert.ok(target.focused&&target.enabled&&target.hit&&target.rect.width>0&&target.rect.height>0&&target.rect.left>=0&&target.rect.right<=target.width&&target.rect.top>=0&&target.rect.bottom<=target.height,action+' remains visible and reachable: '+JSON.stringify(target));
+      }
     }
+    assert.equal(writes.length,layoutWrites,'layout and focus inspection never invoke search mutations');
+    console.log('WHALEBRIDGE_SEARCH_LAYOUTS:'+JSON.stringify(searchLayouts));
     assert.deepEqual(errors, []);
     console.log('WHALEBRIDGE_GLOBAL_RESULT:PASS safe candidates, unknown settings, drafts, decimals, metrics, ledger filters, save error, responsive focus');
   } finally { win.destroy(); await new Promise(resolve => server.close(resolve)); }

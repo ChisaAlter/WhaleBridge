@@ -113,11 +113,11 @@ func (p Provider) ModelTest() string {
 		}
 		return "decide"
 	}
-	if p.isClaudeAccount() {
+	if p.isClaudeAccount() || p.IsVertex() {
 		return ""
 	}
 	for _, pr := range p.Speaks() {
-		if pr == Chat || pr == Responses || pr == Anthropic {
+		if pr == Chat || pr == Responses || pr == Anthropic || pr == Gemini && p.Gemini != "" {
 			return ""
 		}
 	}
@@ -148,8 +148,14 @@ func tinyBody(q Provider, proto Protocol, model string) (url, body string) {
 	case Anthropic:
 		return q.Anthropic + "/v1/messages", fmt.Sprintf(`{"model":%q,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`, model)
 	case Gemini:
-		// Factory's generate route. droid sends no stream field.
-		return q.Base(Gemini) + "/generate", fmt.Sprintf(`{"model":%q,"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`, model)
+		if q.IsVertex() {
+			return vertexTest(q, model)
+		}
+		if q.FactoryGemini() {
+			// Factory's generate route. droid sends no stream field.
+			return q.Base(Gemini) + "/generate", fmt.Sprintf(`{"model":%q,"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`, model)
+		}
+		return q.Gemini + GeminiPath(model, false), `{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{"maxOutputTokens":16}}`
 	}
 	return "", ""
 }
@@ -347,7 +353,7 @@ func isClaude(id string) bool {
 // Azure OpenAI takes a key in api-key alone: a Bearer there is an Entra ID
 // token, and the key sent as one is turned away.
 func AuthHeaders(p Provider, proto Protocol) map[string]string {
-	if p.Key == "" {
+	if p.Key == "" || p.IsVertex() {
 		return map[string]string{}
 	}
 	if p.IsAzure() {
@@ -355,6 +361,9 @@ func AuthHeaders(p Provider, proto Protocol) map[string]string {
 			return map[string]string{"x-api-key": p.Key}
 		}
 		return map[string]string{"api-key": p.Key}
+	}
+	if proto == Gemini && !p.FactoryGemini() {
+		return map[string]string{"x-goog-api-key": p.Key}
 	}
 	if proto == Anthropic {
 		if strings.HasSuffix(p.Host(), "anthropic.com") || p.IsBedrock() {

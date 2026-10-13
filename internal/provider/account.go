@@ -125,7 +125,7 @@ func (p Provider) ListedAPIs(model string) []Protocol {
 		return p.pluginAPIs(model)
 	}
 	// asked for every model of every agent: read once while a request holds
-	ms := heldOf("live:"+p.ID, func() []catalog.Model { ms, _, _ := catalog.Live(p.ID); return ms })
+	ms, _, _ := p.live()
 	for _, m := range ms {
 		if m.ID == model && len(m.APIs) > 0 {
 			out := make([]Protocol, len(m.APIs))
@@ -177,6 +177,17 @@ func (p Provider) Sign(ctx context.Context, req *http.Request, proto Protocol, b
 	ctx = p.Via(ctx) // a sign-in refreshed on the way goes through its proxy
 	if p.Account != nil && p.Account.sign != nil {
 		return p.Account.sign(ctx, req, body)
+	}
+	if p.IsVertex() {
+		// A Google token goes nowhere but this project's Vertex address.
+		if base := p.vertexBase(); base == "" || !strings.HasPrefix(req.URL.String(), base+"/") {
+			return fmt.Errorf("%s is asked only at Vertex AI, at its project's address", p.Name)
+		}
+		tok, err := p.vertexAccessToken(ctx)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+tok)
 	}
 	for k, v := range AuthHeaders(p, proto) {
 		req.Header.Set(k, v)

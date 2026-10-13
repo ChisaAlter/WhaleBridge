@@ -19,9 +19,9 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/tidwall/jsonc"
 	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
+	"github.com/tidwall/jsonc"
 	_ "modernc.org/sqlite"
 )
 
@@ -233,6 +233,10 @@ func sameProvider(a, b Provider) bool {
 	if !maps.Equal(cleanHeaders(a.Headers), cleanHeaders(b.Headers)) {
 		return false
 	}
+	if a.IsVertex() || b.IsVertex() {
+		av, bv := a.Vertex.Normal(), b.Vertex.Normal()
+		return a.IsVertex() && b.IsVertex() && av != nil && bv != nil && *av == *bv
+	}
 	has := a.Key == b.Key
 	for _, k := range a.Keys {
 		has = has || k.Key == b.Key
@@ -241,12 +245,12 @@ func sameProvider(a, b Provider) bool {
 		return false
 	}
 	hosts := map[string]bool{}
-	for _, u := range []string{a.Chat, a.Responses, a.Anthropic, a.Decide} {
+	for _, u := range []string{a.Chat, a.Responses, a.Anthropic, a.Gemini, a.Decide} {
 		if h := hostOf(u); h != "" {
 			hosts[h] = true
 		}
 	}
-	for _, u := range []string{b.Chat, b.Responses, b.Anthropic} {
+	for _, u := range []string{b.Chat, b.Responses, b.Anthropic, b.Gemini} {
 		if hosts[hostOf(u)] {
 			return true
 		}
@@ -556,7 +560,7 @@ func merge(have []AppImport, it AppImport) []AppImport {
 }
 
 func firstURL(p Provider) string {
-	for _, u := range []string{p.Chat, p.Responses, p.Anthropic} {
+	for _, u := range []string{p.Chat, p.Responses, p.Anthropic, p.Gemini} {
 		if u != "" {
 			return u
 		}

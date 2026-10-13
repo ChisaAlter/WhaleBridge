@@ -6,7 +6,31 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
 )
+
+func TestEmptyAdapterDiscoveryDoesNotStartRuntime(t *testing.T) {
+	h := newProviderHTTP(t)
+	if len(plugin.Load().Plugins) != 0 || plugin.Running() {
+		t.Fatal("expected an empty, stopped adapter environment")
+	}
+	hadBun := plugin.HasBun()
+	var result struct {
+		Installed []json.RawMessage `json:"installed"`
+		Available []json.RawMessage `json:"available"`
+		Error     string            `json:"error"`
+	}
+	if err := json.Unmarshal(h.call("GET", "subscription/adapters", nil, 200), &result); err != nil {
+		t.Fatal(err)
+	}
+	if len(result.Installed) != 0 || len(result.Available) == 0 || result.Error != "" {
+		t.Fatalf("empty discovery lost its catalog or attempted runtime loading: %+v", result)
+	}
+	if plugin.Running() || plugin.HasBun() != hadBun {
+		t.Fatal("browsing adapters started or downloaded a runtime")
+	}
+}
 
 func TestAdapterInstallReportsFailureInRequestedFormat(t *testing.T) {
 	h := newProviderHTTP(t)

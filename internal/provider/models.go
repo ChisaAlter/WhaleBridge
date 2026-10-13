@@ -137,7 +137,7 @@ func (p Provider) Listed() (time.Time, bool) {
 // none: its models are what the plugin lists now, and a built-in moved
 // onto it left its own last list under the same id.
 func (p Provider) live() ([]catalog.Model, time.Time, bool) {
-	if p.IsPlugin() {
+	if !p.ListsModels() {
 		return nil, time.Time{}, false
 	}
 	type live struct {
@@ -147,6 +147,16 @@ func (p Provider) live() ([]catalog.Model, time.Time, bool) {
 	}
 	l := heldOf("fetched:"+p.ID, func() live { ms, at, ok := catalog.Live(p.ID); return live{ms, at, ok} })
 	return l.ms, l.at, l.ok
+}
+
+// ListsModels says whether a fetched list belongs to this provider's current
+// endpoint. A plan with no list ignores a cache from its former endpoint.
+func (p Provider) ListsModels() bool {
+	if p.IsPlugin() {
+		return false
+	}
+	pr := Preset(p.Preset)
+	return p.Account != nil || pr == nil || !pr.NoList || strings.TrimSpace(p.ModelsURL) != "" || p.listRegion(pr)
 }
 
 // Fetch asks the vendor which models it serves and remembers the answer.
@@ -426,13 +436,30 @@ func (p Provider) fetchOne(ctx context.Context) ([]catalog.Model, string, error)
 	var errs []string
 	for _, proto := range p.Speaks() {
 		base := p.Base(proto)
+		if proto == Gemini {
+			if p.Gemini == "" {
+				continue // Factory's and Vertex's lists are supplied by their contracts.
+			}
+			ms, _, err := catalog.FetchGemini(ctx, base, p.Key, p.listHeaders())
+			if err == nil {
+				for i := range ms {
+					ms[i].APIs = []string{string(Gemini)}
+				}
+				return p.planModels(ms), base, nil
+			}
+			if !slices.Contains(errs, err.Error()) {
+				errs = append(errs, err.Error())
+			}
+			continue
+		}
 		ms, at, err := catalog.FetchAt(ctx, base, p.Key, proto == Anthropic, p.listHeaders())
 		if err == nil {
 			if proto != Anthropic {
 				base = p.fixV1(base, at)
 			}
 			// the image models its list leaves out (AIHubMix's gpt-image-2)
-			return catalog.WithDrawers(p.planModels(ms), catalog.PublicDrawers(ctx, base)), base, nil
+			ms = catalog.WithDrawers(p.planModels(ms), catalog.PublicDrawers(ctx, base))
+			return p.withGeminiModels(ctx, ms, proto), base, nil
 		}
 		// Chat and Responses at one base say the same thing
 		if !slices.Contains(errs, err.Error()) {
@@ -445,6 +472,54 @@ func (p Provider) fetchOne(ctx context.Context) ([]catalog.Model, string, error)
 	// the endpoints are kept as they were: a vendor with no list (or one
 	// that wants what the key can't give) still serves the models typed in
 	return nil, "", errorf("%s — type its model ids in by hand, or give the URL its list is at", strings.Join(errs, "; "))
+}
+
+// withGeminiModels merges the native Gemini list with the endpoint that
+// answered first. A refused Gemini read keeps only its previously listed
+// models for this key, while the endpoint that answered stays authoritative.
+func (p Provider) withGeminiModels(ctx context.Context, ms []catalog.Model, proto Protocol) []catalog.Model {
+	if p.Gemini == "" {
+		return ms
+	}
+	apis := []string{string(proto)}
+	if proto == Chat && p.Responses != "" && p.Base(Responses) == p.Base(Chat) {
+		apis = append(apis, string(Responses))
+	} else if proto == Responses && p.Chat != "" && p.Base(Chat) == p.Base(Responses) {
+		apis = append(apis, string(Chat))
+	}
+	for i := range ms {
+		if len(ms[i].APIs) == 0 {
+			ms[i].APIs = slices.Clone(apis)
+		}
+	}
+	native, _, err := catalog.FetchGemini(ctx, p.Gemini, p.Key, p.listHeaders())
+	if err != nil {
+		old, _, _ := catalog.Live(p.ID)
+		for _, m := range old {
+			if slices.Contains(m.APIs, string(Gemini)) && (len(m.Keys) == 0 || slices.Contains(m.Keys, keyID(p.Key))) {
+				m.APIs = []string{string(Gemini)}
+				native = append(native, m)
+			}
+		}
+	}
+	byID := make(map[string]int, len(ms))
+	for i, m := range ms {
+		byID[m.ID] = i
+	}
+	for _, m := range native {
+		m.APIs = []string{string(Gemini)}
+		if i, ok := byID[m.ID]; ok {
+			if !slices.Contains(ms[i].APIs, string(Gemini)) {
+				ms[i].APIs = append(ms[i].APIs, string(Gemini))
+			}
+			ms[i].ImageInput = sharedImageInput(ms[i].ImageInput, m.ImageInput)
+			ms[i].Images = ms[i].Images && m.Images
+		} else {
+			byID[m.ID] = len(ms)
+			ms = append(ms, m)
+		}
+	}
+	return ms
 }
 
 // listRegion reports whether the provider sits at one of its preset's
@@ -521,8 +596,11 @@ func (p Provider) planModels(ms []catalog.Model) []catalog.Model {
 		return ms
 	}
 	models := pr.Models
-	if r := p.regionOf(pr); r != nil && len(r.Models) > 0 {
+	if r := p.regionOf(pr); r != nil && r.Models != nil {
 		models = r.Models
+	}
+	if p.IsVertex() && p.Vertex != nil {
+		models = vertexModels(p.Vertex.Location)
 	}
 	if pr.Only == "" && (len(models) == 0 || len(ms) > 0) {
 		return ms
@@ -563,6 +641,39 @@ func (p Provider) planModels(ms []catalog.Model) []catalog.Model {
 		if m.Output == 0 {
 			out[i].Output = catalog.OutputOf(id)
 		}
+	}
+	return out
+}
+
+// PlanEmbeddings are the embedding models explicitly included in the preset
+// region's plan, kept out of agents' chat-model lists.
+func (p Provider) PlanEmbeddings() []catalog.Model {
+	return p.planMedia(func(r *Region) []string { return r.Embeddings }, false, false)
+}
+
+// PlanDrawers are the image-generation models in the preset region's plan.
+func (p Provider) PlanDrawers() []catalog.Model {
+	return p.planMedia(func(r *Region) []string { return r.Drawers }, true, false)
+}
+
+// PlanVideos are the video-generation models in the preset region's plan.
+func (p Provider) PlanVideos() []catalog.Model {
+	return p.planMedia(func(r *Region) []string { return r.Videos }, false, true)
+}
+
+func (p Provider) planMedia(ids func(*Region) []string, draws, films bool) []catalog.Model {
+	pr := Preset(p.Preset)
+	if pr == nil {
+		return nil
+	}
+	r := p.regionOf(pr)
+	if r == nil {
+		return nil
+	}
+	models := ids(r)
+	out := make([]catalog.Model, 0, len(models))
+	for _, id := range models {
+		out = append(out, catalog.Model{ID: id, Name: id, Provider: p.ID, Draws: draws, Films: films})
 	}
 	return out
 }
@@ -694,7 +805,7 @@ func anyImageInput(a, b *bool) *bool {
 // Serves reports whether key k can be asked for model: false only when the
 // vendor's lists say another of the provider's keys sees it and k doesn't.
 func (p Provider) Serves(k KeyAccount, model string) bool {
-	live, _, ok := catalog.Live(p.ID)
+	live, _, ok := p.live()
 	if !ok {
 		return true
 	}

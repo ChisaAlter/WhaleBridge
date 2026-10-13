@@ -66,6 +66,10 @@ const server = http.createServer(async (req, res) => {
         catalogs.push({ scenario, installed, ids: rows.map(row => row.id) });
         return json(rows);
       }
+      if (pathname === '/api/provider/presets') return json(scenario === 'layout' ? [{ id: 'layout-preset', name: 'Fixture region provider', regions: [
+        { id: 'fixture-region', name: 'Fixture region', chat: 'https://fixture.example/v1',
+          decide: 'https://fixture.example/workspaces/{WorkspaceId}/decide', models: ['fixture-model'] },
+      ] }] : []);
       if (pathname === '/api/subscription/adapter') {
         if (scenario === 'failure') {
           res.writeHead(400, { 'Content-Type': 'text/plain' });
@@ -208,6 +212,8 @@ async function run() {
   })()`);
   const open = async () => {
     await js(`document.querySelector('#dismiss-message').click(); document.querySelector('#content [data-action="subscription"]').click()`);
+    await waitFor(`document.querySelector('#editor').open && !editor.loading && document.querySelector('[data-source-key="subscription:claude"]')`);
+    await js(`document.querySelector('[data-source-key="subscription:claude"]').click()`);
     await waitFor(`document.querySelector('#editor').open && document.querySelector('#f-agent')`);
   };
   const chooseSubscription = id => js(`(() => {
@@ -296,6 +302,8 @@ async function run() {
 
     scenario = 'api-provider';
     await js(`document.querySelector('#content [data-action="add-provider"]').click()`);
+    await waitFor(`document.querySelector('#editor').open && document.querySelector('[data-source-command="custom"]')`);
+    await js(`document.querySelector('[data-source-command="custom"]').click()`);
     await waitFor(`document.querySelector('#editor').open && document.querySelector('#f-name')`);
     await js(`(() => {
       document.querySelector('#f-name').value = 'Fixture API';
@@ -423,11 +431,14 @@ async function run() {
         };
       },
     }; true`);
-    const layout = { pages: [], subscriptions: [], callbacks: [], accounts: [], keys: [], providers: [], routes: [], successes: [], confirmations: [] };
+    const layout = { windowSizes: [], pages: [], subscriptions: [], callbacks: [], accounts: [], keys: [], providers: [], routes: [], successes: [], confirmations: [] };
     for (const scheme of ['dark', 'light']) {
       for (const width of [1120, 820, 600, 420, 380]) {
         win.setContentSize(width, 760);
-        await waitFor(`innerWidth === ${width}`);
+        await waitFor(`Math.abs(innerWidth - ${width}) <= 1 && Math.abs(innerHeight - 760) <= 1`);
+        const actual = { scheme, requested: { width, height: 760 }, contentBounds: win.getContentBounds(), windowBounds: win.getBounds(), renderer: await js(`({width:innerWidth,height:innerHeight,dpr:devicePixelRatio})`) };
+        assert.ok(Math.abs(actual.renderer.width - actual.contentBounds.width) <= 1 && Math.abs(actual.renderer.height - actual.contentBounds.height) <= 1, JSON.stringify(actual));
+        layout.windowSizes.push(actual);
         const label = `${scheme}-${width}`;
         process.stderr.write(`layout start ${label}\n`);
         const inspectDialogs = width === 1120 || width === 420;
@@ -448,7 +459,7 @@ async function run() {
           document.querySelector('#f-method').dispatchEvent(new Event('change', { bubbles: true }));
           return { pages, subscription: { methodGap, keyGap: layoutQA.gap('#f-method', 'label[for="f-key"]'), dialog: layoutQA.dialog() } };
         })()`, 15000);
-        layout.pages.push(...first.pages.map(row => ({ scheme, ...row })));
+        layout.pages.push(...first.pages.map(row => ({ scheme, requestedWidth: width, ...row })));
         if (width === 1120) {
           const toolbar = first.pages.find(row => row.page === 'providers').providerToolbar;
           assert.ok(toolbar.search.width > 0 && toolbar.search.height > 0 && toolbar.filter.width > 0 && toolbar.filter.height > 0,
@@ -483,7 +494,7 @@ async function run() {
           layoutQA.phase = 'keys close'; await layoutQA.close();
           layoutQA.phase = 'provider open'; openProvider();
           await layoutQA.settle();
-          const identityKeyGap = layoutQA.gap('[data-section="connection"] > .form-grid', '[data-section="connection"] > label[for="f-key"]');
+          const identityKeyGap = layoutQA.gap('[data-section="connection"] > .form-grid', '#provider-api-auth > label[for="f-key"]');
           const customPreset = document.querySelector('#f-preset').value;
           document.querySelector('#f-preset').value = 'layout-preset';
           document.querySelector('#f-preset').dispatchEvent(new Event('change', { bubbles: true }));

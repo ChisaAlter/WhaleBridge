@@ -36,11 +36,19 @@ const JevLatest = "jev-latest"
 const BailianDecision = "decision-model-preview"
 
 // bailianDecides reports whether base is Bailian's: a workspace's host or
-// the Token Plan's, <x>.<region>.maas.aliyuncs.com. Its /models lists
-// Qwen's chat models, never the decision model.
+// the Token Plan's, <x>.<region>.maas.aliyuncs.com, or the Qwen AI
+// platform's, maas.qianwenaiapi.com and its plan's under it (#1506). Its
+// /models lists Qwen's chat models, never the decision model.
 func bailianDecides(base string) bool {
 	h := HostOf(base)
-	return strings.HasSuffix(h, ".maas.aliyuncs.com") || strings.HasSuffix(h, ".maas.qianwenaiapi.com")
+	return strings.HasSuffix(h, ".maas.aliyuncs.com") || h == "maas.qianwenaiapi.com" || strings.HasSuffix(h, ".maas.qianwenaiapi.com")
+}
+
+// bailianApart reports whether p serves conversations and Bailian's
+// decision model both (Bailian's Token Plan, #1506): its chat models'
+// list never names the decision model, which is kept apart from it.
+func (p Provider) bailianApart() bool {
+	return !p.DecideOnly() && bailianDecides(p.Decide)
 }
 
 // ownDecideModels are a System One provider's models that its vendor's
@@ -66,7 +74,7 @@ func (p Provider) Decides() bool { return p.Decide != "" }
 
 // DecideOnly reports whether the provider has no conversation endpoint.
 func (p Provider) DecideOnly() bool {
-	return p.Decides() && p.Chat == "" && p.Responses == "" && p.Anthropic == ""
+	return p.Decides() && p.Chat == "" && p.Responses == "" && p.Anthropic == "" && p.Gemini == "" && !p.IsVertex()
 }
 
 // DecidesModel distinguishes Jev from the conversation models a gateway
@@ -77,6 +85,9 @@ func (p Provider) DecidesModel(model string) bool {
 	}
 	if p.DecideOnly() {
 		return true
+	}
+	if p.bailianApart() {
+		return model == BailianDecision
 	}
 	if p.listsDecisions() {
 		// OpenRouter's Jev Router (typesafe/jev-router) is a chat model
@@ -99,18 +110,21 @@ func openRouterDecisions(base string) string {
 }
 
 // listsDecisions reports whether p's decision models are a list of their
-// own, OpenRouter's, rather than Jev's ids among its chat models.
-func (p Provider) listsDecisions() bool { return openRouterDecisions(p.Decide) != "" }
+// own, OpenRouter's, oMLX's (omlxDecides) or MLX-Serve's (mlxServeDecides),
+// rather than Jev's ids among its chat models.
+func (p Provider) listsDecisions() bool {
+	return openRouterDecisions(p.Decide) != "" || p.omlxDecides() || p.mlxServeDecides()
+}
 
 // decisionsID is where a provider that serves conversations too keeps the
 // list of its decision models, beside its chat models' list.
 func decisionsID(id string) string { return id + ".decisions" }
 
-// DecisionModels are the decision models a provider that serves
-// conversations too lists apart from them (OpenRouter's), for its editor
-// to show beside its chat models; nil for any other provider.
+// DecisionModels are the decision models listed separately from a provider's
+// conversations: OpenRouter's own list, oMLX's, MLX-Serve's, or a Bailian
+// Token Plan's decision model.
 func (p Provider) DecisionModels() []catalog.Model {
-	if p.DecideOnly() || !p.listsDecisions() {
+	if p.DecideOnly() || !p.listsDecisions() && !p.bailianApart() {
 		return nil
 	}
 	return p.decideModels()
@@ -135,6 +149,10 @@ func (p Provider) decideListDue() bool {
 		return false
 	}
 	live, _, ok := catalog.Live(id)
+	if p.omlxDecides() || p.mlxServeDecides() {
+		// a server with no decision model loaded lists none, for good
+		return !ok
+	}
 	return !ok || !slices.ContainsFunc(live, func(m catalog.Model) bool { return m.Context > 0 || m.ImageInput != nil })
 }
 
@@ -208,6 +226,14 @@ func (p Provider) Jev() string {
 	}
 	// OpenRouter's Jev is ~typesafe/jev-latest, in its list of decision
 	// models; its Jev Router is a chat model
+	if p.omlxDecides() || p.mlxServeDecides() {
+		// oMLX and MLX-Serve have no Jev of their own: their first decision
+		// model, if any
+		if ms := p.decideListed(); len(ms) > 0 {
+			return ms[0].ID
+		}
+		return ""
+	}
 	if p.listsDecisions() || p.DecideOnly() && HostOf(strings.TrimSpace(p.ModelsURL)) == "openrouter.ai" {
 		ms := p.decideListed()
 		if i := slices.IndexFunc(ms, func(m catalog.Model) bool { return jevID(m.ID) }); i >= 0 {
@@ -292,9 +318,15 @@ func withDecideFacts(ms []catalog.Model) []catalog.Model {
 }
 
 func (p Provider) decideListed() []catalog.Model {
+	if p.bailianApart() {
+		return p.ownDecideModels()
+	}
 	if p.listsDecisions() && !p.DecideOnly() {
 		if live, _, ok := catalog.Live(decisionsID(p.ID)); ok && len(live) > 0 {
 			return live
+		}
+		if p.omlxDecides() || p.mlxServeDecides() {
+			return nil // none until its server says which
 		}
 		return []catalog.Model{{ID: OpenRouterJev, Name: "Jev"}}
 	}
@@ -455,7 +487,7 @@ func Deciders() []Entry {
 			continue
 		}
 		ms := p.Exposed()
-		if !p.DecideOnly() && (len(p.Models) == 0 || p.listsDecisions()) {
+		if !p.DecideOnly() && (len(p.Models) == 0 || p.listsDecisions() || p.bailianApart()) {
 			ms = p.decideModels() // the conversation picker's limit does not hide Jev
 		}
 		for _, m := range ms {
@@ -505,7 +537,10 @@ func RouteDecider(model string) (Provider, string, error) {
 		if !p.On() {
 			return Provider{}, "", decideBadRequest("%s is switched off in magpie", p.Name)
 		}
-		return p, p.Jev(), nil
+		if m := p.Jev(); m != "" {
+			return p, m, nil
+		}
+		return Provider{}, "", decideBadRequest("%s lists no decision models", p.Name)
 	}
 	var listed []Provider
 	for _, p := range on {
@@ -663,6 +698,10 @@ func (p Provider) fetchDecide(ctx context.Context) ([]catalog.Model, error) {
 		list, all = u, true
 	} else if u := openRouterDecisions(p.Decide); u != "" {
 		list, all = u, true
+	} else if p.omlxDecides() {
+		list = omlxDecisions(p.Decide)
+	} else if p.mlxServeDecides() {
+		list = mlxServeDecisions(p.Decide)
 	} else if bailianDecides(p.Decide) {
 		// Bailian lists its chat models only: its decision model is asked
 		return p.decideAsked(ctx)
@@ -688,6 +727,22 @@ func (p Provider) fetchDecide(ctx context.Context) ([]catalog.Model, error) {
 			return p.decideAsked(ctx)
 		}
 		return nil, fmt.Errorf("%s: %s", p.Name, APIError(b, res.Status))
+	}
+	if p.omlxDecides() {
+		// none is an answer too: the server has no decision model now
+		ms, err := listedOMLXDecide(b)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %s", p.Name, err)
+		}
+		return ms, catalog.SaveLive(decisionsID(p.ID), p.Decide, ms)
+	}
+	if p.mlxServeDecides() {
+		// none is an answer too: the server has no decision model now
+		ms, err := listedMLXServeDecide(b)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %s", p.Name, err)
+		}
+		return ms, catalog.SaveLive(decisionsID(p.ID), p.Decide, ms)
 	}
 	ms, err := listedDecide(b, all)
 	if (err != nil || len(ms) == 0) && own {

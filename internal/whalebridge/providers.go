@@ -139,7 +139,7 @@ func supplierInfo(p provider.Provider) map[string]any {
 	keys := keyInfos(p)
 	out := map[string]any{
 		"id": p.ID, "name": p.Name, "icon": p.Icon, "preset": p.Preset, "host": p.Host(),
-		"chat": p.Chat, "responses": p.Responses, "anthropic": p.Anthropic, "decide": p.Decide, "baseAPI": p.BaseAPI,
+		"chat": p.Chat, "responses": p.Responses, "anthropic": p.Anthropic, "gemini": p.Gemini, "vertex": p.Vertex, "decide": p.Decide, "baseAPI": p.BaseAPI,
 		"catalog": p.Catalog, "family": p.Family, "website": p.Website, "keysUrl": p.KeysURL,
 		"headerNames": headers, "keySet": p.Key != "", "keyMasked": provider.Mask(p.Key), "keyList": keys,
 		"models": p.Models, "chosen": p.Models, "available": available, "modelCount": len(p.Exposed()),
@@ -158,9 +158,10 @@ func supplierInfo(p provider.Provider) map[string]any {
 	if p.Account != nil {
 		out["accountAgent"], out["accountUser"] = p.Account.Agent, p.Account.User
 	}
-	optional := p.Account != nil
+	optional := p.Account != nil || p.IsVertex()
 	if pr := provider.Preset(p.Preset); pr != nil {
 		optional = optional || pr.NoKey
+		out["presetInfo"] = pr
 		out["sponsored"] = pr.Sponsored
 	}
 	out["keyOptional"] = optional
@@ -212,7 +213,7 @@ func bodyValue[T any](in map[string]json.RawMessage, name string) (T, error) {
 // patchProvider preserves every field omitted by the editor. The initial
 // DTO carries only header names; a null header value removes that header.
 func patchProvider(p provider.Provider, in map[string]json.RawMessage) (provider.Provider, error) {
-	allowed := strings.Fields("id name icon iconUrl preset keyName keyProtocol keyWeight keys chat responses anthropic decide baseAPI catalog website keysUrl family models unlisted off contexts fallback routing affinity sink searches pinUpstream unredacted proxy accountProxies accountModels accountCaps accountConcurrency balanceURL balancePath modelsURL zhipuTeam maxConcurrency queueLimit queueWait priceRate")
+	allowed := strings.Fields("id name icon iconUrl preset keyName keyProtocol keyWeight keys chat responses anthropic gemini vertex decide baseAPI catalog website keysUrl family models unlisted off contexts fallback routing affinity sink searches pinUpstream unredacted proxy accountProxies accountModels accountCaps accountConcurrency balanceURL balancePath modelsURL zhipuTeam maxConcurrency queueLimit queueWait priceRate")
 	patch := map[string]json.RawMessage{}
 	for _, k := range allowed {
 		if v, ok := in[k]; ok {

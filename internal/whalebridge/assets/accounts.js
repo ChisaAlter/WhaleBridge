@@ -2,6 +2,74 @@
 // client's active account or edits that client's model configuration.
 let subscriptions=[];
 const subscriptionNames={claude:'Claude',codex:'Codex','chatgpt-api':'ChatGPT API',copilot:'GitHub Copilot',cursor:'Cursor',grok:'Grok',devin:'Devin',kiro:'Kiro',zcode:'ZCode',workbuddy:'WorkBuddy','workbuddy-ai':'WorkBuddy AI','commandcode-plan':'Command Code',qoder:'Qoder','qoder-cn':'Qoder 中国版',zed:'Zed',factory:'Factory','mimo-app':'小米 MiMo',gemini:'Google Gemini',antigravity:'Google Antigravity'};
+const sourceGroups={subscription:['账号登录','用已有订阅账号授权接入'],plugin:['已安装的供应商适配器','由适配器提供认证和模型'],partner:['上游赞助供应商','由供应商赞助的目录条目'],vendor:['模型供应商','模型厂商的官方 API'],relay:['聚合服务','一个接口接入多种模型'],local:['本机服务','运行在这台计算机上的模型服务'],remote:['远程网关','连接另一台计算机上的网关']};
+function sourceIsPlan(pr){
+ const words=[pr.id,pr.name,pr.short,pr.note,...Object.values(pr.notes || {}),pr.only,...(pr.regions || []).flatMap(r=>[r.id,r.name,r.chat,r.responses,r.anthropic,r.decide])].filter(Boolean).join(' ');
+ return /\b(?:coding|token|agent|step)[\s_-]*plan\b|\bsubscription\b|\bmembership\b|\bcline[\s_-]*pass\b|\bopencode[\s_-]*go\b|套餐|订阅|会员/i.test(words);
+}
+function sourceRows(rows){
+ const accounts=rows.map(s=>{
+  const name=s.plugin?s.name:s.id==='codex'?'ChatGPT / Codex':subscriptionNames[s.id] || s.name;
+  const existing=state.providers.find(p=>p.id===s.id || p.account?.agent===s.id || s.pid&&p.account?.agent===s.pid);
+  const methods=(s.methods || []).map(m=>m.label).join(' · '),apiOnly=s.plugin&&s.methods?.length&&s.methods.every(m=>m.type==='api');
+  return {type:'subscription',id:s.id,name,group:s.plugin?'plugin':'subscription',plan:true,auth:apiOnly?'适配器 · API 登录密钥':s.plugin?'适配器认证':'账号登录',description:[s.hint,methods,s.package?'支持供应商适配器':'',s.riskNote?'登录前请查看供应商使用说明':''].filter(Boolean).join(' · '),search:[s.name,s.id,s.pid,s.package,methods,s.riskNote,'订阅 登录 subscription account',s.id==='codex'?'ChatGPT Plus Pro Business':s.id==='zcode'?'GLM 智谱 Z.ai Coding Plan':s.id==='workbuddy'?'CodeBuddy':''].filter(Boolean).join(' '),existing};
+ });
+ const presets=state.presets.map(pr=>{
+  const group=sourceGroups[pr.kind]?pr.kind:'vendor',plan=sourceIsPlan(pr);
+  const existing=state.providers.find(p=>!p.account&&(p.preset===pr.id || p.id===pr.id));
+  const regions=pr.regions || [],regionSummary=regions.length>3?`${regions.slice(0,3).map(r=>r.name).join(' / ')} · 共 ${regions.length} 个选项`:regions.map(r=>r.name).join(' / ');
+  const note=pr.notes?.zh || pr.notes?.['zh-CN'] || pr.notes?.en || pr.note;
+  return {type:'preset',id:pr.id,name:pr.name,group,plan,auth:pr.id==='google-vertex'?'Google Cloud 凭据':pr.noKey?'API 密钥可选':plan?'API Key 套餐':'API 密钥',description:[note,regionSummary].filter(Boolean).join(' · '),search:[pr.short,pr.id,pr.note,...Object.values(pr.notes || {}),pr.only,pr.chat,pr.responses,pr.anthropic,pr.decide,pr.website,...regions.flatMap(r=>[r.id,r.name,r.chat,r.responses,r.anthropic,r.decide]),plan?'套餐 订阅 会员 coding token plan':'','API 接口 key'].filter(Boolean).join(' '),existing};
+ });
+ return [...accounts,...presets];
+}
+function drawSourceRows(){
+ if(editor?.type!=='sources')return;
+ const focusKey=document.activeElement?.closest('[data-source-key]')?.dataset.sourceKey;
+ const words=editor.query.trim().toLowerCase().split(/\s+/).filter(Boolean),scope=editor.scope;
+ const visible=editor.rows.map((row,index)=>({row,index})).filter(({row})=>scope==='all'||scope==='plans'&&row.plan||scope==='api'&&row.type==='preset'||scope==='plugins'&&row.group==='plugin'||scope==='local'&&['local','remote'].includes(row.group)).filter(({row})=>words.every(word=>[row.name,row.id,row.auth,row.description,row.search,...sourceGroups[row.group]].join(' ').toLowerCase().includes(word)));
+ $('#source-count').textContent=`${visible.length} 个匹配来源${editor.loading?' · 正在刷新来源目录…':''}`;
+ $('#source-results').innerHTML=Object.entries(sourceGroups).map(([group,[title,hint]])=>{
+  const picks=visible.filter(({row})=>row.group===group);if(!picks.length)return '';
+  return `<section class="source-group"><header><h3>${escape(title)}</h3><p class="caption">${escape(hint)}</p></header><div class="source-grid">${picks.map(({row,index})=>`<button type="button" class="source-choice" data-source-pick="${index}" data-source-key="${escape(row.type+':'+row.id)}"><span class="source-choice-head"><strong>${escape(row.name)}</strong>${row.existing?'<span class="source-added">已添加</span>':''}</span><span class="source-auth">${escape(row.auth)}</span>${row.description?`<span class="source-description">${escape(row.description)}</span>`:''}<span class="source-id">${escape(row.id)}</span></button>`).join('')}</div></section>`;
+ }).join('') || `<div class="source-empty"><h3>${editor.loading?'正在读取来源目录':'没有匹配的模型来源'}</h3><p class="form-hint">${editor.loading?'完整供应商与账号登录目录正在读取。':'试试供应商名称、ID 或「套餐」「登录」「本机」等类别；也可以添加自定义接口或查找供应商适配器。'}</p>${scope!=='all'?'<button type="button" data-source-command="all">查看全部来源</button>':''}</div>`;
+ if(focusKey){const next=[...$('#source-results').querySelectorAll('[data-source-key]')].find(b=>b.dataset.sourceKey===focusKey);(next || $('#source-search')).focus({preventScroll:true});}
+}
+async function openSourcePicker(scope='all',query=''){
+ editor={type:'sources',scope,query,rows:sourceRows([]),loading:true};const current=editor;
+ $('#editor-title').textContent='添加模型来源';
+ $('#fields').innerHTML=`<p class="form-hint">账号登录和 API Key 套餐均可在这里查找。选择来源后再配置认证；保存或完成授权后才接入鲸桥。</p><div class="source-toolbar"><div><label for="source-search">查找供应商或订阅</label><div class="search">${icon('search')}<input id="source-search" type="search" value="${escape(query)}" placeholder="名称、ID、套餐或说明" aria-controls="source-results"></div></div><div><label for="source-scope">来源范围</label><select id="source-scope">${[['all','全部来源'],['plans','账号登录 / API Key 套餐'],['api','API 供应商'],['plugins','已安装适配器'],['local','本机 / 远程服务']].map(([id,label])=>`<option value="${id}" ${id===scope?'selected':''}>${label}</option>`).join('')}</select></div></div><div class="actions-bar source-shortcuts" aria-label="更多模型来源"><button type="button" data-source-command="custom">自定义接口</button><button type="button" data-source-command="adapters">查找供应商适配器</button></div><p class="form-hint" id="source-count" role="status" aria-live="polite"></p><div id="source-results"></div><p class="form-hint">未列出的订阅可能由社区适配器提供。进入适配器目录查看说明后，可自行选择安装。</p>${removedSubscriptions()}`;
+ drawSourceRows();showEditor();$('#save').hidden=true;$('#source-search').focus();
+ $('#source-search').oninput=e=>{current.query=e.target.value;drawSourceRows();};
+ $('#source-scope').onchange=e=>{current.scope=e.target.value;drawSourceRows();};
+ $('#source-search').onkeydown=e=>{if(e.key==='ArrowDown'){const first=$('#source-results [data-source-pick]');if(first){e.preventDefault();first.focus();}}else if(e.key==='Escape'&&e.target.value){e.preventDefault();e.stopPropagation();e.target.value=current.query='';drawSourceRows();}};
+ try{const [presets,rows]=await Promise.all([api('provider/presets'),api('subscriptions')]);if(current!==editor||current.closed)return;state.presets=presets;current.loading=false;current.rows=sourceRows(rows);drawSourceRows();}
+ catch(error){if(current===editor&&!current.closed){current.loading=false;drawSourceRows();formError(error);}}
+ return current;
+}
+function attachSourceReturn(context){
+ editor.sourcePicker=context;
+ $('#fields').insertAdjacentHTML('afterbegin','<div class="source-back"><button type="button" class="text-button" data-source-command="back">'+icon('arrow')+'返回来源目录</button></div>');
+}
+$('#fields').addEventListener('click',async e=>{
+ const pick=e.target.closest('[data-source-pick]'),command=e.target.closest('[data-source-command]');if(!pick&&!command)return;
+ const b=pick || command;if(b.disabled)return;const current=editor,context=current.type==='sources'?{scope:current.scope,query:current.query}:current.sourcePicker;
+ let busy;
+ try{
+  if(command){
+   const action=command.dataset.sourceCommand;
+   if(action==='all'){$('#source-scope').value=current.scope='all';drawSourceRows();$('#source-search').focus();return;}
+   if(action==='back'){await openSourcePicker(context.scope,context.query);return;}
+   if(action==='custom'){openProvider();attachSourceReturn(context);return;}
+   if(action==='adapters'){busy=startButtonBusy(b,'加载中');const next=await openAdapters('discover',current);if(next===editor&&!next.closed)attachSourceReturn(context);return;}
+  }
+  if(pick&&current.type==='sources'){
+   const row=current.rows[Number(pick.dataset.sourcePick)];if(!row)return;
+   if(row.type==='preset'){row.existing?openProvider(row.existing.id):openProvider('','edit',row.id);attachSourceReturn(context);return;}
+   busy=startButtonBusy(b,'加载中');const next=await openSubscription(row.id,false,current);if(next===editor&&!next.closed)attachSourceReturn(context);
+  }
+ }catch(error){if(current===editor&&!current.closed)formError(error);}finally{busy?.finish();}
+});
 async function openSubscription(adapterId='', preferAdapter=false, expected){
  const rows=await api('subscriptions');
  if(expected&&(expected!==editor||expected.closed))return;
@@ -62,7 +130,7 @@ function pollLogin(){
   }catch(e){if(loginFlow!==id||current!==editor||current.closed)return;loginFlow=null;editor.loginBusy?.finish();editor.loginBusy=null;$('#form-error').textContent=e.message;$('#form-error').hidden=false;}
  },1500);
 }
-$('#editor').addEventListener('close',()=>{if(editor){editor.closed=true;editor.loginBusy?.finish();editor.loginBusy=null;}clearTimeout(loginTimer);if(loginFlow){const id=loginFlow;loginFlow=null;api(`signin/${encodeURIComponent(id)}/cancel`,{}).catch(e=>message(e.message));}});
+$('#editor').addEventListener('beforetoggle',event=>{if(event.newState!=='closed')return;if(editor){editor.closed=true;editor.loginBusy?.finish();editor.loginBusy=null;}clearTimeout(loginTimer);if(loginFlow){const id=loginFlow;loginFlow=null;api(`signin/${encodeURIComponent(id)}/cancel`,{}).catch(e=>message(e.message));}});
 
 async function openAccounts(id){
  const rows=await api('accounts/'+encodeURIComponent(id)),p=state.providers.find(p=>p.id===id);

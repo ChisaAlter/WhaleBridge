@@ -80,8 +80,15 @@ func clineKeyUsage(ctx context.Context, p Provider) (windows []QuotaWindow, bala
 		}
 		return nil, "", limErr
 	}
+	if limErr != nil {
+		// Keep the credits read, while saying why the ClinePass limits
+		// could not be read rather than looking like an account without it.
+		return nil, balance, fmt.Errorf("%s: %w", clineLimitsUnread, limErr)
+	}
 	return windows, balance, nil
 }
+
+const clineLimitsUnread = "ClinePass limits couldn't be read"
 
 // clineCredits is the account's credit balance, {balance} in millionths of
 // a dollar, at /users/{id}/balance with the id /users/me tells.

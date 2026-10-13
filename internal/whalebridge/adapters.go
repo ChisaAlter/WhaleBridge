@@ -39,9 +39,14 @@ func setAdapterMirror(on bool) error {
 
 func subscriptionAdapters(ctx context.Context) map[string]any {
 	installed, available, moves := []map[string]any{}, []plugin.Listing{}, []map[string]any{}
-	ps, providerErr := plugin.Providers(ctx)
+	es := plugin.Load().Plugins
+	var ps []plugin.Provider
+	var providerErr error
+	if len(es) > 0 {
+		ps, providerErr = plugin.Providers(ctx)
+	}
 	errs := map[string]string{}
-	if plugin.Running() || plugin.HasBun() {
+	if len(es) > 0 && (plugin.Running() || plugin.HasBun()) {
 		loaded, err := plugin.Plugins(ctx)
 		if err != nil && providerErr == nil {
 			providerErr = err
@@ -50,7 +55,6 @@ func subscriptionAdapters(ctx context.Context) map[string]any {
 			errs[plugin.Name(p.Spec)] = p.Error
 		}
 	}
-	es := plugin.Load().Plugins
 	names := []string{}
 	for _, e := range es {
 		if !plugin.IsPath(e.Spec) && !plugin.IsGit(e.Spec) {

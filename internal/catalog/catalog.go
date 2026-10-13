@@ -40,6 +40,8 @@ type Model struct {
 	Images bool `json:",omitempty"`
 	// ImageInput is the source's explicit answer; nil means it did not say.
 	ImageInput *bool `json:",omitempty"`
+	// InputModalities are what the source says the model takes; nil is unknown.
+	InputModalities []string `json:",omitempty"`
 	// Context is how many tokens a prompt may hold, when known: models.dev's
 	// input limit, else its context window.
 	Context int `json:",omitempty"`

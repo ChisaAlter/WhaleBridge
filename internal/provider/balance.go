@@ -874,9 +874,10 @@ func KeyBalances(ctx context.Context) []SubscriptionQuota {
 			if clineKeyCard(j.p) {
 				ws, amount, err := clineKeyUsage(ctx, j.p)
 				if err != nil {
-					q.Error = err.Error()
+					q.Error, q.Balance = err.Error(), amount
 				} else {
-					q.Windows, q.Balance = ws, amount
+					q.Windows = append(q.Windows, ws...)
+					q.Balance = amount
 					now := time.Now()
 					q.ReadAt = &now
 				}

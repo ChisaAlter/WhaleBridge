@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -154,6 +155,9 @@ func Run(version string) error {
 		writeJSON(w, map[string]any{"active": active})
 	})
 	mux.HandleFunc("GET /api/state", stateHandler(version))
+	mux.HandleFunc("GET /api/provider/presets", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, sourcePresets(3*time.Second))
+	})
 	providerRoutes(mux, server)
 	globalRoutes(mux, server, version)
 	mux.HandleFunc("GET /api/usage", func(w http.ResponseWriter, r *http.Request) {
@@ -347,6 +351,31 @@ func Run(version string) error {
 	return <-failures
 }
 
+type sourcePreset struct {
+	provider.PresetDef
+	Notes map[string]string `json:"notes,omitempty"`
+}
+
+func sourcePresets(wait time.Duration) []sourcePreset {
+	var partners []provider.Partner
+	if wait > 0 {
+		partners = provider.PartnersNow(wait)
+	} else {
+		partners = provider.Partners()
+	}
+	out := make([]sourcePreset, 0, len(partners)+len(provider.Presets()))
+	for _, p := range partners {
+		if len(p.Langs) != 0 && !slices.Contains(p.Langs, "zh") {
+			continue
+		}
+		out = append(out, sourcePreset{PresetDef: p.PresetDef, Notes: p.Notes})
+	}
+	for _, p := range provider.Presets() {
+		out = append(out, sourcePreset{PresetDef: p})
+	}
+	return out
+}
+
 func stateHandler(version string) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if err := provider.FileError(); err != nil {
@@ -371,7 +400,7 @@ func stateHandler(version string) http.HandlerFunc {
 			removed = append(removed, row)
 		}
 		s := settings.Load()
-		writeJSON(w, map[string]any{"version": version, "gateway": gateway.URL(), "providers": suppliers, "removed": removed, "excluded": provider.Excluded(), "presets": provider.Presets(), "models": settingsModels(shown, modelSuppliers), "hidden": settingsModels(hidden, modelSuppliers), "groups": provider.Groups(), "defaultModel": isDefault(), "catalog": catalog.Status(), "syncError": dshSyncError(), "chineseUnits": s.ChineseUnits, "quotaLeft": s.QuotaLeft})
+		writeJSON(w, map[string]any{"version": version, "gateway": gateway.URL(), "providers": suppliers, "removed": removed, "excluded": provider.Excluded(), "presets": sourcePresets(0), "models": settingsModels(shown, modelSuppliers), "hidden": settingsModels(hidden, modelSuppliers), "groups": provider.Groups(), "defaultModel": isDefault(), "catalog": catalog.Status(), "syncError": dshSyncError(), "chineseUnits": s.ChineseUnits, "quotaLeft": s.QuotaLeft})
 	}
 }
 

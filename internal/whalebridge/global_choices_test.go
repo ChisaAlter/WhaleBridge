@@ -53,7 +53,7 @@ func TestGlobalAuxiliaryChoicesUseSafeJSON(t *testing.T) {
 	var fields map[string]json.RawMessage
 	_ = json.Unmarshal(raw, &fields)
 	_ = json.Unmarshal(fields["searchVendors"], &vendorRows)
-	if len(vendorRows) != 5 || vendorRows[0]["id"] == nil || vendorRows[0]["ID"] != nil || got.SearchVendors[0].ID != "tavily" {
+	if len(vendorRows) != len(provider.SearchVendors) || vendorRows[0]["id"] == nil || vendorRows[0]["ID"] != nil || got.SearchVendors[0].ID != "tavily" {
 		t.Fatalf("search vendor JSON does not match renderer fields: %s", raw)
 	}
 	if len(got.Searchers) == 0 || got.Searchers[0]["id"] == nil || got.Searchers[0]["provider"] != nil {

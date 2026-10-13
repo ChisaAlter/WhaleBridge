@@ -34,7 +34,7 @@ const (
 	Chat      Protocol = "chat"      // OpenAI Chat Completions
 	Responses Protocol = "responses" // OpenAI Responses
 	Anthropic Protocol = "anthropic" // Anthropic Messages
-	Gemini    Protocol = "gemini"    // Google Gemini. Served to clients; spoken upstream only for Factory's generate route
+	Gemini    Protocol = "gemini"    // Google Gemini's generateContent: custom Gemini URL, Vertex AI and Factory's generate route
 )
 
 // Protocols in the order magpie prefers them when it has to translate.
@@ -68,6 +68,9 @@ type Provider struct {
 	Chat      string `json:"chat,omitempty"`
 	Responses string `json:"responses,omitempty"`
 	Anthropic string `json:"anthropic,omitempty"`
+	// Gemini is the base of Google's Gemini API, or of one that answers as
+	// it does: generateContent is asked under it, the key in x-goog-api-key.
+	Gemini string `json:"gemini,omitempty"`
 	// Decide is the base of a decision API (TypeSafe's System One, which
 	// Jev answers), for routing groups' choices of model and effort. The
 	// provider may also serve conversations on the other endpoints.
@@ -197,6 +200,9 @@ type Provider struct {
 	// team's windows are told to the key only with them (see
 	// zhipuKeyTeamWindows). nil for a key of the user's own plan.
 	ZhipuTeam *ZhipuTeam `json:"zhipuTeam,omitempty"`
+	// Vertex is the Google Cloud project, location and credentials used by
+	// a Google Vertex AI provider.
+	Vertex *Vertex `json:"vertex,omitempty"`
 
 	// ModelsURL, when set, is where the vendor lists its models, for one
 	// that lists them away from the base URL requests go to (Xiaomi MiMo's
@@ -386,6 +392,10 @@ func (p Provider) clone() Provider {
 		v := *p.ZhipuTeam
 		p.ZhipuTeam = &v
 	}
+	if p.Vertex != nil {
+		v := *p.Vertex
+		p.Vertex = &v
+	}
 	return p // Account, the sign-in's runtime, stays shared
 }
 
@@ -400,7 +410,7 @@ func allProviders() []Provider {
 	var out []Provider
 	for _, p := range stored {
 		p = normalize(p)
-		if p.Chat == "" && p.Responses == "" && p.Anthropic == "" && p.Decide == "" {
+		if !hasEndpoint(p) {
 			picks[p.ID] = p
 			continue
 		}
@@ -497,6 +507,10 @@ func Slug(name string) string {
 
 // Save adds or replaces a provider.
 func Save(p Provider) error {
+	// Refuse a key before normalize drops it: Vertex uses Google credentials.
+	if p.IsVertex() && (strings.TrimSpace(p.Key) != "" || len(p.Keys) > 0) {
+		return errors.New("Google Vertex AI is asked with your Google credentials, not an API key")
+	}
 	p = normalize(p)
 	p.IconURL = "" // import-only: never stored
 	if p.ID == "" {
@@ -537,7 +551,11 @@ func Save(p Provider) error {
 			// taken, it would hide that subscription once signed in
 			return fmt.Errorf("%q is the id of the %s subscription; pick another name", p.ID, p.ID)
 		}
-		if p.Chat == "" && p.Responses == "" && p.Anthropic == "" && p.Decide == "" {
+		if p.IsVertex() {
+			if err := p.Vertex.check(); err != nil {
+				return err
+			}
+		} else if !hasEndpoint(p) {
 			if p.Preset == AzurePreset {
 				return errors.New("Azure OpenAI needs your resource's endpoint, e.g. https://<resource>.openai.azure.com")
 			}
@@ -546,7 +564,7 @@ func Save(p Provider) error {
 		if strings.Contains(p.Decide, WorkspaceID) {
 			return errors.New("Bailian's decision model is asked at your workspace's host: give its workspace ID (workspace=… or the editor's Workspace ID), or pick the Token Plan")
 		}
-		if p.Key == "" && !keyOptional(p) {
+		if p.Key == "" && !keyOptional(p) && !p.IsVertex() {
 			return fmt.Errorf("%s needs an API key", p.Name)
 		}
 	}
@@ -623,6 +641,10 @@ func AddCopy(p Provider, from string) (string, error) {
 	if p.ZhipuTeam == nil {
 		p.ZhipuTeam = src.ZhipuTeam
 	}
+	if p.Vertex == nil && src.Vertex != nil {
+		v := *src.Vertex
+		p.Vertex = &v
+	}
 	if p.Fallback == nil {
 		p.Fallback = slices.Clone(src.Fallback)
 	}
@@ -641,7 +663,7 @@ func AddCopy(p Provider, from string) (string, error) {
 // hostID is an id for a provider from the host it is on: api.relay.com is
 // relay, and one on an IP address, or with no address, is custom.
 func hostID(p Provider) string {
-	for _, u := range []string{p.Chat, p.Responses, p.Anthropic} {
+	for _, u := range []string{p.Chat, p.Responses, p.Anthropic, p.Gemini} {
 		h := hostOf(u)
 		if host, _, err := net.SplitHostPort(h); err == nil {
 			h = host
@@ -825,8 +847,16 @@ func normalize(p Provider) Provider {
 	p.AccountModels = normalAccountModels(p.AccountModels)
 	p.AccountCaps = normalAccountCaps(p.AccountCaps)
 	p.ZhipuTeam = p.ZhipuTeam.normal()
+	p.Vertex = p.Vertex.Normal()
+	if !p.IsVertex() {
+		p.Vertex = nil
+	} else {
+		// Vertex tokens go only to the project's own address, never a custom URL.
+		p.Chat, p.Responses, p.Anthropic, p.Gemini, p.Decide = "", "", "", "", ""
+		p.Key, p.KeyName, p.Keys, p.KeyProtocol, p.KeyWeight = "", "", nil, "", 0
+	}
 	p.remoteMagpieEndpoints()
-	for _, u := range []*string{&p.Chat, &p.Responses, &p.Anthropic, &p.Decide, &p.Website, &p.KeysURL} {
+	for _, u := range []*string{&p.Chat, &p.Responses, &p.Anthropic, &p.Gemini, &p.Decide, &p.Website, &p.KeysURL} {
 		*u = strings.TrimRight(strings.TrimSpace(*u), "/")
 		if *u != "" && !strings.Contains(*u, "://") {
 			*u = "https://" + *u
@@ -842,6 +872,7 @@ func normalize(p Provider) Provider {
 			break
 		}
 	}
+	p.Gemini = GeminiBase(p.Gemini)
 	p.Models = cleanList(p.Models)
 	if p.BaseAPI != "" && p.baseOf(p.BaseAPI) == "" {
 		p.BaseAPI = ""
@@ -868,6 +899,10 @@ func normalize(p Provider) Provider {
 		if pr := Preset(p.Preset); pr != nil {
 			p.Decide = pr.Decide
 		}
+	}
+	// Earlier oMLX / MLX-Serve entries acquire System One at their own chat base.
+	if (p.Preset == OMLXPreset || p.Preset == MLXServePreset) && p.Decide == "" && p.Chat != "" {
+		p.Decide = p.Chat
 	}
 	if p.Routing != Ordered && p.Routing != Rotate && p.Routing != LeastUsed && p.Routing != Pace && p.Routing != Weighted {
 		p.Routing = ""
@@ -974,6 +1009,8 @@ func (p Provider) baseOf(api string) string {
 		return p.Responses
 	case "anthropic":
 		return p.Anthropic
+	case "gemini":
+		return p.Gemini
 	case "decide":
 		return p.Decide
 	}
@@ -993,11 +1030,14 @@ func (p Provider) Base(proto Protocol) string {
 			return p.Account.codeAssist
 		}
 	case Gemini:
-		// Factory's Gemini models are generateContent at /api/llm/g, not
-		// Code Assist. No other provider speaks Gemini upstream.
-		if p.ID == "factory" && p.Account != nil {
+		// Factory's own generate route, Vertex's project, or a Gemini API.
+		if p.FactoryGemini() {
 			return factoryAPI + "/api/llm/g/v1"
 		}
+		if p.IsVertex() {
+			return p.vertexBase()
+		}
+		return p.Gemini
 	}
 	return ""
 }
@@ -1020,11 +1060,18 @@ func (p Provider) Speaks() []Protocol {
 	}
 	// Factory's Gemini models, on generateContent. A model droid didn't
 	// list stays on the other three (factoryAPIs); this is not one of them.
-	if p.ID == "factory" && p.Account != nil {
+	if p.IsVertex() {
+		if p.vertexBase() != "" {
+			out = append(out, Gemini)
+		}
+	} else if p.FactoryGemini() || p.Gemini != "" {
 		out = append(out, Gemini)
 	}
 	return out
 }
+
+// FactoryGemini is Factory's sign-in, whose Gemini models use its own generate route.
+func (p Provider) FactoryGemini() bool { return p.ID == "factory" && p.Account != nil }
 
 // ResponsesFirst: an OpenAI model on OpenAI's API, Copilot's, PipeLLM's or Bedrock's,
 // which is best asked on the Responses API though Chat serves it too.
@@ -1200,7 +1247,12 @@ func Mask(s string) string {
 
 // Ready reports whether the provider can be used: it has a key, needs
 // none, or is a signed-in agent.
-func (p Provider) Ready() bool { return p.Account != nil || p.Key != "" || keyOptional(p) }
+func (p Provider) Ready() bool {
+	if p.IsVertex() {
+		return p.vertexBase() != ""
+	}
+	return p.Account != nil || p.Key != "" || keyOptional(p)
+}
 
 // On is whether the provider takes requests: ready, and not switched off.
 func (p Provider) On() bool { return p.Ready() && !p.Off }

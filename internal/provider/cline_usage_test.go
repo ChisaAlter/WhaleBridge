@@ -20,7 +20,7 @@ func TestClineKeyUsage(t *testing.T) {
 
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		key := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
-		if key != "sk-pass" && key != "sk-free" {
+		if key != "sk-pass" && key != "sk-free" && key != "sk-down" && key != "sk-denied" && key != "sk-nobal" {
 			w.WriteHeader(http.StatusUnauthorized)
 			w.Write([]byte(`{"success":false,"error":"invalid API key"}`))
 			return
@@ -30,12 +30,23 @@ func TestClineKeyUsage(t *testing.T) {
 			w.Write([]byte(`{"success":true,"data":{"id":"usr_` + key + `","email":"a@b.c"}}`))
 		case "/api/v1/users/usr_sk-pass/balance":
 			w.Write([]byte(`{"success":true,"data":{"balance":4250000,"userId":"usr_sk-pass"}}`))
-		case "/api/v1/users/usr_sk-free/balance":
+		case "/api/v1/users/usr_sk-free/balance", "/api/v1/users/usr_sk-down/balance", "/api/v1/users/usr_sk-denied/balance":
 			w.Write([]byte(`{"success":true,"data":{"balance":12000000}}`))
+		case "/api/v1/users/usr_sk-nobal/balance":
+			w.WriteHeader(http.StatusBadGateway)
 		case "/api/v1/users/me/plan/usage-limits":
-			if key == "sk-free" {
+			switch key {
+			case "sk-free":
 				w.WriteHeader(http.StatusNotFound)
 				w.Write([]byte(`{"success":false,"error":"no active plan"}`))
+				return
+			case "sk-down":
+				w.WriteHeader(http.StatusServiceUnavailable)
+				w.Write([]byte(`{"success":false,"error":"try again later"}`))
+				return
+			case "sk-denied":
+				w.WriteHeader(http.StatusForbidden)
+				w.Write([]byte(`{"success":false,"error":"forbidden"}`))
 				return
 			}
 			w.Write([]byte(`{"success":true,"data":{"limits":[
@@ -52,7 +63,8 @@ func TestClineKeyUsage(t *testing.T) {
 	t.Cleanup(func() { clineUsageAPI = old })
 
 	if err := Save(Provider{ID: "clinepass", Name: "ClinePass", Preset: "clinepass", Chat: "https://api.cline.bot/api/v1",
-		Key: "sk-pass", KeyName: "pass", Keys: []KeyAccount{{Name: "free", Key: "sk-free"}, {Name: "bad", Key: "sk-bad"}}}); err != nil {
+		Key: "sk-pass", KeyName: "pass", Keys: []KeyAccount{{Name: "free", Key: "sk-free"}, {Name: "bad", Key: "sk-bad"},
+			{Name: "down", Key: "sk-down"}, {Name: "denied", Key: "sk-denied"}, {Name: "nobal", Key: "sk-nobal"}}}); err != nil {
 		t.Fatal(err)
 	}
 	got := map[string]SubscriptionQuota{}
@@ -75,5 +87,14 @@ func TestClineKeyUsage(t *testing.T) {
 	}
 	if bad := got["bad"]; !strings.Contains(bad.Error, "401") || bad.Balance != "" {
 		t.Fatalf("a key Cline refuses: %+v", bad)
+	}
+	for user, code := range map[string]string{"down": "503", "denied": "403"} {
+		q := got[user]
+		if !strings.HasPrefix(q.Error, "ClinePass limits couldn't be read: ") || !strings.Contains(q.Error, code) || q.Balance != "$12.00" || len(q.Windows) != 0 {
+			t.Fatalf("a key whose limits fail with %s: %+v", code, q)
+		}
+	}
+	if q := got["nobal"]; q.Error != "" || q.Balance != "" || len(q.Windows) != 3 {
+		t.Fatalf("a key whose balance fails: %+v", q)
 	}
 }

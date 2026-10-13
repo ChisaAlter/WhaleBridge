@@ -4,6 +4,10 @@
   "archiveSha256": "61875980830b94c5fecd202dd8bd81eae8de0e3551978b77faadac48b43d1844",
   "providerFeaturesCommit": "290c60a31ebe701903af425cae6a95fbe1f55255",
   "providerFeaturesArchiveSha256": "20d4fcc0634e53834ec016d4d59360ec4cb742aaa31220d23adb00649ec3cd4d",
+  "providerDiscoveryCommit": "a75de4c21ac28be98af8334643077d8b0bf47df7",
+  "providerDiscoveryArchiveSha256": "d27f7aeeff819464a6a2b82c7038dd473e8af63e8336182726241a4af9d66ddf",
+  "searchFeaturesCommit": "a75de4c21ac28be98af8334643077d8b0bf47df7",
+  "searchFeaturesArchiveSha256": "d27f7aeeff819464a6a2b82c7038dd473e8af63e8336182726241a4af9d66ddf",
   "agentFeaturesCommit": "290c60a31ebe701903af425cae6a95fbe1f55255",
   "agentFeaturesArchiveSha256": "20d4fcc0634e53834ec016d4d59360ec4cb742aaa31220d23adb00649ec3cd4d",
   "version": "1.2.0"

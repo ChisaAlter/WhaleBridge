@@ -30,6 +30,7 @@ const manifest = {
   id: 'whalebridge', name: '鲸桥', version,
   description: '默认接入鲸屿，也可为其他 Agent 配置模型，统一管理供应商、路由与用量。',
   upstream: pin.commit, providerFeaturesUpstream: pin.providerFeaturesCommit,
+  providerDiscoveryUpstream: pin.providerDiscoveryCommit, searchFeaturesUpstream: pin.searchFeaturesCommit,
   agentFeaturesUpstream: pin.agentFeaturesCommit, license,
   platforms: { 'win32-x64': { asset, size: binary.length, sha256: createHash('sha256').update(binary).digest('hex') } },
 };

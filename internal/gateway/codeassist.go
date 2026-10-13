@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"strings"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
@@ -114,6 +115,7 @@ func buildCodeAssist(r *Request, model, agent string) []byte {
 // the request goes out under is the one everything below is shaped from.
 func buildCodeAssistSent(r *Request, sent, agent string) []byte {
 	ag := agent == "antigravity"
+	vx := agent == "vertex"
 	at := "" // the level the id says it thinks at
 	if ag {
 		if _, l, ok := antigravityBaseOf(sent); ok {
@@ -135,6 +137,7 @@ func buildCodeAssistSent(r *Request, sent, agent string) []byte {
 			role = "model"
 		}
 		var parts, after []map[string]any // after: tools' images held back
+		signed := vx && slices.ContainsFunc(m.Parts, func(p Part) bool { return p.Kind == ToolCall && p.Signature != "" })
 		for _, p := range m.Parts {
 			switch p.Kind {
 			case Text:
@@ -153,7 +156,14 @@ func buildCodeAssistSent(r *Request, sent, agent string) []byte {
 				if id := toolID(p.ID); id != "" {
 					call["id"] = id
 				}
-				parts = append(parts, map[string]any{"functionCall": call, "thoughtSignature": skipSignature})
+				part := map[string]any{"functionCall": call}
+				switch {
+				case vx && p.Signature != "":
+					part["thoughtSignature"] = p.Signature
+				case !signed:
+					part["thoughtSignature"] = skipSignature
+				}
+				parts = append(parts, part)
 			case ToolResult:
 				name := names[p.CallID]
 				if name == "" {
@@ -279,7 +289,11 @@ func buildCodeAssistSent(r *Request, sent, agent string) []byte {
 	if len(r.Stop) > 0 {
 		gen["stopSequences"] = r.Stop
 	}
-	if tc := thinkingConfig(r, sent, claude, at); tc != nil {
+	tc := thinkingConfig(r, sent, claude, at)
+	if vx {
+		tc = vertexThinking(r, sent)
+	}
+	if tc != nil {
 		gen["thinkingConfig"] = tc
 		// Claude's answer has to have room past its thinking
 		if b, ok := tc["thinkingBudget"].(int); ok && claude && gen["maxOutputTokens"] == nil {
@@ -594,7 +608,7 @@ func (d *codeAssistDecoder) decode(data string, emit func(Event)) error {
 					args = json.RawMessage("{}")
 				}
 				d.tools = true
-				emit(Event{Kind: KToolStart, ID: id, Name: toolOfCall(p.FunctionCall.Name)})
+				emit(Event{Kind: KToolStart, ID: signedID(id, p.Signature), Name: toolOfCall(p.FunctionCall.Name)})
 				emit(Event{Kind: KToolArgs, Text: string(args)})
 			case p.Thought:
 				d.flush(emit)

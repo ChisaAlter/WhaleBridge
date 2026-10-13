@@ -147,8 +147,11 @@ func Drawers(p provider.Provider) []catalog.Model {
 	if p.Account != nil || (p.Base(provider.Chat) == "" && p.Base(provider.Responses) == "") {
 		return nil
 	}
-	var out []catalog.Model
-	have := map[string]bool{}
+	out := p.PlanDrawers()
+	have := make(map[string]bool, len(out))
+	for _, m := range out {
+		have[m.ID] = true
+	}
 	for _, c := range p.Catalogs() {
 		for _, m := range catalog.Drawers(c) {
 			if !have[m.ID] {
@@ -157,11 +160,13 @@ func Drawers(p provider.Provider) []catalog.Model {
 			}
 		}
 	}
-	for _, m := range catalog.LiveDrawers(p.ID) {
-		if !have[m.ID] {
-			have[m.ID] = true
-			m.Provider = p.ID
-			out = append(out, m)
+	if p.ListsModels() {
+		for _, m := range catalog.LiveDrawers(p.ID) {
+			if !have[m.ID] {
+				have[m.ID] = true
+				m.Provider = p.ID
+				out = append(out, m)
+			}
 		}
 	}
 	for _, id := range p.Models {

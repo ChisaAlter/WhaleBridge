@@ -40,11 +40,11 @@ func globalState() map[string]any {
 	out["otel"] = map[string]any{"enabled": s.OTel.Enabled, "endpoint": s.OTel.Endpoint, "metrics": s.OTel.Metrics, "bodies": s.OTel.Bodies, "bodiesWhole": s.OTel.BodiesWhole, "headerNames": names}
 	searches := []map[string]any{}
 	for _, a := range provider.StoredSearchAPIs() {
-		searches = append(searches, map[string]any{"vendor": a.Vendor, "name": a.Name(), "url": a.URL, "keySet": a.Key != "", "keyMasked": provider.Mask(a.Key), "ready": a.Ready()})
+		searches = append(searches, map[string]any{"vendor": a.Vendor, "name": a.Name(), "url": a.URL, "keySet": len(a.Keys()) > 0, "keyMasked": a.MaskedKey(), "ready": a.Ready()})
 	}
 	searchVendors := []map[string]any{}
 	for _, v := range provider.SearchVendors {
-		searchVendors = append(searchVendors, map[string]any{"id": v.ID, "name": v.Name, "base": v.Base, "keysURL": v.KeysURL})
+		searchVendors = append(searchVendors, map[string]any{"id": v.ID, "name": v.Name, "base": v.Base, "keysURL": v.KeysURL, "keyOptional": v.KeyOptional})
 	}
 	searchers := []map[string]any{}
 	for _, c := range gateway.Searchers() {

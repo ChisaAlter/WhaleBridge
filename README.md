@@ -26,9 +26,9 @@ Magpie 源码的模型连接组件，默认接入鲸屿，也支持配置其他 
 
 独立 Windows 工作流验证网关、供应商、设置、用量和鲸桥 API，运行实际二进制启动检查及四组页面交互回归。页面检查依赖固定的 Electron 44.2.0：`pnpm install --frozen-lockfile --ignore-scripts` 后执行 `node node_modules/electron/install.js`、`pnpm test:web`。鲸屿宿主的安装/更新/回滚和原生管理窗口 QA 留在鲸屿仓库，使用独立构建产物，不再解析组件源树。
 
-工作分支与 PR 不发布组件；成功的 main 构建才发布未存在的组件版本。首次公开源码和实际资产下载验证完成前，不切换线上客户端。
+工作分支与 PR 不发布组件；成功的 main 构建才发布未存在的组件版本。稳定版 1.1.0 的原始二进制和清单已迁入独立 GitHub 仓库，宿主的匿名发现、下载校验、安装、启动、停止与卸载已验证；新的 1.2.0 多 Agent 功能与独立工作流保留在开发分支，等待合入。
 
-组件的 CNB 工作流位于本仓库，继续分发到共享镜像 `ayasealter/WhaleIsle`，只推送选中的新组件 tag，不推送或改写鲸屿 main，也不推送全部历史 tag。旧版 1.1.0 的 CNB tag 保持原宿主来源，新流程从独立仓库的新版本开始。新仓库需填写 Actions secret `CNB_TOKEN`，具备该镜像的 `repo-code:rw` 与 `repo-release:rw` 权限；GitHub 无法读取并复制旧仓库已保存的 secret。凭据配置和实际匿名字节验证尚未完成。
+组件的 CNB 工作流位于本仓库，继续分发到共享镜像 `ayasealter/WhaleIsle`，只推送选中的新组件 tag，不推送或改写鲸屿 main，也不推送全部历史 tag。旧版 1.1.0 的 CNB tag 保持原宿主来源，新流程从独立仓库的新版本开始。Actions secret `CNB_TOKEN` 已经由旧仓库通过目标仓库公钥加密迁入，明文未离开加密步骤；原凭据和旧仓库手动关闭的发布、镜像工作流保持原状。新组件 tag 的实际镜像和匿名下载校验待首次独立发布时确认。
 
 上游 Agent 测试整包在 Windows 尚未通过：部分离线案例使用 Unix 文件权限或需要 symlink 权限，Codex 的陈旧进程测试要求 Windows 实现明确不提供的进程判定。测试及断言保持原样；工作流验证组件 API 接出的行为和可在 Windows 上运行的七项格式恢复案例，不宣称上游 CLI 全量验收通过。
 

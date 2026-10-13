@@ -133,3 +133,13 @@ func factoryLoginQuota(ctx context.Context, l Login) SubscriptionQuota {
 	q.Windows = factoryQuota(lim)
 	return q
 }
+
+// FactoryAllowanceForTest is the allowance an account's /api/billing/limits
+// answer gives routing, for the gateway's tests.
+func FactoryAllowanceForTest(limits []byte, now time.Time) Allowance {
+	var l factoryLimits
+	if json.Unmarshal(limits, &l) != nil {
+		return nil
+	}
+	return allowanceOf(factoryQuota(l), now)
+}

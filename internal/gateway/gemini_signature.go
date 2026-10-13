@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"slices"
+	"strconv"
 	"strings"
 )
 
@@ -17,9 +18,16 @@ import (
 // there. A Chat client knows no such field (Pi's openai-completions drops
 // it, as the AI SDK does), but every client sends a call's id back as it
 // was given. So the signature rides in the id the client is given,
-// <id>__ts__<signature, base64url>, and comes off it on the way back: into
-// extra_content for Gemini, and left out for any other upstream, which
-// gets the id the call had.
+// <id>__ts<n>__<signature, base64url>, and comes off it on the way back:
+// into extra_content for Gemini, and left out for any other upstream,
+// which gets the id the call had.
+//
+// n is how many characters the signature has in the id. Some clients
+// shorten an id they were given (one caps them at 40 characters, #1536),
+// and what is left of a signature often still decodes as base64, so only
+// n tells a shortened signature from a whole one. A signature that isn't
+// whole is none: Gemini answers a partial one with 400 "Corrupted thought
+// signature".
 //
 // A call with no signature to give back — made by another model, or an
 // id a client shortened — goes to Gemini with the value Google documents
@@ -27,8 +35,13 @@ import (
 // Code Assist path sends every call.
 
 const (
-	sigMark    = "__ts__"  // the signature's own bytes, base64url
-	sigMarkRaw = "__tsr__" // a signature that isn't canonical base64, its text base64url
+	// sigMark begins the signature in an id: __ts<n>__ for the signature's
+	// own bytes, __tsr<n>__ for one that isn't canonical base64, its text.
+	// Ids magpie gave before #1536 have no n (__ts__, __tsr__); they are
+	// still read, with nothing to check them by.
+	sigMark = "__ts"
+	sigRaw  = "r"
+	sigEnd  = "__"
 )
 
 // signedID is a tool call's id carrying its thought signature.
@@ -39,24 +52,49 @@ func signedID(id, sig string) string {
 	if id == "" {
 		id = "call_" + newID()
 	}
+	kind, enc := sigRaw, base64.RawURLEncoding.EncodeToString([]byte(sig))
 	if b, err := base64.StdEncoding.DecodeString(sig); err == nil && base64.StdEncoding.EncodeToString(b) == sig {
-		return id + sigMark + base64.RawURLEncoding.EncodeToString(b)
+		kind, enc = "", base64.RawURLEncoding.EncodeToString(b)
 	}
-	return id + sigMarkRaw + base64.RawURLEncoding.EncodeToString([]byte(sig))
+	return id + sigMark + kind + strconv.Itoa(len(enc)) + sigEnd + enc
 }
 
 // unsignedID splits an id signedID made into the call's own id and its
-// signature; any other id comes back as it is, with no signature.
+// signature; any other id, or one whose signature was cut short, comes
+// back as it is, with no signature.
 func unsignedID(id string) (string, string) {
-	if i := strings.Index(id, sigMarkRaw); i > 0 {
-		if b, err := base64.RawURLEncoding.DecodeString(id[i+len(sigMarkRaw):]); err == nil && len(b) > 0 {
+	for at := 1; at < len(id); {
+		i := strings.Index(id[at:], sigMark)
+		if i < 0 {
+			break
+		}
+		i += at
+		at = i + 1
+		rest := id[i+len(sigMark):]
+		raw := strings.HasPrefix(rest, sigRaw)
+		if raw {
+			rest = rest[len(sigRaw):]
+		}
+		d := 0
+		for d < len(rest) && rest[d] >= '0' && rest[d] <= '9' {
+			d++
+		}
+		enc, ok := strings.CutPrefix(rest[d:], sigEnd)
+		if !ok {
+			continue // not a mark: part of the call's own id
+		}
+		// the first mark decides: a signature cut short is none
+		if d > 0 && rest[:d] != strconv.Itoa(len(enc)) {
+			return id, ""
+		}
+		b, err := base64.RawURLEncoding.DecodeString(enc)
+		if err != nil || len(b) == 0 {
+			return id, ""
+		}
+		if raw {
 			return id[:i], string(b)
 		}
-	}
-	if i := strings.Index(id, sigMark); i > 0 {
-		if b, err := base64.RawURLEncoding.DecodeString(id[i+len(sigMark):]); err == nil && len(b) > 0 {
-			return id[:i], base64.StdEncoding.EncodeToString(b)
-		}
+		return id[:i], base64.StdEncoding.EncodeToString(b)
 	}
 	return id, ""
 }
@@ -122,7 +160,7 @@ func googleExtra(sig string) map[string]any {
 // in extra_content, or skip_thought_signature_validator in a turn with
 // none; for another upstream the ids are only the calls' own again.
 func chatCallSignatures(body []byte, gemini bool) []byte {
-	signed := bytes.Contains(body, []byte(sigMark)) || bytes.Contains(body, []byte(sigMarkRaw))
+	signed := bytes.Contains(body, []byte(sigMark))
 	if !signed && !(gemini && bytes.Contains(body, []byte(`"tool_calls"`))) {
 		return body
 	}

@@ -38,6 +38,9 @@ type caller struct {
 	agent, via string
 	session    string
 	native     [2]string // header, value
+	// ua is the User-Agent the request came with, as it came: the one a
+	// provider that passes the agent's on is sent (userAgentFor)
+	ua string
 }
 
 type callerCtx struct{}
@@ -46,7 +49,7 @@ type callerCtx struct{}
 // headers that said so off it.
 func withCaller(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		c := caller{agent: agentOf(r), session: boundedSession(r.Header.Get(SessionHeader))}
+		c := caller{agent: agentOf(r), session: boundedSession(r.Header.Get(SessionHeader)), ua: r.Header.Get("User-Agent")}
 		for _, h := range sessionHeaders {
 			if v := boundedSession(r.Header.Get(h)); v != "" {
 				c.native = [2]string{h, v}

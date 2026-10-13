@@ -31,6 +31,17 @@ const pluginBase = "plugin://"
 // plugin's chat.headers hook as its session; it goes no further.
 const ConversationHeader = "X-Magpie-Conversation"
 
+// WorkDirHeader and WorkGitHeader tell a plugin's fetch where the agent
+// that asked works, as the agent says it in its request: the folder,
+// percent-encoded (decodeURIComponent reads it), and "yes" or "no" for
+// whether it is in a git repository. Each is left off when it isn't
+// known. The plugin host takes them off whatever the plugin sends on
+// (host.js), so they reach no vendor as headers.
+const (
+	WorkDirHeader = "X-Magpie-Work-Dir"
+	WorkGitHeader = "X-Magpie-Work-Git"
+)
+
 // PluginID is the id magpie gives the provider OpenCode calls id: the same,
 // unless a preset or a built-in subscription has it (google, openai,
 // anthropic), when it is id-plugin — but for a built-in moved onto the
@@ -166,11 +177,22 @@ func pluginCatalog(pp plugin.Provider) []catalog.Model {
 		c := catalog.Model{
 			ID: m.ID, Name: m.Name, Provider: pp.ID, Released: m.Released,
 			APIs: []string{string(pluginProtocol(pp.ID, m))}, Images: m.Image,
-			Context: m.Input, Output: m.Output, Free: m.Free,
+			Context: catalog.Window(m.Input), Output: m.Output, Free: m.Free,
 			Rate: m.Rate, RateWas: m.RateWas,
+			// a decision model the plugin marked counts only where it
+			// serves a decision API (pp.Decide)
+			Decides: pp.Decide && m.Decides,
 		}
-		if c.Context == 0 {
-			c.Context = m.Context
+		// a limit under catalog.LeastWindow (512, H20 on Discord) is none:
+		// the other one, or models.dev, answers (ListedWindow)
+		if window := catalog.Window(m.Context); c.Context == 0 {
+			c.Context = window
+		} else if window > 0 && window < c.Context {
+			// the prompt cap a plugin names wins, but never above the
+			// window it also names: a row with input over context
+			// (opencode/hy3-free's 192K over 190K) was served past its
+			// window (#1286)
+			c.Context = window
 		}
 		// Cursor's own ids no catalog knows: one not named a 1M model
 		// holds what the catalog knows its base to, as the built-in's did
@@ -197,7 +219,12 @@ func pluginCatalog(pp plugin.Provider) []catalog.Model {
 		}
 		if m.ImageSaid {
 			c.ImageInput = &m.Image
+			// what else it takes (audio, video, pdf), only where the
+			// plugin said what it takes: the host's default for a model
+			// it said nothing of is text alone (#1595)
+			c.InputModalities = m.Inputs
 		}
+		c.OutputModalities = m.Outputs
 		out = append(out, c)
 	}
 	return out
@@ -270,7 +297,9 @@ func pluginProvider(pp plugin.Provider, l pluginLogin) Provider {
 	a := &Account{Agent: "plugin", User: user, Plan: l.Plan, Stream: true, plugin: &pp, pluginKey: acct.Key}
 	if pp.ID == "grok" {
 		// Codex's namespaced tools go to Grok flat, as the built-in sends
-		// them (#404): the plugin's own rewrite would leave them out
+		// them (#404): the plugin's own rewrite would leave them out; and
+		// a plain agent_message goes as the user's message, as the plugin
+		// itself sends it from 0.1.11
 		a.body = grokBody
 	}
 	if pp.ID == "zed" {
@@ -324,6 +353,13 @@ func pluginProvider(pp plugin.Provider, l pluginLogin) Provider {
 		case CodeAssist:
 			a.codeAssist = pluginBase + pp.ID
 		}
+	}
+	if pp.Decide {
+		// its decision API is the provider's own base, asked at
+		// /systemone through the plugin's fetch: pluginFetch sends nowhere
+		// but the loader's host, so an address of the plugin's own
+		// couldn't be reached (#1514)
+		p.Decide = pluginBase + pp.ID + "/v1"
 	}
 	return p
 }

@@ -45,7 +45,15 @@ func (s *Server) serveZed(w http.ResponseWriter, r *http.Request, from provider.
 	if err != nil {
 		return writeError(w, from, 400, err.Error()), err.Error()
 	}
+	// the vendor's own API is told the answer's format in words
+	req = req.inSystem()
 	req.Model = model
+	// a Claude model's request is Anthropic's, which needs a reply limit:
+	// one the client didn't name is the model's own, as the Zed editor
+	// sends it (#1792, askedOutput)
+	if req.MaxTokens <= 0 && zed.Wire(zedProviderOf(p.Account.User, model)) == "anthropic" {
+		req.MaxTokens = askedOutput(p, model)
+	}
 	ask := s.askZed(p.Account.User, model)
 	if req.WebSearch && !searching(r.Context()) {
 		if canSearch() {

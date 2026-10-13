@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // Packing1 on Discord: dsh through magpie alone, every web search failed
@@ -108,5 +110,87 @@ func TestDshSearchThroughGateway(t *testing.T) {
 	}
 	if s = read(); s != own {
 		t.Fatalf("user's row after reset:\n%s", s)
+	}
+}
+
+// 我只会玩单机 on Discord: with a searcher named under Settings › Web search
+// (GPT-6 Luna), dsh's search row still asked the model dsh starts on, which
+// can't search by itself and asked the searcher in turn: two requests a
+// search, and a model that takes one call at a time timed out. The row
+// asks the named searcher, follows it being picked and cleared on the
+// round that writes the route again, and a row of the user's stays.
+func TestDshSearchAsksNamedSearcher(t *testing.T) {
+	home, _, web := dshRouteHome(t)
+	if err := provider.Save(provider.Provider{ID: "oai", Name: "OpenAI", Responses: "https://api.openai.com/v1", Key: "k", Models: []string{"gpt-6-luna", "gpt-6-sol"}}); err != nil {
+		t.Fatal(err)
+	}
+	name := func(v string) {
+		t.Helper()
+		st := settings.Load()
+		st.Searcher = v
+		if err := settings.Save(st); err != nil {
+			t.Fatal(err)
+		}
+	}
+	template := "# Your patch layer for this dsh profile.\n[]\n"
+	os.WriteFile(web, []byte(template), 0o644)
+	read := func() string { b, _ := os.ReadFile(web); return string(b) }
+	f := dsh(home).Field("model")
+
+	name("oai/gpt-6-luna")
+	if err := f.Set("magpie/deepseek/pro"); err != nil {
+		t.Fatal(err)
+	}
+	s := read()
+	if !strings.Contains(s, `model: "oai/gpt-6-luna"`) || strings.Count(s, "id: "+dshSearchRow) != 1 {
+		t.Fatalf("named searcher not asked:\n%s", s)
+	}
+	if !strings.Contains(s, "model: deepseek/pro") && !strings.Contains(s, `model: "deepseek/pro"`) {
+		t.Fatalf("dsh's own start lost:\n%s", s)
+	}
+
+	// cleared in Settings: the next round asks dsh's start again
+	name("")
+	if _, err := dshRouteAgain(web, magpieModels("dsh"), gateway.URL()); err != nil {
+		t.Fatal(err)
+	}
+	if s = read(); !strings.Contains(s, `model: "deepseek/pro"`) || strings.Contains(s, `model: "oai/gpt-6-luna"`) {
+		t.Fatalf("searcher cleared:\n%s", s)
+	}
+	// named again, while dsh already runs through magpie
+	name("oai/gpt-6-luna")
+	if _, err := dshRouteAgain(web, magpieModels("dsh"), gateway.URL()); err != nil {
+		t.Fatal(err)
+	}
+	if s = read(); !strings.Contains(s, `model: "oai/gpt-6-luna"`) {
+		t.Fatalf("searcher named later:\n%s", s)
+	}
+	// provider search off: the start model, as before
+	name("off")
+	if _, err := dshRouteAgain(web, magpieModels("dsh"), gateway.URL()); err != nil {
+		t.Fatal(err)
+	}
+	if s = read(); !strings.Contains(s, `model: "deepseek/pro"`) {
+		t.Fatalf("search off:\n%s", s)
+	}
+	name("oai/gpt-6-luna")
+	if err := f.Set(""); err != nil {
+		t.Fatal(err)
+	}
+	if s = read(); s != template {
+		t.Fatalf("reset:\n%s", s)
+	}
+
+	// a row of the user's, its own model, stays with a searcher named
+	own := "# Your patch layer for this dsh profile.\n- id: web-search-deepseek\n  config:\n    apiKeyEnv: MY_KEY\n    baseURL: https://search.example/v1\n    model: my-search\n"
+	os.WriteFile(web, []byte(own), 0o644)
+	if err := f.Set("magpie/deepseek/pro"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dshRouteAgain(web, magpieModels("dsh"), gateway.URL()); err != nil {
+		t.Fatal(err)
+	}
+	if s = read(); !strings.HasPrefix(s, own) || strings.Count(s, dshSearchRow) != 1 || strings.Contains(s, `model: "oai/gpt-6-luna"`) {
+		t.Fatalf("user's row:\n%s", s)
 	}
 }

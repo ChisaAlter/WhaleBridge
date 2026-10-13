@@ -6,6 +6,7 @@ import (
 	"os"
 	"time"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/filelock"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
@@ -28,13 +29,13 @@ func lock(ctx context.Context) (unlock func(), err error) {
 		return func() {}, nil // no lock to be had here: sync as before there was one
 	}
 	for {
-		got, err := tryLock(f)
+		got, err := filelock.TryLock(f)
 		if err != nil { // a file system without locks, as an NFS home with no lockd
 			f.Close()
 			return func() {}, nil
 		}
 		if got {
-			return func() { unlockFile(f); f.Close() }, nil
+			return func() { filelock.Unlock(f); f.Close() }, nil
 		}
 		select {
 		case <-ctx.Done():

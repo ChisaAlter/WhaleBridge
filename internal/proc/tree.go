@@ -45,6 +45,6 @@ func (t *Tree) Kill() {
 	if t.done {
 		return
 	}
-	t.kill(t.cmd)
+	_ = t.kill(t.cmd)
 	_ = t.cmd.Process.Kill()
 }

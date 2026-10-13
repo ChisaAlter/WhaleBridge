@@ -46,9 +46,24 @@ func (s *Server) retrieve(path, operation string) http.HandlerFunc {
 		who := callerOf(r)
 		call := Call{Time: start, From: provider.Chat, Agent: who.agent, Via: who.via, Model: asked}
 		usage.Saw(agentOf(r))
+		// a model the user disabled (#1867), or a group of them all
+		if msg, off := idOff(asked); off {
+			call.Status, call.Error = 403, msg
+			writeError(w, provider.Chat, 403, msg)
+			s.record(call)
+			return
+		}
 		p, model, ok := resolveRetrievalModel(asked)
+		if _, _, isGroup := provider.FindGroup(asked); ok && !isGroup {
+			if msg, off := modelOff(p, model, asked); off {
+				call.Status, call.Error = 403, msg
+				writeError(w, provider.Chat, 403, msg)
+				s.record(call)
+				return
+			}
+		}
 		if !ok {
-			msg := fmt.Sprintf("magpie knows no model %q", asked)
+			msg := unknownModel(asked, "")
 			if off, isOff := provider.SwitchedOff(asked); isOff {
 				msg = switchedOff(off, asked)
 			}
@@ -65,6 +80,19 @@ func (s *Server) retrieve(path, operation string) http.HandlerFunc {
 			s.record(call)
 			return
 		}
+		if isGroup {
+			// a model a pause rule holds for now is left out, as for a chat
+			var paused []provider.Paused
+			if ms, paused = provider.PausedOut(g.Live(), ms, agentOf(r), "", ruleClock()); len(ms) == 0 && len(paused) > 0 {
+				msg := pausedError(asked, paused)
+				call.Status, call.Error = 503, msg
+				writeError(w, provider.Chat, 503, msg)
+				s.record(call)
+				return
+			} else if len(paused) > 0 {
+				p, model = ms[0].Provider, ms[0].Model // not the paused one, when planning finds none
+			}
+		}
 		call.To = provider.Chat
 		// a routing group's members are tried as its routing orders them,
 		// each account or key of theirs too (#773), the next asked when one
@@ -75,6 +103,18 @@ func (s *Server) retrieve(path, operation string) http.HandlerFunc {
 			if cs, _ := s.planGroup(g.Live(), ms, provider.Chat); len(cs) > 0 {
 				tries = cs
 			}
+		} else {
+			// a model of one provider goes over its keys or accounts as a
+			// chat does, never on one whose own list of models leaves it
+			// out (#1657)
+			cs, code, msg := s.onKeys(r, p, model, asked)
+			if code != 0 {
+				call.Status, call.Error = code, msg
+				writeError(w, provider.Chat, code, msg)
+				s.record(call)
+				return
+			}
+			tries = cs
 		}
 		// the accounts or keys the calling key may not use are left out of
 		// the tries too (#905): a group's members through it no less
@@ -88,6 +128,7 @@ func (s *Server) retrieve(path, operation string) http.HandlerFunc {
 				return
 			}
 		}
+		tries = probeOne(tries) // of those resting, only the one back soonest (#1799)
 		var skipped []string
 		// masked once, as the settings say: a document a reranker gives
 		// back has its secrets again
@@ -181,14 +222,17 @@ func resolveRetrievalModel(id string) (provider.Provider, string, bool) {
 // retrieveFrom posts body to url as the provider signs its requests, and
 // reads the answer; a failure's code is the vendor's, with its message.
 func (s *Server) retrieveFrom(ctx context.Context, p provider.Provider, url string, body []byte) ([]byte, int, error) {
-	ctx = p.Via(ctx)
+	ctx = s.metered(p.Via(ctx), p, "") // counted against its MaxRPM (rpm.go)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
 	if err != nil {
 		return nil, 500, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json")
+	// magpie's, or the agent's own where the provider passes it on (#1851)
+	stampUA(ctx, p, req.Header)
 	if p.IsRemoteMagpie() {
+		req.Header.Set("User-Agent", "magpie/"+Version)
 		passOnCaller(ctx, req)
 	}
 	if err := p.Sign(ctx, req, provider.Chat, body); err != nil {

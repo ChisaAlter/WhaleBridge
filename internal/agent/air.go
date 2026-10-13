@@ -33,14 +33,13 @@ package agent
 import (
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
-	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
+	"github.com/ChisaAlter/WhaleBridge/internal/proc"
 )
 
 // airAgent is the name magpie's agent has in acp.json, and so in Air's
@@ -66,7 +65,7 @@ func airDir(home, cfg string) string {
 // one OpenCode's installer puts in ~/.opencode/bin, as a full path, since
 // Air, an app, may not have the shell's PATH; "" when there is none.
 var airOpenCode = func(home string) string {
-	if p, err := exec.LookPath("opencode"); err == nil {
+	if p, err := proc.LookPath("opencode"); err == nil {
 		if abs, err := filepath.Abs(p); err == nil {
 			return abs
 		}
@@ -88,7 +87,7 @@ func air(home, cfg string) *Agent {
 	// the OpenCode config magpie's agent runs on, magpie's own file
 	ocPath := filepath.Join(dir, "magpie-opencode.json")
 	entry := "agent_servers." + airAgent
-	provider := func() any { return magpieProviderJSONFor("opencode", "air") }
+	provider := theirsKept(ocPath, "provider."+magpieID, func() any { return magpieProviderJSONFor("opencode", "air") }, "models")
 	// ours: acp.json's Magpie is the agent magpie added, on its file
 	ours := func() bool {
 		v, _ := edit.GetJSON(path, entry+".env.OPENCODE_CONFIG")
@@ -108,9 +107,9 @@ func air(home, cfg string) *Agent {
 				return ""
 			}
 			if airOpenCode(home) == "" {
-				return "Air runs magpie's models through OpenCode's ACP server, and OpenCode isn't installed here: install OpenCode (npm i -g opencode-ai), then pick Magpie in a new Air task."
+				return noticeAir1.String()
 			}
-			return "In Air, start a new task and pick Magpie in its agent menu: magpie's models and routing groups are in its model menu."
+			return noticeAir2.String()
 		},
 		Check: func() string {
 			if !usesMagpie(model()) {
@@ -120,7 +119,7 @@ func air(home, cfg string) *Agent {
 				return "Air's Magpie agent (" + filepath.Base(path) + ") is gone, so Air no longer reaches magpie"
 			}
 			return wiringOff("Air", ocPath, func(k string) (string, bool) { return edit.GetJSON(ocPath, "provider."+magpieID+".options."+k) },
-				"baseURL", gatewayV1(), "apiKey", gateway.Token)
+				"baseURL", gatewayV1(), "apiKey", hereKey())
 		},
 		Sync: func() error {
 			return syncJSONInOrder(ocPath, "provider."+magpieID, provider)
@@ -167,3 +166,9 @@ func air(home, cfg string) *Agent {
 		}},
 	}, path, ocPath)
 }
+
+// what air says after a change (notice.go)
+var (
+	noticeAir1 = newNotice("Air runs magpie's models through OpenCode's ACP server, and OpenCode isn't installed here: install OpenCode (npm i -g opencode-ai), then pick Magpie in a new Air task.")
+	noticeAir2 = newNotice("In Air, start a new task and pick Magpie in its agent menu: magpie's models and routing groups are in its model menu.")
+)

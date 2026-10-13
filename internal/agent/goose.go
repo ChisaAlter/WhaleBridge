@@ -132,7 +132,7 @@ func gooseProviderJSON(at place) map[string]any {
 		"description":              "Every model magpie has, through its local gateway",
 		"api_key_env":              "",
 		"base_url":                 at.v1(),
-		"headers":                  map[string]any{"Authorization": "Bearer " + at.gwKey()},
+		"headers":                  map[string]any{"Authorization": "Bearer " + gooseKey(at)},
 		"requires_auth":            false,
 		"skip_canonical_filtering": true,
 		"models":                   models,
@@ -143,6 +143,13 @@ func gooseProviderJSON(at place) map[string]any {
 	}
 	return p
 }
+
+// gooseKey is the key magpie's custom provider hands the Goose at a place:
+// one that names Goose (agentKeyAt), since goose's HTTP client sends no
+// User-Agent (reqwest's default, crates/goose-providers/src/api_client.rs),
+// so the plain key left its requests to "your agent" on Routing and "other"
+// in Usage (#1083).
+func gooseKey(at place) string { return agentKeyAt("goose", at.gw()) }
 
 // writeGooseProvider writes magpie's custom provider file for Goose.
 func writeGooseProvider(path string, at place) error {

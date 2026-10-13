@@ -5,7 +5,8 @@ import (
 	"strings"
 )
 
-// parseScutil reads `scutil --proxy`. HTTPS wins over HTTP over SOCKS.
+// parseScutil reads `scutil --proxy`. HTTPS wins over HTTP over SOCKS for
+// URL; HTTP and SOCKS are each entry alone.
 func parseScutil(out string) Proxy {
 	kv := map[string]string{}
 	var bypass []string
@@ -30,13 +31,21 @@ func parseScutil(out string) Proxy {
 		}
 		kv[k] = v
 	}
-	for _, p := range []struct{ key, scheme string }{{"HTTPS", "http"}, {"HTTP", "http"}, {"SOCKS", "socks5"}} {
-		if kv[p.key+"Enable"] == "1" && kv[p.key+"Proxy"] != "" {
-			host := kv[p.key+"Proxy"]
-			if port := kv[p.key+"Port"]; port != "" {
-				host = net.JoinHostPort(host, port)
-			}
-			return Proxy{URL: p.scheme + "://" + host, Bypass: bypass}
+	entry := func(key, scheme string) string {
+		if kv[key+"Enable"] != "1" || kv[key+"Proxy"] == "" {
+			return ""
+		}
+		host := kv[key+"Proxy"]
+		if port := kv[key+"Port"]; port != "" {
+			host = net.JoinHostPort(host, port)
+		}
+		return scheme + "://" + host
+	}
+	p := Proxy{HTTP: entry("HTTP", "http"), SOCKS: entry("SOCKS", "socks5")}
+	for _, u := range []string{entry("HTTPS", "http"), p.HTTP, p.SOCKS} {
+		if u != "" {
+			p.URL, p.Bypass = u, bypass
+			return p
 		}
 	}
 	return Proxy{}

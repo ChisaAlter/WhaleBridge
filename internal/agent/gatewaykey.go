@@ -20,6 +20,10 @@ func keyAt(gw string) string {
 	return gateway.Token
 }
 
+// KeyAt is keyAt, for what else magpie gives an agent that reaches the
+// gateway at gw (the library's MCP servers relayed through it).
+func KeyAt(gw string) string { return keyAt(gw) }
+
 // gwKey is keyAt for the agent at p.
 func (p place) gwKey() string { return keyAt(p.gw()) }
 
@@ -32,6 +36,15 @@ func agentKeyAt(agent, gw string) string {
 	return gateway.TokenFor(agent)
 }
 
+// hereKey is keyAt for the gateway's own address, gateway.URL(): an agent
+// on this machine given that address sends the gateway's own token, unless
+// MAGPIE_ADDR pins it to an address beyond loopback, which the gateway
+// takes only a named key from (#1647, ggbdpq).
+func hereKey() string { return keyAt(gateway.URL()) }
+
+// agentKey is agentKeyAt for the gateway's own address, as hereKey.
+func agentKey(agent string) string { return agentKeyAt(agent, gateway.URL()) }
+
 // ourKey says k is a key magpie gives an agent: gateway.Token, or the LAN
 // sharing key one that reaches the gateway from elsewhere is given.
 func ourKey(k string) bool {
@@ -39,4 +52,14 @@ func ourKey(k string) bool {
 		return true
 	}
 	return k != "" && k == access.LANSecret()
+}
+
+// gatewayTakes says the gateway would authenticate a request carrying k: a
+// caller key of this magpie's own (one issued, or a value the user brought),
+// so an agent holding it in its store of its own still goes through magpie
+// (#1332). A key of another magpie's, which this gateway would refuse, is
+// not.
+func gatewayTakes(k string) bool {
+	_, ok := access.Authenticate(k)
+	return ok
 }

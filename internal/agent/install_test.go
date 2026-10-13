@@ -35,6 +35,9 @@ func TestInstallCommands(t *testing.T) {
 		{"gemini", "windows", []string{"npm: npm install -g @google/gemini-cli"}},
 		{"opencode", "darwin", []string{"script: curl -fsSL https://opencode.ai/install | bash", "npm: npm install -g opencode-ai"}},
 		{"opencode", "windows", []string{"npm: npm install -g opencode-ai"}},
+		{"deveco", "darwin", []string{"npm: npm install -g @deveco/deveco-code"}},
+		{"deveco", "windows", []string{"npm: npm install -g @deveco/deveco-code"}},
+		{"deveco", "linux", nil}, // no Linux build in its package
 		{"pi", "linux", []string{"npm: npm install -g @earendil-works/pi-coding-agent"}},
 		{"cursor", "darwin", nil}, // no command magpie knows
 	} {
@@ -101,8 +104,11 @@ func TestInstallCommandsWithoutNode(t *testing.T) {
 // npm is found in a folder of a user's tools (nvm's, Homebrew's), as
 // npm.cmd on Windows; a folder without it, or a folder named npm, isn't it.
 func TestNpmIn(t *testing.T) {
-	empty, nvm, win, odd := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
+	empty, nvm, win, odd, miseExe := t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir(), t.TempDir()
 	testenv.Program(t, filepath.Join(nvm, "npm"), "#!/bin/sh\n")
+	if err := os.WriteFile(filepath.Join(miseExe, "npm.exe"), []byte("MZ"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := os.WriteFile(filepath.Join(win, "npm.cmd"), nil, 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -120,6 +126,8 @@ func TestNpmIn(t *testing.T) {
 		{[]string{nvm}, "windows", false},
 		{[]string{empty, win}, "windows", true},
 		{[]string{win}, "linux", false},
+		// mise's shims folder in its default (exe) mode
+		{[]string{empty, miseExe}, "windows", true},
 	} {
 		if got := npmIn(c.dirs, c.goos); got != c.want {
 			t.Errorf("npmIn(%q, %s) = %v, want %v", c.dirs, c.goos, got, c.want)

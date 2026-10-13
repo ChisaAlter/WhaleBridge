@@ -172,6 +172,9 @@ func ocRoots(out []file, parent map[string]string) []file {
 // they are done (closeDBs).
 var dbs = map[string]*sql.DB{}
 
+// Snapshot readers also remove their temporary database when a scan ends.
+var dbCleanup = map[string]func(){}
+
 func openDB(path string) *sql.DB {
 	if db := dbs[path]; db != nil {
 		return db
@@ -187,7 +190,12 @@ func openDB(path string) *sql.DB {
 
 func closeDBs() {
 	for p, db := range dbs {
-		db.Close()
+		if done := dbCleanup[p]; done != nil {
+			done()
+			delete(dbCleanup, p)
+		} else {
+			db.Close()
+		}
 		delete(dbs, p)
 	}
 }

@@ -2,9 +2,11 @@ package agent
 
 import (
 	"reflect"
+	"slices"
 	"testing"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/usage"
 )
 
 // Every one of Pi's levels is in the map, the model's own mapped and the
@@ -103,5 +105,26 @@ func TestPiCostAndPromptCache(t *testing.T) {
 		if !reflect.DeepEqual(e["promptCache"], c.cache) {
 			t.Errorf("%s: promptCache %v, want %v", c.m.ID, e["promptCache"], c.cache)
 		}
+	}
+}
+
+// dgmico's report (#1966): PI-Desktop's requests, sent with a User-Agent
+// of pi-desktop/<version>, were counted as Pi's, since Pi's requests are
+// known by "pi-". Pi's own and other pi- names stay Pi's.
+func TestPIDesktopIsNotPi(t *testing.T) {
+	for ua, want := range map[string]string{
+		"pi-desktop/0.1.0":          "pi-desktop",
+		"PI-Desktop/0.1.0":          "pi-desktop",
+		"pi-desktop":                "pi-desktop",
+		"pi (darwin 25.6.0; arm64)": "pi",
+		"pi-bridge/1.0":             "pi",
+		"pidesktop/1.0":             "pidesktop",
+	} {
+		if got := usage.AgentOf(ua); got != want {
+			t.Errorf("%q: %q, want %q", ua, got, want)
+		}
+	}
+	if !slices.ContainsFunc(Clients(), func(a *Agent) bool { return a.ID == "pi-desktop" && a.Name == "PI-Desktop" && a.Icon == "pi" }) {
+		t.Error("PI-Desktop isn't a client the Usage and Routing views draw")
 	}
 }

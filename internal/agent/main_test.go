@@ -6,6 +6,7 @@ import (
 	"os"
 	"testing"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/netproxy"
 	"github.com/ChisaAlter/WhaleBridge/internal/testenv"
 )
 
@@ -31,15 +32,27 @@ func TestMain(m *testing.M) {
 	// Pi's and omp's model registries are read from their installs; never
 	// this machine's
 	nodeModulesOf = func(string, []string) []string { return nil }
+	// Microsoft Store apps are read from the current user's AppX registry;
+	// never this machine's (a Windows box with the Codex app installed)
+	windowsStorePackages = func() []string { return nil }
 	// Aside's default is changed through the aside binary, which answers for
 	// the account the developer is actually running: a test that picks a
 	// model would change the real Aside's default, and the running one would
 	// keep the old one, so the test would read back a file nothing had
 	// applied. The Aside tests stand in for it themselves.
 	asideSet = func(string, string) error { return errors.New("aside: no Aside in a test") }
-	asideRead = func() (map[string]json.RawMessage, error) { return nil, errors.New("aside: no Aside in a test") }
+	asideRead = func(string) (map[string]json.RawMessage, error) { return nil, errors.New("aside: no Aside in a test") }
 	// an address an agent is pointed at is tried over the network (Drift,
 	// #1013); never from a test, whose reach tests stand in for it
 	reachProbe = func(string) bool { return true }
+	// nor is the way Codex goes there read from this machine's proxy
+	// settings, or a proxy tried; the proxy tests say both
+	codexProxyEnv = func(string) string { return "" }
+	codexSystemProxy = func() netproxy.Proxy { return netproxy.Proxy{} }
+	proxyProbe = func(string, string) bool { return true }
+	// nor an address of the agent's own asked whether magpie answers
+	// there (a reverse proxy, #1985): known, and not magpie, as for a
+	// relay; the proxy-kept tests answer it
+	magpieAt = func(string) (bool, bool) { return false, true }
 	os.Exit(testenv.Run(m))
 }

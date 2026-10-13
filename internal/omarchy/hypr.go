@@ -29,6 +29,7 @@ func Hyprland() bool {
 const PanelGap = 6
 
 type hyprMonitor struct {
+	Name          string
 	X, Y          int
 	Width, Height int
 	Scale         float64
@@ -52,40 +53,57 @@ func (m hyprMonitor) size() (w, h int) {
 
 // PanelAt is where a drop-down panel width wide goes: under the bar, its
 // middle at the cursor (which has just clicked the icon it drops from),
-// kept PanelGap inside the monitor the cursor is on. maxH is the room it has
-// down to the bottom of that monitor's work area.
-func PanelAt(width int) (x, y, maxH int, ok bool) {
+// kept PanelGap inside the monitor the cursor is on. mon is that monitor's
+// name, and x, y are from its top left corner, as Hyprland's move rule
+// takes them: it adds the monitor's own place to them, so a monitor not at
+// 0,0 was counted twice and the panel opened off the screen (#1785). maxH
+// is the room it has down to the bottom of that monitor's work area.
+func PanelAt(width int) (mon string, x, y, maxH int, ok bool) {
 	var cur struct{ X, Y int }
 	var mons []hyprMonitor
 	if hyprJSON("cursorpos", &cur) != nil || hyprJSON("monitors", &mons) != nil {
-		return 0, 0, 0, false
+		return "", 0, 0, 0, false
 	}
 	return panelAt(width, cur.X, cur.Y, mons)
 }
 
-func panelAt(width, cx, cy int, mons []hyprMonitor) (x, y, maxH int, ok bool) {
+// panelAt takes the cursor in layout coordinates, across every monitor (as
+// hyprctl cursorpos gives it), and answers from the corner of the one it is
+// on.
+func panelAt(width, cx, cy int, mons []hyprMonitor) (mon string, x, y, maxH int, ok bool) {
 	for _, m := range mons {
 		w, h := m.size()
 		if cx < m.X || cx >= m.X+w || cy < m.Y || cy >= m.Y+h {
 			continue
 		}
-		left, right := m.X+m.Reserved[0]+PanelGap, m.X+w-m.Reserved[2]-PanelGap
-		x = max(left, min(right-width, cx-width/2))
-		y = m.Y + m.Reserved[1] + PanelGap
-		return x, y, m.Y + h - m.Reserved[3] - PanelGap - y, true
+		left, right := m.Reserved[0]+PanelGap, w-m.Reserved[2]-PanelGap
+		x = max(left, min(right-width, cx-m.X-width/2))
+		y = m.Reserved[1] + PanelGap
+		return m.Name, x, y, h - m.Reserved[3] - PanelGap - y, true
 	}
-	return 0, 0, 0, false
+	return "", 0, 0, 0, false
 }
 
 // PlacePanel gives the window titled title a rule of its own (replacing
-// the last one, by name): floating, pinned to every workspace, at x, y, with
-// no border and fully opaque — the page draws its own frame, in the border's
-// colour. It is asked each time the panel opens, as where it goes follows
-// the click, and a config reload drops rules made this way.
-func PlacePanel(title string, x, y int) error {
-	lua := fmt.Sprintf(`hl.window_rule({ name = "magpie-panel", match = { title = %s }, tag = "-default-opacity", float = true, pin = true, border_size = 0, no_shadow = true, opacity = "1 1", no_anim = true, move = { %d, %d } })`,
-		strconv.Quote("^"+regexpQuote(title)+"$"), x, y)
-	return hyprctl("eval", lua)
+// the last one, by name): floating, pinned to every workspace, on monitor
+// mon at x, y from its corner, with no border and fully opaque — the page
+// draws its own frame, in the border's colour. It is asked each time the
+// panel opens, as where it goes follows the click, and a config reload
+// drops rules made this way.
+func PlacePanel(title, mon string, x, y int) error {
+	return hyprctl("eval", panelRule(title, mon, x, y))
+}
+
+// panelRule is PlacePanel's rule. The monitor is named so that the move
+// counts from the corner of the one clicked, not from whichever Hyprland
+// would have opened the panel on.
+func panelRule(title, mon string, x, y int) string {
+	on := ""
+	if mon != "" {
+		on = "monitor = " + strconv.Quote(mon) + ", "
+	}
+	return fmt.Sprintf(`hl.window_rule({ name = "magpie-panel", match = { title = %s }, tag = "-default-opacity", float = true, pin = true, border_size = 0, no_shadow = true, opacity = "1 1", no_anim = true, %smove = { %d, %d } })`,
+		strconv.Quote("^"+regexpQuote(title)+"$"), on, x, y)
 }
 
 // Clicks are how the panel closes on a click outside it, as Omarchy's own

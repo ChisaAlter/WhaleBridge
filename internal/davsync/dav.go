@@ -13,6 +13,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/backup"
 )
 
 // folder and file are where the backup lives under the address given.
@@ -36,6 +38,11 @@ var errNotModified = errors.New("the file on the server is unchanged")
 type version struct {
 	ETag     string `json:"etag,omitempty"`
 	Modified string `json:"modified,omitempty"`
+	// Blind: a put told it wrote without the server checking the version
+	// it went over (s3.go's HEAD then PUT, where conditional writes are
+	// refused): another computer's write in the moment between may have
+	// gone over it (#1776)
+	Blind bool `json:"-"`
 }
 
 // conditions are the headers that ask for the file only when it isn't v.
@@ -105,7 +112,7 @@ func retryAfter(v string) time.Duration {
 	return 0
 }
 
-// remote is where the backup is kept: a WebDAV folder, or an S3 bucket.
+// remote is where the backup is kept.
 type remote interface {
 	// get reads the backup and its version; nil data and no error when
 	// there is none yet. With have, the version last read, it is asked
@@ -117,8 +124,11 @@ type remote interface {
 	put(ctx context.Context, data []byte, etag string) (version, error)
 }
 
-// newRemote is c's: an S3 bucket for an s3:// address, WebDAV for the rest.
+// newRemote selects the backend from c's address.
 func newRemote(c Config) (remote, error) {
+	if c.GitHub() {
+		return newGitHub(c)
+	}
 	if c.S3() {
 		return newS3(c)
 	}
@@ -240,9 +250,21 @@ func (d *dav) there(ctx context.Context, u string) bool {
 // get reads the backup; nil data and no error when there is none yet, and
 // errNotModified when it is still have. A server that doesn't do
 // conditional reads sends the file, as it always did.
+//
+// The read asks for the file as it is, not compressed: the ETag it gives
+// back is what the write after it matches with If-Match, and a server that
+// compresses changes that ETag for the compressed copy. Apache's
+// mod_deflate — InfiniCLOUD's (TeraCloud's) WebDAV is Apache — adds
+// "-gzip" inside the quotes, and nginx and other proxies weaken it to
+// W/"…"; either never matches the file in an If-Match, so every write after
+// such a read was refused as changed meanwhile (#1362).
 func (d *dav) get(ctx context.Context, have version) (data []byte, v version, err error) {
 	cond := have.conditions()
-	res, err := d.send(ctx, http.MethodGet, d.url(folder, file), nil, cond)
+	h := map[string]string{"Accept-Encoding": "identity"}
+	for k, v := range cond {
+		h[k] = v
+	}
+	res, err := d.send(ctx, http.MethodGet, d.url(folder, file), nil, h)
 	if err != nil {
 		return nil, version{}, err
 	}
@@ -269,6 +291,22 @@ func (d *dav) get(ctx context.Context, have version) (data []byte, v version, er
 	data, err = io.ReadAll(io.LimitReader(res.Body, 64<<20))
 	if err != nil {
 		return nil, version{}, err
+	}
+	// asked for as it is, the file still came compressed: Go unpacks it
+	// only when it asked for gzip itself
+	if data, err = unpacked("WebDAV", data, res.Header.Get("Content-Encoding")); err != nil {
+		return nil, version{}, fmt.Errorf("reading %s from the WebDAV server: %w", file, err)
+	}
+	// a redirect that ended at something other than the file — a web
+	// app's sign-in or files page — is said with where it went: the
+	// address is the thing to fix
+	if res.Request != nil && res.Request.Response != nil && !backupHead(bytes.TrimSpace(data)) {
+		if f := whatIs(data); !f.Replace {
+			to := *res.Request.URL
+			to.RawQuery, to.Fragment, to.User = "", "", nil
+			f.Moved = to.Host + to.Path
+			return nil, version{}, &notBackup{f: f, where: "the file " + folder + "/" + file + " on the WebDAV server", cmd: "webdav", err: backup.ErrNotBackup}
+		}
 	}
 	return data, versionOf(res.Header), nil
 }
@@ -336,7 +374,8 @@ func (d *dav) put(ctx context.Context, data []byte, etag string) (version, error
 // file is the whole failure — so no download rides on a write. It gives
 // back the ETag it saw, for a retry to match the file as the short write
 // left it. A HEAD that can't be done — an error, or not a 200 — leaves the
-// write unchecked: it landed either way.
+// write unchecked: it landed either way. A HEAD that says short is asked
+// again of PROPFIND, which costs a request only then.
 func (d *dav) check(ctx context.Context, u, name string, want int) (etag string, err error) {
 	res, err := d.send(ctx, http.MethodHead, u, nil, nil)
 	if err != nil {
@@ -349,10 +388,49 @@ func (d *dav) check(ctx context.Context, u, name string, want int) (etag string,
 		return "", nil
 	}
 	etag = res.Header.Get("ETag")
-	if n := res.ContentLength; n >= 0 && int(n) < want {
-		return etag, fmt.Errorf("the WebDAV server kept %d of %d bytes of %s: the write was cut short — sync again, and if it keeps happening the network to the server is dropping long uploads", n, want, name)
+	n := res.ContentLength
+	if n < 0 || int(n) >= want {
+		return etag, nil
 	}
-	return etag, nil
+	// a HEAD's Content-Length isn't always the file's: 坚果云 (Nutstore)
+	// answered a 6869-byte usage file's with 0 on every try (#1259). The
+	// length WebDAV keeps for a file is PROPFIND's getcontentlength, which
+	// every client of it reads, so a short HEAD is asked of that before it
+	// is believed; with no length there, the HEAD's stands
+	if m, ok := d.length(ctx, u); ok {
+		if m >= int64(want) {
+			return etag, nil
+		}
+		n = m
+	}
+	return etag, fmt.Errorf("the WebDAV server kept %d of %d bytes of %s: the write was cut short — sync again, and if it keeps happening the network to the server is dropping long uploads", n, want, name)
+}
+
+// length is the file at u's size as PROPFIND (Depth 0) says it; false when
+// it says none.
+func (d *dav) length(ctx context.Context, u string) (int64, bool) {
+	res, err := d.send(ctx, "PROPFIND", u, nil, map[string]string{"Depth": "0"})
+	if err != nil {
+		return 0, false
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusMultiStatus {
+		return 0, false
+	}
+	var ms struct {
+		Responses []struct {
+			Length string `xml:"propstat>prop>getcontentlength"`
+		} `xml:"response"`
+	}
+	if xml.NewDecoder(io.LimitReader(res.Body, 1<<20)).Decode(&ms) != nil {
+		return 0, false
+	}
+	for _, r := range ms.Responses {
+		if n, err := strconv.ParseInt(strings.TrimSpace(r.Length), 10, 64); err == nil && n >= 0 {
+			return n, true
+		}
+	}
+	return 0, false
 }
 
 func (d *dav) mkcol(ctx context.Context) error {

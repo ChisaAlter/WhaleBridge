@@ -170,7 +170,7 @@ func (rw *Writer) event(ev []byte) error {
 		rw.pending = nil
 	}
 	typ := ""
-	tailPath, tail := "", ""
+	tailPath, tail, cut := "", "", ""
 	restored, _ := walk(data, func(path, key, s string) string {
 		if path == "type" {
 			typ = s
@@ -181,11 +181,14 @@ func (rw *Writer) event(ev []byte) error {
 		if keep(key, s) {
 			return s
 		}
-		s = Restore(s, asJSON(key, typ))
+		// the tail is looked for before anything is put back, so a
+		// placeholder whose last brace is still to come isn't put back
+		// without it and the brace left behind
 		if n := partialTail(s); n > 0 {
 			tailPath, tail = path, s[len(s)-n:]
+			cut = Restore(s[:len(s)-n], asJSON(key, typ))
 		}
-		return s
+		return Restore(s, asJSON(key, typ))
 	})
 	full := rebuild(pre, restored, post)
 	if tail == "" {
@@ -194,7 +197,7 @@ func (rw *Writer) event(ev []byte) error {
 	}
 	cutData, _ := walk(restored, func(path, _, s string) string {
 		if path == tailPath {
-			return strings.TrimSuffix(s, tail)
+			return cut
 		}
 		return s
 	})

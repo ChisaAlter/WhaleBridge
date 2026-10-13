@@ -13,9 +13,11 @@ package gateway
 // went wrong, so there the reply ends with the error, as it used to.
 // Only a reply no tool call of has begun goes on: a call's arguments
 // can't be prefilled, so one begun ends the reply as it used to. A
-// refusal isn't asked again.
+// refusal isn't asked again, and a model that turned the prefill away
+// isn't asked to go on (prefill.go).
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -46,21 +48,68 @@ func emptyRetries(w http.ResponseWriter, ctx context.Context) int {
 	return streamRetries
 }
 
+// loopReasks is how many times a reply whose reasoning was stuck in a
+// loop (loopGuard) before it said anything is asked again in place, rather
+// than ended with the loop's error.
+const loopReasks = 1
+
 // errStreamCut ends a reply's read once its error event is in hand,
 // without waiting on a vendor that keeps the connection open after it.
 var errStreamCut = errors.New("stream cut mid-reply")
 
-// errEndedShort is an Anthropic stream that ended, its connection closed
-// cleanly, before it said its reply had: the passthrough's word for it.
+// errEndedShort is a stream that ended, its connection closed cleanly,
+// before it said its reply had — an Anthropic one with no stop_reason and
+// no message_stop, a Responses one with no response.completed: the same
+// two the passthrough tells apart. A Chat stream may end without [DONE]
+// and be whole, so Chat is not one.
 var errEndedShort = errors.New("the reply ended before it was complete")
 
-// anthropicEnds says whether an Anthropic stream's event ends the reply:
-// its message_stop (a stop_reason is upstreamStop's), or an error.
-func anthropicEnds(data string) bool {
-	var v struct {
-		Type string `json:"type"`
+// geminiEnds says whether a Gemini chunk ends the reply, as replyEnds
+// does for events that name their type. Gemini's and Code Assist's chunks
+// name none and there is no [DONE]: the last one is the one whose
+// candidate carries a finishReason (Code Assist's wrap theirs in a
+// response). usageMetadata is no end: Vertex AI sends it on every chunk
+// ({"trafficType":"ON_DEMAND"} until the last, vertexThought), so a
+// stream cut after any of them would read as whole. A chunk with no
+// candidate at all — usage alone, or a prompt blocked — ends it too: such
+// a reply said nothing, and is the empty reply's to answer (#667), not a
+// cut one's.
+func geminiEnds(data []byte) bool {
+	if !bytes.Contains(data, []byte(`"finishReason"`)) && bytes.Contains(data, []byte(`"candidates"`)) {
+		return false
 	}
-	return json.Unmarshal([]byte(data), &v) == nil && lastEvent(v.Type)
+	type chunk struct {
+		Candidates []struct {
+			FinishReason string `json:"finishReason"`
+		} `json:"candidates"`
+	}
+	var ch struct {
+		chunk
+		Response *chunk `json:"response"`
+	}
+	if json.Unmarshal(data, &ch) != nil {
+		return false
+	}
+	c := ch.chunk
+	if ch.Response != nil {
+		c = *ch.Response
+	}
+	if len(c.Candidates) == 0 {
+		return true
+	}
+	for _, cand := range c.Candidates {
+		if cand.FinishReason != "" {
+			return true
+		}
+	}
+	return false
+}
+
+// geminiKin is an upstream whose chunks the Gemini decoder reads: Gemini
+// (a custom provider's Gemini URL, Vertex AI, Factory's generate route)
+// and Code Assist.
+func geminiKin(actual provider.Protocol) bool {
+	return actual == provider.Gemini || actual == provider.CodeAssist
 }
 
 // groupTryKey marks a try of a routing group's member. A member whose
@@ -194,7 +243,7 @@ func (c *continuation) request(orig *Request) *Request {
 func (c *continuation) emit(enc streamEncoder, ev Event) {
 	if c.resume {
 		switch ev.Kind {
-		case KThink, KSig:
+		case KThink, KSig, KThinkStart, KSealed:
 			return
 		case KText:
 			if ev.Text = c.unecho(ev.Text); ev.Text == "" {
@@ -247,6 +296,10 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 	sw := newSSEWriter(w)
 	enc := encoder(from, sw, request, u)
 	cont := &continuation{mode: prefillHow(p, to, model)}
+	if !s.fits(p.ID, prefillRefused(model), to) {
+		// the model turned a prefill away before (prefill.go, #1447)
+		cont.mode = ""
+	}
 	var failed, failedCode string
 	var failedStatus int
 	var cut, errSent bool
@@ -255,8 +308,41 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 	said, stop := false, ""
 	var kept []Event       // the reply's end, while nothing is said in it
 	var before, this Usage // what the tries before this one billed, and this try
+	// spoke: the reply has said something, a text or a call; relooped: this
+	// try's reasoning was found stuck in a loop before it had, and it is
+	// let go to ask again (loopReasks)
+	var spoke, relooped bool
+	var summaryUpstream bool
+	reasks := 0
+	if h, ok := w.(*holdWriter); ok {
+		h.onLoop(func(t loopTrip) bool {
+			// only reasoning nobody acts on: a text or a call the agent
+			// has would be said twice, and a continuation's prefill would
+			// be asked to go on with the loop
+			if !t.reasoning || spoke || cont.resume || reasks >= loopReasks || r.Context().Err() != nil {
+				return false
+			}
+			reasks++
+			relooped = true
+			return true
+		})
+		defer h.onLoop(nil)
+	}
 	emit := func(ev Event) {
+		if relooped {
+			return // the rest of a try let go for its loop
+		}
+		spoke = spoke || saysSomething(ev)
 		switch ev.Kind {
+		case KThink, KSealed:
+			if ev.Kind == KThink && !summaryUpstream {
+				break
+			}
+			if h, ok := w.(*holdWriter); ok {
+				h.mu.Lock()
+				h.first.hidden = true
+				h.mu.Unlock()
+			}
 		case KError:
 			if ev.Code == "" && cont.possible() && !inGroupTry(r.Context()) {
 				// held while the reply may yet go on; sent when it can't
@@ -301,6 +387,9 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 	}
 	var serr error
 	for again := 0; ; again++ {
+		// what cut the reply, which it ends with if the model turns the
+		// continuation's prefill away
+		cutBy, cutCode, cutErr := failed, failedCode, serr
 		failed, failedCode, failedStatus, cut, serr = "", "", 0, false, nil
 		var held func() // what a textCallSee of this try holds back
 		req := request
@@ -316,17 +405,29 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 		}
 		if err == nil {
 			u.RequestID = requestID(res.Header)
+			summaryUpstream = actual == provider.Responses || actual == provider.Gemini || actual == provider.CodeAssist
 			empty = emptyFails(actual)
 		}
 		if err == nil && res.StatusCode >= 400 {
 			b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 			res.Body.Close()
 			failed, failedStatus = p.Explain(p.Name+": "+provider.APIError(b, res.Status), res.StatusCode, b), res.StatusCode
-			if res.StatusCode == http.StatusTooManyRequests && accountAgent(p) == "antigravity" && antigravityTurnsAway(request.System) {
+			if cont.resume && refusesPrefill(res.StatusCode, b) {
+				// a model that takes no prefill (forwardTranslated
+				// remembers it): the reply ends with what cut it, as a
+				// reply that can't go on does, not with the refusal of
+				// an ask the client never made (#1447)
+				failed, failedCode, serr = cutBy, cutCode, cutErr
+			}
+			if wrongEndpoint(res.StatusCode, b) {
+				failed += wrongAPINote(p, model, res, b)
+			}
+			turnedAway := res.StatusCode == http.StatusTooManyRequests && antigravityTurnedAway(p, request.System, string(b))
+			if turnedAway {
 				failed += " — " + antigravityTurnedAwayHint
 			}
 			if !cont.resume {
-				if res.StatusCode == http.StatusTooManyRequests && accountAgent(p) == "antigravity" && antigravityTurnsAway(request.System) {
+				if turnedAway {
 					markAntigravityTurnsAway(w)
 				}
 				if p.Preset == "openrouter" && openRouterSharedPool(b) {
@@ -334,6 +435,9 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 				}
 				keepRetry(w.Header(), res.Header, b)
 				u.ErrType = provider.ErrorType(b)
+				if turnedAway {
+					u.ErrType = turnedAwayErrType
+				}
 				return writeError(w, from, res.StatusCode, failed), failed
 			}
 		}
@@ -358,12 +462,12 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 				ended := false // the upstream said its reply ended
 				serr = readSSEAlive(rd, func(_, data string) error {
 					st := upstreamStop([]byte(data))
-					u.add(Usage{Upstream: upstreamOf([]byte(data)), Stop: st})
-					ended = ended || st != "" || actual == provider.Anthropic && anthropicEnds(data)
+					u.add(Usage{Upstream: upstreamOf([]byte(data)), Stop: st, Tier: upstreamTier([]byte(data))})
+					ended = ended || replyEnds(actual, data, st)
 					if err := dec(data, attemptSee); err != nil {
 						return err
 					}
-					if cut {
+					if cut || relooped {
 						return errStreamCut
 					}
 					return nil
@@ -372,15 +476,36 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 				if errors.Is(serr, errStreamCut) {
 					serr = nil
 				}
-				if serr == nil && failed == "" && !ended && actual == provider.Anthropic && r.Context().Err() == nil {
+				if serr == nil && failed == "" && !ended && !relooped &&
+					(actual == provider.Anthropic || actual == provider.Responses || geminiKin(actual)) && r.Context().Err() == nil {
 					// an Anthropic stream that just stopped — no
-					// stop_reason, no message_stop — is a reply cut
-					// short, not a finished one: a relay's (蓝猫 on
-					// Discord) read as whole ended the agent's turn a
-					// few words in, with nothing to say why
+					// stop_reason, no message_stop — or a Responses one
+					// with no response.completed is a reply cut short,
+					// not a finished one: a relay's (蓝猫 on Discord)
+					// read as whole ended the agent's turn a few words
+					// in, with nothing to say why, and a Responses reply
+					// whole would say completed it never said. A Gemini
+					// one is told by its finishReason (geminiEnds, #1643)
 					serr = errEndedShort
 				}
 			}
+		}
+		if relooped {
+			// the model's reasoning ran into a loop before it said a word
+			// (#1359), which DeepSeek v4 flash on WorkBuddy did now and
+			// then in a long turn; asked again, it mostly doesn't. The
+			// agent keeps the reasoning it has and the next try's follows
+			// it, as an empty reply's does (#667); a loop on that try too
+			// ends the reply with the loop's error.
+			relooped = false
+			before, this = before.plus(this, false), Usage{}
+			kept, stop = nil, ""
+			enc.keepalive()
+			select {
+			case <-time.After(retryPause):
+			case <-r.Context().Done():
+			}
+			continue
 		}
 		if serr == nil && failed == "" {
 			if held != nil {
@@ -446,9 +571,12 @@ func (s *Server) streamTranslated(w http.ResponseWriter, r *http.Request, p prov
 			failed = p.Name + ": " + errEndedShort.Error()
 		}
 	}
-	if failed != "" {
+	if failed != "" && markAntigravityRefused(w, p, request.System, failed) {
 		// the same refusal as the 429's, said inside the reply
-		markAntigravityRefused(w, p, request.System, failed)
+		if !strings.HasSuffix(failed, antigravityTurnedAwayHint) {
+			failed += " — " + antigravityTurnedAwayHint
+		}
+		u.ErrType = turnedAwayErrType
 	}
 	if !errSent {
 		enc.event(Event{Kind: KError, Text: failed, Code: failedCode})

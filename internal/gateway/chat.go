@@ -8,6 +8,7 @@ import (
 	"mime"
 	"net"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -35,7 +36,9 @@ type cRequest struct {
 	Messages []struct {
 		Role             string          `json:"role"`
 		Content          json.RawMessage `json:"content"`
-		ReasoningContent string          `json:"reasoning_content,omitempty"`
+		ReasoningContent json.RawMessage `json:"reasoning_content,omitempty"`
+		Reasoning        json.RawMessage `json:"reasoning,omitempty"`
+		ReasoningDetails json.RawMessage `json:"reasoning_details,omitempty"`
 		ToolCalls        []cToolCall     `json:"tool_calls,omitempty"`
 		ToolCallID       string          `json:"tool_call_id,omitempty"`
 	} `json:"messages"`
@@ -60,16 +63,17 @@ type cRequest struct {
 	ParallelToolCalls   *bool           `json:"parallel_tool_calls,omitempty"`
 	ServiceTier         string          `json:"service_tier,omitempty"`
 	PromptCacheKey      string          `json:"prompt_cache_key,omitempty"`
+	ResponseFormat      json.RawMessage `json:"response_format,omitempty"`
 }
 
 func parseChat(body []byte) (*Request, error) {
 	var c cRequest
-	if err := json.Unmarshal(body, &c); err != nil {
+	if err := decodeJSON(body, &c); err != nil {
 		return nil, fmt.Errorf("invalid request: %v", err)
 	}
 	r := &Request{Model: c.Model, MaxTokens: c.MaxCompletionTokens, Temp: c.Temperature, TopP: c.TopP,
-		Stream: c.Stream, Effort: effortOf(c.ReasoningEffort), Parallel: c.ParallelToolCalls, Fast: c.ServiceTier == "priority",
-		CacheKey: c.PromptCacheKey}
+		Stream: c.Stream, Effort: effortOf(c.ReasoningEffort), Parallel: c.ParallelToolCalls, Fast: c.ServiceTier == "priority", Tier: c.ServiceTier,
+		CacheKey: c.PromptCacheKey, Format: openAIFormat(c.ResponseFormat)}
 	if r.MaxTokens == 0 {
 		r.MaxTokens = c.MaxTokens
 	}
@@ -78,10 +82,10 @@ func parseChat(body []byte) (*Request, error) {
 	}
 	r.ThinkOff = strings.EqualFold(strings.TrimSpace(c.ReasoningEffort), "none")
 	var stop string
-	if json.Unmarshal(c.Stop, &stop) == nil && stop != "" {
+	if decodeJSON(c.Stop, &stop) == nil && stop != "" {
 		r.Stop = []string{stop}
 	} else {
-		json.Unmarshal(c.Stop, &r.Stop)
+		decodeJSON(c.Stop, &r.Stop)
 	}
 	var sys []string
 	for _, m := range c.Messages {
@@ -92,8 +96,15 @@ func parseChat(body []byte) (*Request, error) {
 			r.Messages = append(r.Messages, Message{Role: "user", Parts: chatParts(m.Content)})
 		case "assistant":
 			msg := Message{Role: "assistant"}
-			if m.ReasoningContent != "" {
-				msg.Parts = append(msg.Parts, Part{Kind: Thinking, Text: m.ReasoningContent})
+			// an earlier turn's thinking comes back in any of
+			// messageReasoning's spellings, and every upstream that
+			// thinks wants it as the thinking part
+			if think := reasoningText(map[string]json.RawMessage{
+				"reasoning_content": m.ReasoningContent,
+				"reasoning":         m.Reasoning,
+				"reasoning_details": m.ReasoningDetails,
+			}); think != "" {
+				msg.Parts = append(msg.Parts, Part{Kind: Thinking, Text: think})
 			}
 			msg.Parts = append(msg.Parts, chatParts(m.Content)...)
 			for _, tc := range m.ToolCalls {
@@ -118,7 +129,7 @@ func parseChat(body []byte) (*Request, error) {
 		r.Tools = append(r.Tools, Tool{Name: t.Function.Name, Description: t.Function.Description, Schema: t.Function.Parameters, Strict: t.Function.Strict != nil && *t.Function.Strict})
 	}
 	var tc string
-	if json.Unmarshal(c.ToolChoice, &tc) == nil {
+	if decodeJSON(c.ToolChoice, &tc) == nil {
 		r.ToolChoice = tc
 	} else {
 		var o struct {
@@ -127,7 +138,7 @@ func parseChat(body []byte) (*Request, error) {
 				Name string `json:"name"`
 			} `json:"function"`
 		}
-		if json.Unmarshal(c.ToolChoice, &o) == nil && o.Function.Name != "" {
+		if decodeJSON(c.ToolChoice, &o) == nil && o.Function.Name != "" {
 			r.ToolChoice = "name:" + o.Function.Name
 		}
 	}
@@ -137,7 +148,7 @@ func parseChat(body []byte) (*Request, error) {
 // chatParts reads a message's content: a string, or an array of parts.
 func chatParts(raw json.RawMessage) []Part {
 	var s string
-	if json.Unmarshal(raw, &s) == nil {
+	if decodeJSON(raw, &s) == nil {
 		if s == "" {
 			return nil
 		}
@@ -155,7 +166,7 @@ func chatParts(raw json.RawMessage) []Part {
 			Filename string `json:"filename"`
 		} `json:"file"`
 	}
-	json.Unmarshal(raw, &items)
+	decodeJSON(raw, &items)
 	var out []Part
 	for _, it := range items {
 		switch it.Type {
@@ -213,15 +224,39 @@ func dataURL(p Part) string {
 }
 
 // buildChat renders a request for a Chat Completions upstream.
+// buildHost is the host a request for p is built for. Cursor's plugin is
+// "cursor" (plugin://cursor) moved or not: a moved one's Host is the
+// built-in's, for show, which Cursor's is none, and its fast mode was lost
+// on every request magpie translated (#1360).
+func buildHost(p provider.Provider) string {
+	if p.IsPlugin() && p.PluginProvider() == "cursor" {
+		return "cursor"
+	}
+	return p.Host()
+}
+
+// chatReplaysReasoning is whether a Chat upstream wants a turn's reasoning
+// back in reasoning_content: DeepSeek's models wherever they are served
+// (#388), the model named as the provider names it (OpenCode Go's
+// deepseek-v4.1-flash, whose host doesn't say so), and Command Code's
+// plugin, which replays it for a Go key as the built-in did to
+// /alpha/generate.
+func chatReplaysReasoning(host, model string) bool {
+	return strings.Contains(host, "deepseek") || strings.Contains(strings.ToLower(model), "deepseek") || host == provider.CommandCodePlanID
+}
+
 func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 	var msgs []map[string]any
 	if r.System != "" {
 		msgs = append(msgs, map[string]any{"role": "system", "content": r.System})
 	}
-	// DeepSeek takes a turn's reasoning back, wherever its models are
-	// served (#388), as Command Code's plugin does for a Go key, as the
-	// built-in replayed it to /alpha/generate
-	replay := strings.Contains(host, "deepseek") || strings.Contains(strings.ToLower(model), "deepseek") || host == provider.CommandCodePlanID
+	replay := chatReplaysReasoning(host, model)
+	// MiniMax's own Chat API gives a model's thinking in the text, between
+	// <think> tags, and wants it back there on the turns after (its
+	// interleaved thinking): the decoder takes it out as thinking (#1267),
+	// so it goes back in where it came from. A relay serving MiniMax's
+	// models may give the thinking apart and take it back otherwise.
+	inlineThink := strings.HasSuffix(host, "minimax.io") || strings.HasSuffix(host, "minimaxi.com")
 	// Gemini wants each step's thought signature back on its first call
 	// (#687), and one it can't check for a step it didn't sign
 	gemini := geminiCompat(host, model)
@@ -252,7 +287,11 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 			seen = nil
 		}
 	}
-	for i, m := range r.Messages {
+	turns := joinSplitCalls(r.Messages)
+	// afterTool: the last message sent is a tool result, with no message
+	// of the user's after it
+	afterTool := false
+	for i, m := range turns {
 		if m.Role == "assistant" {
 			showSeen()
 			am := map[string]any{"role": "assistant"}
@@ -289,6 +328,9 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 				}
 			}
 			t := text(m.Parts)
+			if think != "" && inlineThink && !(r.Resume && i == len(r.Messages)-1) {
+				t = "<think>" + think + "</think>\n\n" + t
+			}
 			if t != "" || len(calls) == 0 {
 				am["content"] = t
 			}
@@ -301,7 +343,7 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 			// to go on) — and its reasoning goes with it where the upstream
 			// reads reasoning_content back, so the going on picks the thought
 			// up where it was cut
-			if r.Resume && i == len(r.Messages)-1 {
+			if r.Resume && i == len(turns)-1 {
 				mode := chatPrefill(host, model)
 				switch mode {
 				case "prefix":
@@ -314,7 +356,13 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 				}
 			} else if think != "" && replay {
 				am["reasoning_content"] = think
+			} else if replay && (len(calls) > 0 || afterTool) {
+				// a tool call with no thinking (another model's turn), or a
+				// reply to a tool result with none, which DeepSeek turns the
+				// whole request away for (#1462, #1822)
+				am["reasoning_content"] = noReasoning
 			}
+			afterTool = false
 			msgs = append(msgs, am)
 			continue
 		}
@@ -370,6 +418,7 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 			}
 		}
 		msgs = append(msgs, tools...)
+		afterTool = len(tools) > 0 && len(content) == 0 && len(seen) == 0
 		flush()
 	}
 	showSeen()
@@ -385,6 +434,9 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 	// another's chat upstream may not know the tier
 	if r.Fast && host == "cursor" {
 		out["service_tier"] = "priority"
+	}
+	if r.OwnTier && r.Tier != "" {
+		out["service_tier"] = r.Tier
 	}
 	if r.MaxTokens > 0 {
 		if strings.HasSuffix(host, "openai.com") {
@@ -411,8 +463,9 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 		if tc := aiStudioThinking(r, model); tc != nil {
 			out["extra_body"] = map[string]any{"google": map[string]any{"thinking_config": tc}}
 		} else if r.ThinkOff {
-			// Gemini 3 can't stop thinking; it thinks least at minimal
-			out["reasoning_effort"] = "minimal"
+			// Gemini 3 can't stop thinking; it thinks least at minimal,
+			// or at its lowest level where it has no minimal
+			out["reasoning_effort"] = cmp.Or(r.OffLevel, "minimal")
 		} else if r.Effort != "" {
 			out["reasoning_effort"] = r.Effort
 		}
@@ -438,6 +491,9 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 		if r.Parallel != nil {
 			out["parallel_tool_calls"] = *r.Parallel
 		}
+	}
+	if r.Format != nil {
+		out["response_format"] = r.Format.chat()
 	}
 	if r.WebSearch && host == "openrouter.ai" {
 		// OpenRouter's own search, for any of its models
@@ -465,7 +521,9 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 //     id used twice, the way the Responses path's orphanedToolOutputs
 //     turns an output without a call into a user message;
 //   - a call left unanswered gets a synthetic error result, so the turn
-//     can go on (an interrupted turn leaves its call pending);
+//     can go on (an interrupted turn leaves its call pending); a turn's
+//     calls split over consecutive assistant messages were joined into
+//     one by joinSplitCalls before, so they are pending together (#1275);
 //   - an assistant message with nothing in it — no text, no calls, no
 //     reasoning, what a thinking-only turn becomes — is dropped inside a
 //     pending exchange, where it would sit between calls and their
@@ -619,7 +677,7 @@ func thinkingEffort(body []byte) []byte {
 		ReasoningEffort *string        `json:"reasoning_effort"`
 		Thinking        map[string]any `json:"thinking"`
 	}
-	if json.Unmarshal(body, &v) != nil || v.ReasoningEffort != nil {
+	if decodeJSON(body, &v) != nil || v.ReasoningEffort != nil {
 		return body
 	}
 	effort, _ := v.Thinking["effort"].(string)
@@ -633,6 +691,32 @@ func thinkingEffort(body []byte) []byte {
 // thinkingConfigField is Gemini's thinking_config as unfit remembers a
 // provider that refused it.
 const thinkingConfigField = "thinking_config"
+
+// gemini3Levels are the levels Gemini 3 thinks at, of which a model may
+// take only some (gemini-3.8-flash has no minimal): those it is asked at
+// where its own aren't known.
+var gemini3Levels = []string{"minimal", "low", "medium", "high"}
+
+// geminiLevelRefused is Gemini turning away a thinking level the model
+// hasn't, which names thinking but isn't thinking_config turned away
+// (refusesThinkingConfig): gemini-3.8-flash's 400 "Thinking level MINIMAL
+// is not supported for this model. Please retry with other thinking level."
+// at AI Studio's OpenAI-compatible API, and "Thinking level is unsupported:
+// THINKING_LEVEL_MINIMAL" at Vertex AI's, for reasoning_effort minimal and
+// thinking_level minimal alike; and gemini-3.1-pro-preview's
+// "thinking_level MINIMAL is not supported by this model" at its
+// generateContent.
+var geminiLevelRefused = regexp.MustCompile(`(?i)thinking[ _]level\W+(?:(minimal|low|medium|high)\W+is not supported|is unsupported\W+thinking_level_(minimal|low|medium|high))`)
+
+// geminiRefusedLevel is the thinking level Gemini turned away in body
+// (geminiLevelRefused), or "".
+func geminiRefusedLevel(body []byte) string {
+	m := geminiLevelRefused.FindSubmatch(body)
+	if m == nil {
+		return ""
+	}
+	return strings.ToLower(string(m[1]) + string(m[2]))
+}
 
 // refusesThinkingConfig recognizes an upstream turning a request away for
 // the thinking_config it was sent, by its error naming it.
@@ -687,6 +771,16 @@ type cUsage struct {
 	CachedTokens             int `json:"cached_tokens"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	// what a plugin's step collected of its conversation's earlier steps,
+	// which their own replies couldn't count (the Cursor plugin's usage
+	// events that showed late, yetone/magpie#1053): billed with the step,
+	// never its prompt, which a client reads as how full its context is
+	MagpieDeferred *struct {
+		PromptTokens     int `json:"prompt_tokens"`
+		CompletionTokens int `json:"completion_tokens"`
+		CachedTokens     int `json:"cached_tokens"`
+		CacheWriteTokens int `json:"cache_write_tokens"`
+	} `json:"magpie_deferred,omitempty"`
 }
 
 func (u cUsage) usage() Usage {
@@ -713,6 +807,10 @@ func (u cUsage) usage() Usage {
 	if u.CompletionTokensDetails != nil {
 		out.Reasoning = u.CompletionTokensDetails.ReasoningTokens
 	}
+	if d := u.MagpieDeferred; d != nil && d.PromptTokens+d.CompletionTokens > 0 {
+		out.Deferred = &Usage{Input: max(d.PromptTokens-d.CachedTokens-d.CacheWriteTokens, 0), Output: d.CompletionTokens,
+			CacheRead: d.CachedTokens, CacheWrite: d.CacheWriteTokens}
+	}
 	return out
 }
 
@@ -731,32 +829,47 @@ type chatDecoder struct {
 	toolID  string // id of the open tool call, as some relays repeat it on every fragment
 	choice  string // index of the first choice seen; an empty string means none yet
 	// Gemini's OpenAI-compatible API, asked for thoughts, may give them
-	// in the text as a leading <thought>…</thought>: lead holds the text
-	// while it could still be that tag's start, thought is being inside it
-	lead    string
-	thought bool
-	past    bool // the reply's text has begun; no tag is looked for now
+	// in the text as a leading <thought>…</thought>, and MiniMax's Chat
+	// API (#1267), like the open models served without a reasoning
+	// parser, as a leading <think>…</think>: lead holds the text while it
+	// could still be such a tag's start, thought is being inside one, and
+	// thoughtClose is the tag that ends it
+	lead         string
+	thought      bool
+	thoughtClose string
+	past         bool // the reply's text has begun; no tag is looked for now
 }
 
-const thoughtOpen, thoughtClose = "<thought>", "</thought>"
+// thoughtTags are the tags a leading block of thinking comes between in a
+// Chat reply's text, by its opening tag.
+var thoughtTags = map[string]string{"<thought>": "</thought>", "<think>": "</think>"}
 
-// text sends a piece of the reply's text, a leading <thought> block of it
-// as thinking.
+// text sends a piece of the reply's text, a leading <thought> or <think>
+// block of it as thinking.
 func (d *chatDecoder) text(s string, emit func(Event)) {
 	if !d.past && !d.thought {
 		d.lead += s
 		lead := strings.TrimLeft(d.lead, " \n")
-		if len(lead) < len(thoughtOpen) && strings.HasPrefix(thoughtOpen, lead) {
-			return
+		for open := range thoughtTags {
+			if len(lead) < len(open) && strings.HasPrefix(open, lead) {
+				return
+			}
 		}
-		if !strings.HasPrefix(lead, thoughtOpen) {
+		open := ""
+		for o := range thoughtTags {
+			if strings.HasPrefix(lead, o) {
+				open = o
+			}
+		}
+		if open == "" {
 			d.past = true
 			s, d.lead = d.lead, ""
 			emit(Event{Kind: KText, Text: s})
 			return
 		}
-		s, d.lead, d.thought = strings.TrimPrefix(lead, thoughtOpen), "", true
+		s, d.lead, d.thought, d.thoughtClose = strings.TrimPrefix(lead, open), "", true, thoughtTags[open]
 	}
+	thoughtClose := d.thoughtClose
 	if d.thought {
 		s = d.lead + s
 		d.lead = ""
@@ -814,6 +927,13 @@ func (d *chatDecoder) decode(data string, emit func(Event)) error {
 				ReasoningContent string          `json:"reasoning_content"`
 				Reasoning        string          `json:"reasoning"`
 				ToolCalls        []cToolCall     `json:"tool_calls"`
+				// Vertex AI's OpenAI-compatible API marks a chunk of
+				// Gemini's thoughts here, the thought its content
+				ExtraContent struct {
+					Google struct {
+						Thought bool `json:"thought"`
+					} `json:"google"`
+				} `json:"extra_content"`
 			} `json:"delta"`
 			FinishReason string `json:"finish_reason"`
 		} `json:"choices"`
@@ -822,16 +942,29 @@ func (d *chatDecoder) decode(data string, emit func(Event)) error {
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	if err := json.Unmarshal([]byte(data), &ch); err != nil {
+	if err := decodeJSON([]byte(data), &ch); err != nil {
+		// an error in a shape of its own, {"error":"…"}, is still the
+		// reply's end, not a chunk to pass over (#1933)
+		if e, ok := carriedError(data); ok {
+			emit(e)
+		}
 		return nil
 	}
 	if ch.Error != nil {
-		emit(Event{Kind: KError, Text: ch.Error.Message, Code: refusedCode(data)})
+		emit(Event{Kind: KError, Text: cmp.Or(ch.Error.Message, streamErrorText(data)), Code: refusedCode(data)})
 		return nil
 	}
 	if !d.started {
 		d.started, d.tool = true, -1
-		emit(Event{Kind: KStart, MsgID: ch.ID, Model: ch.Model})
+		// most streams count the prompt only at their end, but one that
+		// counts it on its first chunk tells it at the start, as
+		// Anthropic's message_start does (#1887)
+		var prompt Usage
+		if ch.Usage != nil && ch.Usage.PromptTokens > 0 {
+			u := ch.Usage.usage()
+			prompt = Usage{Input: u.Input, CacheRead: u.CacheRead, CacheWrite: u.CacheWrite}
+		}
+		emit(Event{Kind: KStart, MsgID: ch.ID, Model: ch.Model, Usage: prompt})
 	}
 	for _, c := range ch.Choices {
 		// Translation has one reply: lock onto the first readable choice
@@ -857,7 +990,10 @@ func (d *chatDecoder) decode(data string, emit func(Event)) error {
 			t += think
 			content = text
 		} else {
-			json.Unmarshal(c.Delta.Content, &content)
+			decodeJSON(c.Delta.Content, &content)
+		}
+		if c.Delta.ExtraContent.Google.Thought {
+			t, content = t+content, ""
 		}
 		if t != "" {
 			emit(Event{Kind: KThink, Text: t})
@@ -893,7 +1029,7 @@ func (d *chatDecoder) decode(data string, emit func(Event)) error {
 			emit(Event{Kind: KStop, Stop: stopFromChat(c.FinishReason)})
 		}
 	}
-	if ch.Usage != nil && (ch.Usage.PromptTokens > 0 || ch.Usage.CompletionTokens > 0) {
+	if ch.Usage != nil && (ch.Usage.PromptTokens > 0 || ch.Usage.CompletionTokens > 0 || ch.Usage.MagpieDeferred != nil) {
 		emit(Event{Kind: KUsage, Usage: ch.Usage.usage()})
 	}
 	return nil
@@ -907,17 +1043,17 @@ func chatChoiceIndex(raw json.RawMessage) (string, bool) {
 		return "", false
 	}
 	var text string
-	if json.Unmarshal(raw, &text) == nil {
+	if decodeJSON(raw, &text) == nil {
 		raw = json.RawMessage(text)
 	}
 	var n json.Number
-	if json.Unmarshal(raw, &n) != nil {
+	if decodeJSON(raw, &n) != nil {
 		return "", false
 	}
 	index, err := n.Int64()
 	if err != nil {
 		var f float64
-		if json.Unmarshal(raw, &f) != nil || f < 0 || f != float64(int64(f)) {
+		if decodeJSON(raw, &f) != nil || f < 0 || f != float64(int64(f)) {
 			return "", false
 		}
 		index = int64(f)
@@ -1053,6 +1189,9 @@ func renderChat(res Result, model string) []byte {
 	for _, p := range res.Parts {
 		switch p.Kind {
 		case Text:
+			if p.Text == "" && p.Signature != "" {
+				continue // only Gemini's signature on its text, which is Gemini's
+			}
 			if msg["content"] == nil {
 				msg["content"] = p.Text
 			} else {

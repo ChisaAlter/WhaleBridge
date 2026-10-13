@@ -43,7 +43,7 @@ func TestAsideRuntimeWinsOverSavedModelAndPlanRefusesMismatch(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	asideRead = func() (map[string]json.RawMessage, error) {
+	asideRead = func(string) (map[string]json.RawMessage, error) {
 		var s map[string]json.RawMessage
 		_ = json.Unmarshal([]byte(readFile(settings)), &s)
 		s["defaultModel"] = json.RawMessage(`{"provider":"native","modelId":"new-choice","thinkingLevel":"high","fastMode":true}`)

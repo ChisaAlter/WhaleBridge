@@ -21,7 +21,7 @@ import (
 func init() {
 	movers["kiro"] = &mover{
 		pkg:    "@magpie-community/opencode-kiro-auth",
-		min:    "0.1.7", // a Builder ID sign-in asked with Builder ID's service profile, as the built-in (plugins#16)
+		min:    "0.1.9", // a tool's images reach the model, as the built-in sends them (#1861)
 		agents: []string{"kiro"},
 		out: func() ([]Moving, error) {
 			var out []Moving

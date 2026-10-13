@@ -2,13 +2,17 @@ package gateway
 
 import (
 	"bytes"
+	"cmp"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tidwall/gjson"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
@@ -40,6 +44,28 @@ type aBlock struct {
 	Signature string `json:"signature,omitempty"`
 	// a prompt-cache breakpoint: the prompt up to here is cached
 	CacheControl map[string]string `json:"cache_control,omitempty"`
+	// sealed: a redacted_thinking block as Anthropic wrote it, which goes
+	// back as it came (Part.Sealed, #1445)
+	sealed json.RawMessage
+}
+
+// MarshalJSON writes a thinking block's text even when it is empty.
+// Messages requires the field: a signed block with no text (Claude Code's
+// thinking when its display is omitted) sent without it is refused,
+// "messages.N.content.0.thinking.thinking: Field required" (#1447). Every
+// other block keeps its omitempty fields.
+func (b aBlock) MarshalJSON() ([]byte, error) {
+	type plain aBlock
+	if len(b.sealed) > 0 {
+		return b.sealed, nil
+	}
+	if b.Type != "thinking" {
+		return json.Marshal(plain(b))
+	}
+	return json.Marshal(struct {
+		plain
+		Thinking string `json:"thinking"`
+	}{plain(b), b.Thinking})
 }
 
 // ephemeral marks a prompt-cache breakpoint.
@@ -86,7 +112,7 @@ type aRequest struct {
 
 func parseAnthropic(body []byte) (*Request, error) {
 	var a aRequest
-	if err := json.Unmarshal(body, &a); err != nil {
+	if err := decodeJSON(body, &a); err != nil {
 		return nil, fmt.Errorf("invalid request: %v", err)
 	}
 	r := &Request{Model: a.Model, System: stringOrText(a.System), MaxTokens: a.MaxTokens,
@@ -99,21 +125,22 @@ func parseAnthropic(body []byte) (*Request, error) {
 		r.Metadata = a.Metadata
 	}
 	if oc := a.OutputConfig; oc != nil && oc.Format != nil && oc.Format.Type == "json_schema" && len(oc.Format.Schema) > 0 {
-		r.Schema = oc.Format.Schema
+		r.Format = &Format{Type: "json_schema", Name: formatName, Schema: oc.Format.Schema}
 	}
 	for _, m := range a.Messages {
 		msg := Message{Role: m.Role}
 		var s string
-		if json.Unmarshal(m.Content, &s) == nil {
+		if decodeJSON(m.Content, &s) == nil {
 			if s != "" {
 				msg.Parts = append(msg.Parts, Part{Kind: Text, Text: s})
 			}
 		} else {
 			var blocks []aBlock
-			if err := json.Unmarshal(m.Content, &blocks); err != nil {
+			if err := decodeJSON(m.Content, &blocks); err != nil {
 				return nil, fmt.Errorf("invalid message content: %v", err)
 			}
-			for _, b := range blocks {
+			var raws []json.RawMessage // each block as the client sent it
+			for i, b := range blocks {
 				switch b.Type {
 				case "text":
 					msg.Parts = append(msg.Parts, Part{Kind: Text, Text: b.Text})
@@ -122,12 +149,22 @@ func parseAnthropic(body []byte) (*Request, error) {
 						msg.Parts = append(msg.Parts, Part{Kind: Image, MediaType: b.Source.MediaType, Data: b.Source.Data, URL: b.Source.URL})
 					}
 				case "tool_use":
-					msg.Parts = append(msg.Parts, Part{Kind: ToolCall, ID: b.ID, Name: b.Name, Args: b.Input})
+					msg.Parts = append(msg.Parts, Part{Kind: ToolCall, ID: anthropicInID(b.ID), Name: b.Name, Args: b.Input})
 				case "tool_result":
 					out, images := toolOutput(b.Content)
-					msg.Parts = append(msg.Parts, Part{Kind: ToolResult, CallID: b.ToolUseID, Text: out, Images: images, IsError: b.IsError})
+					msg.Parts = append(msg.Parts, Part{Kind: ToolResult, CallID: anthropicInID(b.ToolUseID), Text: out, Images: images, IsError: b.IsError})
 				case "thinking":
 					msg.Parts = append(msg.Parts, Part{Kind: Thinking, Text: b.Thinking, Signature: b.Signature})
+				case "redacted_thinking":
+					// Claude's reasoning its safety systems sealed: it
+					// goes back to Messages whole, and is nothing to
+					// another API (#1445)
+					if raws == nil {
+						_ = decodeJSON(m.Content, &raws)
+					}
+					if i < len(raws) {
+						msg.Parts = append(msg.Parts, Part{Kind: Thinking, Sealed: raws[i], SealedBy: sealAnthropic})
+					}
 				}
 			}
 		}
@@ -165,7 +202,8 @@ func parseAnthropic(body []byte) (*Request, error) {
 	// output_config's effort sets how hard the model thinks only when it
 	// was asked to think: Claude Code's title requests carry effort but no
 	// thinking, and reasoning_effort would turn it on upstream
-	if th := a.Thinking; th != nil && th.Type == "disabled" {
+	// between_tools is Sonnet 5.5's thinking off (#1454)
+	if th := a.Thinking; th != nil && (th.Type == "disabled" || th.Type == "between_tools") {
 		r.ThinkOff = true
 	} else if th != nil && (th.Type == "enabled" || th.Type == "adaptive") {
 		r.Thinking = true
@@ -187,7 +225,7 @@ func thinkingOffUnlessAsked(body []byte) []byte {
 	var v struct {
 		Thinking json.RawMessage `json:"thinking"`
 	}
-	if json.Unmarshal(body, &v) != nil || v.Thinking != nil {
+	if decodeJSON(body, &v) != nil || v.Thinking != nil {
 		return body
 	}
 	// added at the end, the rest left byte for byte as the agent sent it
@@ -202,6 +240,109 @@ func thinkingOffUnlessAsked(body []byte) []byte {
 	return append(out, `"thinking":{"type":"disabled"}}`...)
 }
 
+// anthropicReplaysThinking is whether model, served by host's Messages
+// API, wants a thinking block on every assistant turn that calls a tool:
+// DeepSeek's Anthropic endpoint, thinking (its default, and when asked),
+// refuses a tool_use turn with none, "The `content[].thinking` in the
+// thinking mode must be passed back to the API", and turns
+// redacted_thinking away as a block it doesn't know (422), checked against
+// api.deepseek.com/anthropic on 2026-10-11 (#1611). It takes Claude's
+// signed thinking, its own, one with no signature and a space.
+func anthropicReplaysThinking(host, model string) bool {
+	if host == "api.anthropic.com" || anthropicModel.MatchString(model) {
+		return false
+	}
+	return strings.Contains(host, "deepseek") || strings.Contains(strings.ToLower(model), "deepseek")
+}
+
+// withThinkingOnToolTurns gives each assistant message of a Messages
+// request that has a tool_use, or that answers tool results alone (DeepSeek
+// refuses that one too, checked 2026-10-12, #1822), and no thinking block
+// one holding noReasoning, and turns a redacted_thinking block (Claude's, sealed, which
+// DeepSeek can't read) into that too, or leaves it out when the message
+// has thinking already, for anthropicReplaysThinking. A Claude Code routing
+// group that falls from Claude to DeepSeek sends both (#1611). Every other
+// message, and a body with nothing to change, goes byte for byte.
+func withThinkingOnToolTurns(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`"tool_use"`)) && !bytes.Contains(body, []byte(`"redacted_thinking"`)) {
+		return body
+	}
+	var q map[string]json.RawMessage
+	var msgs []json.RawMessage
+	if decodeJSON(body, &q) != nil || decodeJSON(q["messages"], &msgs) != nil {
+		return body
+	}
+	space, _ := json.Marshal(aBlock{Type: "thinking", Thinking: noReasoning})
+	changed := false
+	// afterTool: the message before is the user's tool results alone
+	afterTool := false
+	for i, raw := range msgs {
+		var m map[string]json.RawMessage
+		var role string
+		var blocks []json.RawMessage
+		if decodeJSON(raw, &m) != nil || decodeJSON(m["role"], &role) != nil {
+			afterTool = false
+			continue
+		}
+		if role != "assistant" {
+			afterTool = decodeJSON(m["content"], &blocks) == nil && len(blocks) > 0 &&
+				!slices.ContainsFunc(blocks, func(b json.RawMessage) bool {
+					var t struct {
+						Type string `json:"type"`
+					}
+					return decodeJSON(b, &t) != nil || t.Type != "tool_result"
+				})
+			continue
+		}
+		after := afterTool
+		afterTool = false
+		if decodeJSON(m["content"], &blocks) != nil {
+			continue
+		}
+		var out []json.RawMessage
+		thought, called, edited := false, false, false
+		for _, b := range blocks {
+			var t struct {
+				Type string `json:"type"`
+			}
+			decodeJSON(b, &t)
+			switch t.Type {
+			case "thinking":
+				thought = true
+			case "tool_use":
+				called = true
+			case "redacted_thinking":
+				edited = true
+				if thought {
+					continue
+				}
+				b, thought = space, true
+			}
+			out = append(out, b)
+		}
+		if (called || after) && !thought {
+			out = append([]json.RawMessage{space}, out...)
+			edited = true
+		}
+		if !edited {
+			continue
+		}
+		m["content"], _ = json.Marshal(out)
+		if nb, err := json.Marshal(m); err == nil {
+			msgs[i], changed = nb, true
+		}
+	}
+	if !changed {
+		return body
+	}
+	q["messages"], _ = json.Marshal(msgs)
+	nb, err := json.Marshal(q)
+	if err != nil {
+		return body
+	}
+	return nb
+}
+
 // anthropicModel is one of Anthropic's own models, which think only when asked,
 // so a request for one is left as the agent sent it.
 var anthropicModel = regexp.MustCompile(`(?i)(?:^|[/.:-])claude-`)
@@ -210,8 +351,25 @@ var anthropicModel = regexp.MustCompile(`(?i)(?:^|[/.:-])claude-`)
 // GLM-5.3 answers 1210, "…always engages in thinking…", or, in Chinese
 // (ZCode's GLM-5.3-Flash), "该模型始终支持思考，不可关闭" (#699); DashScope's
 // own glm-5.3 answers "The value of the enable_thinking parameter is
-// restricted to True."
-var alwaysThinks = regexp.MustCompile(`(?i)always engages in thinking|thinking (?:can ?not|can't) be (?:disabled|turned off)|enable_thinking[^"]{0,60}restricted to true|始终(?:支持|开启|启用)?思考|思考[^"]{0,20}(?:不可|无法|不能)关闭`)
+// restricted to True." MiniMax's MiniMax-M3.1-Flash-Preview answers
+// "…requires adaptive thinking; thinking.type="disabled" (including
+// reasoning.effort=none) is not allowed (2013)", and Volcengine Ark's
+// glm-5.3 "thinking.type `disabled` is not supported by this model"
+// (#1141).
+var alwaysThinks = regexp.MustCompile(`(?i)always engages in thinking|thinking (?:can ?not|can't) be (?:disabled|turned off)|enable_thinking[^"]{0,60}restricted to true|始终(?:支持|开启|启用)?思考|思考[^"]{0,20}(?:不可|无法|不能)关闭|requires adaptive thinking\W+thinking\.type\W+disabled\W+\(including reasoning\.effort=none\) is not allowed|thinking\.type \x60disabled\x60 is not supported by this model`)
+
+// refusesThinkingOff is an Anthropic endpoint turning away a request
+// with thinking turned off (thinking.type disabled): a model that always
+// thinks (alwaysThinks), OpenRouter's mandatory reasoning, a Claude that
+// takes no disabled (thinkingOffRefused), or a relay reading disabled as
+// reasoning effort none and turning that level away by naming the ones
+// it takes: Sub2API's gpt-6.1-sol, "gpt-6.1-sol does not support reasoning
+// effort \"none\"; use low, medium, high, xhigh or max" (#1465).
+func refusesThinkingOff(b []byte) bool {
+	// alwaysThinks' words are matched decoded, too (#1678): 思考 escaped as \uXXXX
+	return alwaysThinks.Match(wordsOf(b)) || mandatoryReasoning.Match(b) || thinkingOffRefused.Match(b) ||
+		effortLevelsNamed.Match(b) && noneQuoted.Match(b)
+}
 
 // ThinksOnlyWhenAsked is a model that takes thinking turned off on the
 // Messages API whatever its levels: one of Anthropic's own (anthropicModel,
@@ -229,7 +387,7 @@ func withoutThinkingOff(body []byte) ([]byte, bool) {
 	var th struct {
 		Type string `json:"type"`
 	}
-	if json.Unmarshal(body, &q) != nil || json.Unmarshal(q["thinking"], &th) != nil || th.Type != "disabled" {
+	if decodeJSON(body, &q) != nil || decodeJSON(q["thinking"], &th) != nil || th.Type != "disabled" {
 		return nil, false
 	}
 	delete(q, "thinking")
@@ -239,24 +397,41 @@ func withoutThinkingOff(body []byte) ([]byte, bool) {
 
 // claudeVersion finds the family's version in a Claude model id however a
 // relay spells it: claude-opus-4-6, claude-opus-5, anthropic.claude-sonnet-4.6-v1,
-// a relay's opus-5.5, or the old order, claude-3-7-sonnet.
-var claudeVersion = regexp.MustCompile(`(?:^|[^a-z0-9])(?:claude-)?(?:opus|sonnet|haiku)-(\d{1,2})(?:[-.](\d{1,2}))?(?:[^0-9]|$)|claude-(\d+)(?:[-.](\d))?-(?:opus|sonnet|haiku)`)
+// a relay's opus-5.5, claude-fable-5-1, or the old order, claude-3-7-sonnet.
+var claudeVersion = regexp.MustCompile(`(?:^|[^a-z0-9])(?:claude-)?(?:opus|sonnet|haiku|fable|mythos)-(\d{1,2})(?:[-.](\d{1,2}))?(?:[^0-9]|$)|claude-(\d+)(?:[-.](\d))?-(?:opus|sonnet|haiku)`)
 
 // adaptiveOnly is a Claude model from 4.6 on, which thinks adaptively:
 // claude-opus-5-5 refuses thinking.type=enabled with a budget ("requires
-// adaptive thinking"), so how hard it thinks goes in output_config.effort.
+// adaptive thinking"), as do Fable and Mythos 5 and 5.1, whose adaptive
+// thinking is always on, so how hard it thinks goes in output_config.effort.
 func adaptiveOnly(model string) bool {
+	major, minor, ok := claudeVersionOf(model)
+	return ok && (major > 4 || major == 4 && minor >= 6)
+}
+
+// noXhigh is a Claude that thinks only adaptively but has no xhigh effort,
+// Opus and Sonnet 4.6, so it is asked max in its place. Every later one
+// takes xhigh (platform.claude.com/docs/en/build-with-claude/effort), and
+// max there spends without limit.
+func noXhigh(model string) bool {
+	major, minor, ok := claudeVersionOf(model)
+	return ok && major == 4 && minor == 6
+}
+
+// claudeVersionOf is a Claude model's version as claudeVersion reads it;
+// ok is false for a model it doesn't read as a Claude.
+func claudeVersionOf(model string) (major, minor int, ok bool) {
 	m := claudeVersion.FindStringSubmatch(strings.ToLower(model))
 	if m == nil {
-		return false
+		return 0, 0, false
 	}
 	v := m[1:3]
 	if m[3] != "" {
 		v = m[3:5]
 	}
-	major, _ := strconv.Atoi(v[0])
-	minor, _ := strconv.Atoi(v[1])
-	return major > 4 || major == 4 && minor >= 6
+	major, _ = strconv.Atoi(v[0])
+	minor, _ = strconv.Atoi(v[1])
+	return major, minor, true
 }
 
 // adaptiveThinking is an Anthropic request as a model that thinks only
@@ -267,13 +442,17 @@ func adaptiveOnly(model string) bool {
 // effort it is nearest in output_config.effort unless one is there (Keenc
 // on Discord: claude-opus-5-5 answered 400). Read off the model the body
 // is sent with, the vendor's own name; any other request, older Claudes'
-// included, goes as it came, and "disabled" stays.
+// included, goes as it came, and "disabled" stays. The thinking enabled
+// shows (display "summarized" by default) is still shown: Opus 4.7 and
+// later leave it out of adaptive thinking unless asked (#1485), so it is
+// asked for unless the request names its own display. A provider that
+// refuses display has it taken out after (withoutRefusedShapes).
 func adaptiveThinking(body []byte) []byte {
 	th := gjson.GetBytes(body, "thinking")
 	if th.Get("type").String() != "enabled" || !adaptiveOnly(gjson.GetBytes(body, "model").String()) {
 		return body
 	}
-	thinking := map[string]any{"type": "adaptive"}
+	thinking := map[string]any{"type": "adaptive", "display": "summarized"}
 	if d := th.Get("display"); d.Exists() {
 		thinking["display"] = d.Value()
 	}
@@ -281,7 +460,7 @@ func adaptiveThinking(body []byte) []byte {
 	if gjson.GetBytes(body, "output_config.effort").String() == "" {
 		if e := effortOfBudget(int(th.Get("budget_tokens").Int())); e != "" {
 			if e == "xhigh" {
-				e = "max" // as buildAnthropic asks it: 4.6 has no xhigh
+				e = "max" // a budget can't tell xhigh from max (budgetOf), and 4.6 has no xhigh
 			}
 			oc, _ := gjson.GetBytes(body, "output_config").Value().(map[string]any)
 			if oc == nil {
@@ -292,6 +471,249 @@ func adaptiveThinking(body []byte) []byte {
 		}
 	}
 	return withFields(body, fields)
+}
+
+// claudeLine finds a Claude model's family and version however a relay
+// spells it: claude-sonnet-5-5, claude-sonnet-5.5, a relay's sonnet-5.5,
+// Bedrock's anthropic.claude-sonnet-5-5-v1:0, Vertex's
+// claude-sonnet-5-5@20261001, claude-fable-5-1.
+var claudeLine = regexp.MustCompile(`(?:^|[^a-z0-9])(?:claude-)?(opus|sonnet|haiku|fable|mythos)-(\d{1,2})(?:[-.](\d{1,2}))?(?:[^0-9]|$)`)
+
+// thinkingOff is how a Claude model takes thinking turned off.
+type thinkingOff int
+
+const (
+	offUnknown      thinkingOff = iota // not a model these rules know: as sent
+	offTaken                           // thinking.type=disabled at any effort
+	offUpToHigh                        // disabled at effort high or below: Opus 5, Haiku 5.5
+	offBetweenTools                    // disabled refused, between_tools asked for: Sonnet 5.5
+	offNever                           // thinking can't be turned off: Opus 5.5, Fable 5, Mythos 5
+)
+
+// thinkingOffOf is how model takes thinking turned off, from Anthropic's
+// own rules: Sonnet 5.5 answers disabled with 400 "To turn thinking off on
+// this model, send "thinking": {"type": "between_tools"}…" and takes
+// between_tools at effort high or below; Opus 5.5 and the Fable and
+// Mythos models refuse disabled at every effort, so thinking is left out
+// (they think adaptively); Opus 5 and Haiku 5.5 refuse it at xhigh and
+// max. Every other Claude takes it as sent, and between_tools on none of
+// them. A model of a later line than these is offUnknown, left as sent.
+func thinkingOffOf(model string) thinkingOff {
+	m := claudeLine.FindStringSubmatch(strings.ToLower(model))
+	if m == nil {
+		return offUnknown
+	}
+	major, _ := strconv.Atoi(m[2])
+	minor, _ := strconv.Atoi(m[3])
+	family := m[1]
+	switch {
+	case family == "fable" || family == "mythos":
+		if major == 5 {
+			return offNever
+		}
+	case major < 5:
+		return offTaken
+	case major == 5 && minor == 0:
+		if family == "opus" {
+			return offUpToHigh
+		}
+		return offTaken // Sonnet 5, Haiku 5
+	case major == 5 && minor == 5:
+		switch family {
+		case "sonnet":
+			return offBetweenTools
+		case "opus":
+			return offNever
+		case "haiku":
+			return offUpToHigh
+		}
+	}
+	return offUnknown
+}
+
+// thinkingOffAsTaken is an Anthropic request that turns thinking off, as
+// the model it is sent to takes that (thinkingOffOf). Claude Code turns
+// thinking off for auto mode's classifier and its side queries whenever
+// it can't tell the model refuses it — a model reached through a gateway
+// is one — and magpie turns it off itself when fitting an effort of none
+// or a budget that doesn't fit; claude-sonnet-5-5 answered every one of
+// them 400 (#1454). Sonnet 5.5 is sent between_tools, alone in thinking,
+// with an effort above high asked as high; Opus 5.5, Fable and Mythos are
+// sent no thinking, at effort low unless one is asked, with the room a
+// thinking model needs on top of a short reply, as Claude Code gives it
+// (classifierRoom); Opus 5 and Haiku 5.5 are asked effort high in place
+// of xhigh or max. between_tools sent to a model that doesn't take it goes
+// as disabled, or as no thinking where disabled is refused too. model is
+// the vendor's name of it: the body's, or, for Bedrock and Vertex, whose
+// body names none, the request path's. Any other request, other vendors'
+// models' and older Claudes' included, goes byte for byte as it came.
+func thinkingOffAsTaken(body []byte, path string) []byte {
+	t := gjson.GetBytes(body, "thinking.type").String()
+	if t != "disabled" && t != "between_tools" {
+		return body
+	}
+	model := gjson.GetBytes(body, "model").String()
+	if model == "" {
+		model = path
+	}
+	rule := thinkingOffOf(model)
+	effort := gjson.GetBytes(body, "output_config.effort").String()
+	aboveHigh := effort == "xhigh" || effort == "max"
+	var thinking map[string]any // nil: left out
+	effortTo := ""
+	switch rule {
+	case offTaken:
+		if t == "disabled" {
+			return body
+		}
+		thinking = map[string]any{"type": "disabled"}
+	case offUpToHigh:
+		if t == "disabled" && !aboveHigh {
+			return body
+		}
+		thinking = map[string]any{"type": "disabled"}
+		if aboveHigh {
+			effortTo = "high"
+		}
+	case offBetweenTools:
+		if th := gjson.GetBytes(body, "thinking"); t == "between_tools" && len(th.Map()) == 1 && !aboveHigh {
+			return body
+		}
+		// between_tools takes no other field (display, budget_tokens)
+		thinking = map[string]any{"type": "between_tools"}
+		if aboveHigh {
+			effortTo = "high"
+		}
+	case offNever:
+		if effort == "" {
+			effortTo = "low"
+		}
+	default:
+		return body
+	}
+	dec := json.NewDecoder(bytes.NewReader(body))
+	dec.UseNumber()
+	var q map[string]any
+	if dec.Decode(&q) != nil {
+		return body
+	}
+	if thinking != nil {
+		q["thinking"] = thinking
+	} else {
+		delete(q, "thinking")
+		if n := gjson.GetBytes(body, "max_tokens").Int(); n > 0 && n < classifierRoom {
+			q["max_tokens"] = n + classifierRoom
+		}
+	}
+	if effortTo != "" {
+		oc, _ := q["output_config"].(map[string]any)
+		if oc == nil {
+			oc = map[string]any{}
+		}
+		oc["effort"] = effortTo
+		q["output_config"] = oc
+	}
+	var out bytes.Buffer
+	enc := json.NewEncoder(&out)
+	enc.SetEscapeHTML(false) // <, > and & as the agent wrote them
+	if enc.Encode(q) != nil {
+		return body
+	}
+	return bytes.TrimSuffix(out.Bytes(), []byte("\n"))
+}
+
+// asksBetweenTools is Sonnet 5.5's answer to thinking turned off, asking
+// for between_tools: "To turn thinking off on this model, send "thinking":
+// {"type": "between_tools"} instead of {"type": "disabled"}" as relays
+// pass it on (#1454), or the API's "Use "thinking.type.between_tools" for
+// the lowest thinking setting".
+var asksBetweenTools = regexp.MustCompile(`(?i)between_tools\W+instead of|use\W+thinking\.type\.between_tools`)
+
+// thinkingOffRefused is a Claude refusing thinking turned off at any
+// effort, as Opus 5.5 does: ""thinking.type.disabled" is not supported for
+// this model. Use "thinking.type.adaptive"…".
+var thinkingOffRefused = regexp.MustCompile(`(?i)thinking\.type\.disabled\W+is not supported`)
+
+// withBetweenTools is body with its thinking turned off as Sonnet 5.5
+// asks it, at effort high at most; false when body doesn't turn it off.
+func withBetweenTools(body []byte) ([]byte, bool) {
+	if gjson.GetBytes(body, "thinking.type").String() != "disabled" {
+		return nil, false
+	}
+	fields := map[string]any{"thinking": map[string]any{"type": "between_tools"}}
+	if e := gjson.GetBytes(body, "output_config.effort").String(); e == "xhigh" || e == "max" {
+		oc, _ := gjson.GetBytes(body, "output_config").Value().(map[string]any)
+		oc["effort"] = "high"
+		fields["output_config"] = oc
+	}
+	return withFields(body, fields), true
+}
+
+// samplingRefused is a Claude that answers temperature, top_p or top_k
+// with a 400, by Anthropic's rules: Opus 4.7, 4.8, 5 and 5.5, Fable 5 and
+// Mythos 5 refuse them at any value; Sonnet 5 and 5.5 refuse a value but
+// their default; Haiku 5.5 takes only temperature 1 and top_p 0.99, never
+// both, and no top_k ("`temperature` is deprecated for this model", #1454).
+// Left out, each model samples at its default. Older Claudes, Haiku 4.5
+// and Opus 4.6 among them, take all three; a later line than these is
+// left as sent.
+func samplingRefused(model string) bool {
+	m := claudeLine.FindStringSubmatch(strings.ToLower(model))
+	if m == nil {
+		return false
+	}
+	major, _ := strconv.Atoi(m[2])
+	minor, _ := strconv.Atoi(m[3])
+	switch m[1] {
+	case "fable", "mythos":
+		return major == 5
+	case "opus":
+		return major == 4 && minor >= 7 || major == 5 && (minor == 0 || minor == 5)
+	case "sonnet":
+		return major == 5 && (minor == 0 || minor == 5)
+	case "haiku":
+		return major == 5 && minor == 5
+	}
+	return false
+}
+
+// samplingAsTaken is an Anthropic request without temperature, top_p and
+// top_k when the model it is sent to refuses them (samplingRefused):
+// Claude Code's auto mode classifier, and magpie's own classifiers, ask at
+// temperature 0. model is the vendor's name, from the body or, for
+// Bedrock and Vertex, the path. Any other request goes byte for byte as it
+// came.
+func samplingAsTaken(body []byte, path string) []byte {
+	if !hasSampling(body) {
+		return body
+	}
+	model := gjson.GetBytes(body, "model").String()
+	if model == "" {
+		model = path
+	}
+	if !samplingRefused(model) {
+		return body
+	}
+	return withoutFields(body, "temperature", "top_p", "top_k")
+}
+
+func hasSampling(body []byte) bool {
+	r := gjson.GetManyBytes(body, "temperature", "top_p", "top_k")
+	return r[0].Exists() || r[1].Exists() || r[2].Exists()
+}
+
+// samplingDeprecated is a Claude refusing a sampling parameter, as Haiku
+// 5.5 does: "`temperature` is deprecated for this model." (and `top_p`,
+// `top_k`).
+var samplingDeprecated = regexp.MustCompile("(?i)\\b(?:temperature|top_p|top_k)`?\\W+is (?:deprecated|not supported) for this model")
+
+// withoutSampling is body without temperature, top_p and top_k; false
+// when it has none of them.
+func withoutSampling(body []byte) ([]byte, bool) {
+	if !hasSampling(body) {
+		return nil, false
+	}
+	return withoutFields(body, "temperature", "top_p", "top_k"), true
 }
 
 // AdaptiveThinking is adaptiveOnly for agents told how to ask a model: a
@@ -311,7 +733,7 @@ func withOutputEffort(body []byte, levels []string) []byte {
 	var v struct {
 		OutputConfig map[string]any `json:"output_config"`
 	}
-	if e == "" || json.Unmarshal(body, &v) != nil {
+	if e == "" || decodeJSON(body, &v) != nil {
 		return body
 	}
 	oc := v.OutputConfig
@@ -339,13 +761,31 @@ func imageBlock(p Part) aBlock {
 	return b
 }
 
+// aMessage is one message of a request built for a Messages upstream.
+type aMessage struct {
+	Role    string   `json:"role"`
+	Content []aBlock `json:"content"`
+}
+
+// interruptedTool is what an unanswered call gets, as pairToolMessages and
+// pairToolItems make for the Chat and Responses paths.
+const interruptedTool = "[The result of this tool call is unavailable: the turn was interrupted.]"
+
 // buildAnthropic renders a request for an Anthropic-style upstream.
 func buildAnthropic(r *Request, model string) []byte {
-	type msg struct {
-		Role    string   `json:"role"`
-		Content []aBlock `json:"content"`
+	return anthropicBody(r, model, false)
+}
+
+// anthropicBody is buildAnthropic; with replay, for an upstream that wants
+// a turn's thinking back (anthropicReplaysThinking), thinking with no
+// signature goes as its text instead of being left out.
+func anthropicBody(r *Request, model string, replay bool) []byte {
+	if r.Format != nil && r.Format.schema() == nil {
+		// output_config.format takes a schema only: any JSON object is
+		// asked for in words
+		r = r.inSystem()
 	}
-	var msgs []msg
+	var msgs []aMessage
 	push := func(role string, blocks []aBlock) {
 		if len(blocks) == 0 {
 			return
@@ -354,7 +794,7 @@ func buildAnthropic(r *Request, model string) []byte {
 			msgs[n-1].Content = append(msgs[n-1].Content, blocks...)
 			return
 		}
-		msgs = append(msgs, msg{Role: role, Content: blocks})
+		msgs = append(msgs, aMessage{Role: role, Content: blocks})
 	}
 	for _, m := range r.Messages {
 		var results, rest []aBlock
@@ -369,7 +809,10 @@ func buildAnthropic(r *Request, model string) []byte {
 			case Image:
 				rest = append(rest, imageBlock(p))
 			case ToolCall:
-				rest = append(rest, aBlock{Type: "tool_use", ID: p.ID, Name: p.Name, Input: argsOf(p)})
+				// Anthropic takes a tool_use id only of [A-Za-z0-9_-]:
+				// another vendor's call (Devin's "Bash:0#…") goes as
+				// anthropicOutID makes it, its result named the same
+				rest = append(rest, aBlock{Type: "tool_use", ID: anthropicOutID(p.ID), Name: p.Name, Input: argsOf(p)})
 			case ToolResult:
 				c, _ := json.Marshal(p.Text)
 				if len(p.Images) > 0 {
@@ -383,10 +826,14 @@ func buildAnthropic(r *Request, model string) []byte {
 					}
 					c, _ = json.Marshal(blocks)
 				}
-				results = append(results, aBlock{Type: "tool_result", ToolUseID: p.CallID, Content: c, IsError: p.IsError})
+				results = append(results, aBlock{Type: "tool_result", ToolUseID: anthropicOutID(p.CallID), Content: c, IsError: p.IsError})
 			case Thinking:
-				if p.Signature != "" {
+				if p.sealedBy(sealAnthropic) {
+					rest = append(rest, aBlock{Type: "redacted_thinking", sealed: p.Sealed})
+				} else if p.Signature != "" {
 					rest = append(rest, aBlock{Type: "thinking", Thinking: p.Text, Signature: p.Signature})
+				} else if replay && p.Text != "" {
+					rest = append(rest, aBlock{Type: "thinking", Thinking: p.Text})
 				}
 			}
 		}
@@ -396,6 +843,10 @@ func buildAnthropic(r *Request, model string) []byte {
 		}
 		push(role, append(results, rest...))
 	}
+	// a conversation a client left with its exchange broken — a call whose
+	// turn was interrupted, a result whose call it dropped — is mended, as
+	// the Chat and Responses paths mend theirs, where Anthropic refuses it
+	msgs = pairToolBlocks(msgs)
 	// Anthropic caches a prompt only up to a block marked for it, which a
 	// request from another API (Codex's, a Chat client's) never has: the
 	// conversation so far is marked at its last block, so the next turn,
@@ -405,7 +856,7 @@ func buildAnthropic(r *Request, model string) []byte {
 	if n := len(msgs); n > 0 {
 		c := msgs[n-1].Content
 		for i := len(c) - 1; i >= 0; i-- {
-			if c[i].Type != "thinking" {
+			if c[i].Type != "thinking" && c[i].Type != "redacted_thinking" {
 				c[i].CacheControl = ephemeral
 				break
 			}
@@ -420,17 +871,30 @@ func buildAnthropic(r *Request, model string) []byte {
 	}
 	maxTokens := r.MaxTokens
 	if maxTokens <= 0 {
-		maxTokens = 16384
+		maxTokens = defaultMaxTokens // the model's own is filled in before (askedOutput)
 	}
-	if (r.Thinking || r.Effort != "") && adaptiveOnly(model) {
-		out["thinking"] = map[string]any{"type": "adaptive"}
+	// a client that turned reasoning off — Codex's or a Chat client's
+	// effort none, which Effort reads as low — is sent thinking off, not a
+	// low budget: it was thinking at 4096 tokens while the log said none
+	// (#1636). A model that won't stop thinking is asked again as before
+	// (forwardTranslated); thinkingOffAsTaken fits off to each Claude
+	think := (r.Thinking || r.Effort != "") && !r.ThinkOff
+	if r.ThinkOff {
+		out["thinking"] = map[string]any{"type": "disabled"}
+	}
+	if think && adaptiveOnly(model) {
+		// Opus 4.7 and later leave the thinking text out unless asked
+		// (display "omitted" by default), and a Chat or Responses client
+		// that asked to reason would see none of it; OpenAI is asked for
+		// its summary and the Claude subscription for summarized alike
+		out["thinking"] = map[string]any{"type": "adaptive", "display": "summarized"}
 		if e := r.Effort; e != "" {
-			if e == "xhigh" {
+			if e == "xhigh" && noXhigh(model) {
 				e = "max"
 			}
 			out["output_config"] = map[string]any{"effort": e}
 		}
-	} else if think, budget := r.Thinking || r.Effort != "", budgetOf(r.Effort); think && (r.MaxTokens <= 0 || r.MaxTokens > 2048) {
+	} else if budget := budgetOf(r.Effort); think && (r.MaxTokens <= 0 || r.MaxTokens > 2048) {
 		if r.MaxTokens > 0 {
 			// the client's cap is what the model can write (Pi sends the
 			// model's own output limit): the budget fits under it, leaving
@@ -449,12 +913,12 @@ func buildAnthropic(r *Request, model string) []byte {
 	} else if r.TopP != nil {
 		out["top_p"] = *r.TopP
 	}
-	if len(r.Schema) > 0 {
+	if s := r.Format.schema(); len(s) > 0 {
 		oc, _ := out["output_config"].(map[string]any)
 		if oc == nil {
 			oc = map[string]any{}
 		}
-		oc["format"] = map[string]any{"type": "json_schema", "schema": r.Schema}
+		oc["format"] = map[string]any{"type": "json_schema", "schema": s}
 		out["output_config"] = oc
 	}
 	out["max_tokens"] = maxTokens
@@ -463,6 +927,10 @@ func buildAnthropic(r *Request, model string) []byte {
 	}
 	if len(r.Metadata) > 0 {
 		out["metadata"] = r.Metadata
+	}
+	if len(r.Safeguards) > 0 && anthropicModel.MatchString(model) {
+		// auto mode's review, which Claude alone does (automode.go)
+		out["safeguards"] = r.Safeguards
 	}
 	if len(r.Tools) > 0 || r.WebSearch {
 		var tools []map[string]any
@@ -506,6 +974,101 @@ func buildAnthropic(r *Request, model string) []byte {
 	return b
 }
 
+// pairToolBlocks mends the tool exchange of a request built for a Messages
+// upstream, as pairToolMessages does for a Chat one (#554) and
+// pairToolItems for a relayed Responses request (#1341): Anthropic refuses
+// a tool_use the next message's tool_results don't answer ("`tool_use` ids
+// were found without `tool_result` blocks immediately after") and a
+// tool_result naming a call it never saw ("unexpected `tool_use_id` found
+// in `tool_result` blocks") — an interrupted turn or a client that dropped
+// its calls leaves both behind, and a relay serving Claude over Messages
+// passes the refusal on. A call left unanswered gets a synthetic result in
+// the user message that follows, or one of its own where none does; an
+// answer to no call becomes a text block, keeping what it said. A
+// well-formed exchange is built exactly as it was.
+func pairToolBlocks(msgs []aMessage) []aMessage {
+	out := make([]aMessage, 0, len(msgs))
+	var pending []string          // the calls of the assistant message in hand
+	open := map[string]bool{}     // which of them stand
+	answered := map[string]bool{} // pending calls a result answered
+
+	// synthetic is a call's missing result
+	synthetic := func(id string) aBlock {
+		c, _ := json.Marshal(interruptedTool)
+		return aBlock{Type: "tool_result", ToolUseID: id, Content: c, IsError: true}
+	}
+	// closeExchange answers the calls still open and ends the exchange
+	closeExchange := func() {
+		var blocks []aBlock
+		for _, id := range pending {
+			if !answered[id] {
+				blocks = append(blocks, synthetic(id))
+			}
+		}
+		if len(blocks) > 0 {
+			out = append(out, aMessage{Role: "user", Content: blocks})
+		}
+		pending, open, answered = nil, map[string]bool{}, map[string]bool{}
+	}
+	for _, m := range msgs {
+		if m.Role == "assistant" {
+			closeExchange()
+			for _, b := range m.Content {
+				if b.Type == "tool_use" {
+					pending = append(pending, b.ID)
+					open[b.ID] = true
+				}
+			}
+			out = append(out, m)
+			continue
+		}
+		var kept, rest []aBlock
+		for _, b := range m.Content {
+			if b.Type != "tool_result" {
+				rest = append(rest, b)
+				continue
+			}
+			if !open[b.ToolUseID] {
+				// answers no call of the exchange in hand — one another
+				// request carried, that closed already, or never there
+				rest = append(rest, resultSaid(b)...)
+				continue
+			}
+			if answered[b.ToolUseID] {
+				continue // a second answer: the first stands
+			}
+			answered[b.ToolUseID] = true
+			kept = append(kept, b)
+		}
+		for _, id := range pending {
+			if !answered[id] {
+				kept = append(kept, synthetic(id))
+			}
+		}
+		out = append(out, aMessage{Role: "user", Content: append(kept, rest...)})
+		pending, open, answered = nil, map[string]bool{}, map[string]bool{}
+	}
+	closeExchange()
+	return out
+}
+
+// resultSaid is what a tool_result that answers no call keeps: its text as
+// a text block, its images beside it as they came.
+func resultSaid(b aBlock) []aBlock {
+	var s string
+	if len(b.Content) > 0 && json.Unmarshal(b.Content, &s) == nil {
+		if strings.TrimSpace(s) == "" {
+			s = "Tool result received."
+		}
+		return []aBlock{{Type: "text", Text: s}}
+	}
+	var blocks []aBlock
+	if len(b.Content) > 0 && json.Unmarshal(b.Content, &blocks) == nil && len(blocks) > 0 {
+		return blocks
+	}
+	return []aBlock{{Type: "text", Text: "Tool result received."}}
+}
+
 // anthropicDecoder leaves out the blocks of Anthropic's own server tools —
 // a web search it ran — whose input is no call of the client's. A
 // tool_use block whose start carries its whole input, as a relay in front
@@ -529,7 +1092,7 @@ func (d *anthropicDecoder) decode(data string, emit func(Event)) error {
 			Type string `json:"type"`
 		} `json:"delta"`
 	}
-	if json.Unmarshal([]byte(data), &ev) == nil {
+	if decodeJSON([]byte(data), &ev) == nil {
 		switch ev.Type {
 		case "content_block_start":
 			d.server[ev.Index] = ev.ContentBlock.Type == "server_tool_use"
@@ -558,7 +1121,7 @@ func (d *anthropicDecoder) decode(data string, emit func(Event)) error {
 // object with something in it.
 func fullInput(in json.RawMessage) bool {
 	var m map[string]any
-	return json.Unmarshal(in, &m) == nil && len(m) > 0
+	return decodeJSON(in, &m) == nil && len(m) > 0
 }
 
 // decodeAnthropic turns an Anthropic event stream into events.
@@ -576,6 +1139,9 @@ func decodeAnthropic(data string, emit func(Event)) error {
 			ID   string `json:"id"`
 			Name string `json:"name"`
 			Text string `json:"text"`
+			// thinking
+			Thinking  string `json:"thinking"`
+			Signature string `json:"signature"`
 		} `json:"content_block"`
 		Delta struct {
 			Type        string `json:"type"`
@@ -584,6 +1150,9 @@ func decodeAnthropic(data string, emit func(Event)) error {
 			Thinking    string `json:"thinking"`
 			Signature   string `json:"signature"`
 			StopReason  string `json:"stop_reason"`
+			// auto mode's review of the reply's calls (automode.go)
+			SafeguardResults json.RawMessage `json:"safeguard_results"`
+			StopDetails      json.RawMessage `json:"stop_details"`
 		} `json:"delta"`
 		Usage aUsage `json:"usage"`
 		Error struct {
@@ -591,8 +1160,13 @@ func decodeAnthropic(data string, emit func(Event)) error {
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	if err := json.Unmarshal([]byte(data), &ev); err != nil {
-		return nil // keep going: pings and unknown shapes are harmless
+	if err := decodeJSON([]byte(data), &ev); err != nil {
+		// keep going: pings and unknown shapes are harmless, but an
+		// error in a shape of its own is still the reply's end (#1933)
+		if e, ok := carriedError(data); ok {
+			emit(e)
+		}
+		return nil
 	}
 	switch ev.Type {
 	case "message_start":
@@ -604,6 +1178,24 @@ func decodeAnthropic(data string, emit func(Event)) error {
 		case "text":
 			if ev.ContentBlock.Text != "" {
 				emit(Event{Kind: KText, Text: ev.ContentBlock.Text})
+			}
+		case "thinking":
+			// a block of its own, even signed with no text in it, or
+			// right after another (#1445)
+			emit(Event{Kind: KThinkStart})
+			if ev.ContentBlock.Thinking != "" {
+				emit(Event{Kind: KThink, Text: ev.ContentBlock.Thinking})
+			}
+			if ev.ContentBlock.Signature != "" {
+				emit(Event{Kind: KSig, Text: ev.ContentBlock.Signature})
+			}
+		case "redacted_thinking":
+			// sealed whole: it goes on as it came, to Messages only
+			var whole struct {
+				Block json.RawMessage `json:"content_block"`
+			}
+			if decodeJSON([]byte(data), &whole) == nil && len(whole.Block) > 0 {
+				emit(Event{Kind: KSealed, Name: sealAnthropic, Text: string(whole.Block)})
 			}
 		}
 	case "content_block_delta":
@@ -621,9 +1213,13 @@ func decodeAnthropic(data string, emit func(Event)) error {
 		if ev.Delta.StopReason != "" {
 			emit(Event{Kind: KStop, Stop: stopFromAnthropic(ev.Delta.StopReason)})
 		}
-		emit(Event{Kind: KUsage, Usage: ev.Usage.usage()})
+		var review json.RawMessage
+		if r := ev.Delta.SafeguardResults; len(r) > 0 && string(r) != "null" {
+			review = r
+		}
+		emit(Event{Kind: KUsage, Usage: ev.Usage.usage(), SafeguardResults: review, StopDetails: stopDetails(ev.Delta.StopDetails)})
 	case "error":
-		emit(Event{Kind: KError, Text: ev.Error.Message, Code: refusedCode(data)})
+		emit(Event{Kind: KError, Text: cmp.Or(ev.Error.Message, ev.Error.Type, streamErrorText(data)), Code: refusedCode(data)})
 	}
 	return nil
 }
@@ -696,12 +1292,15 @@ func stopToAnthropic(s string) string {
 
 // anthropicEncoder writes events as an Anthropic event stream.
 type anthropicEncoder struct {
-	id      string
-	w       *sseWriter
-	model   string
-	index   int
-	open    Kind // kind of the open content block, "" when none
-	args    bool // the open tool block got arguments
+	id    string
+	w     *sseWriter
+	model string
+	index int
+	open  Kind // kind of the open content block, "" when none
+	args  bool // the open tool block got arguments
+	// fresh: a thinking block began upstream (KThinkStart), to be opened
+	// apart from the one open with what it says first
+	fresh   bool
 	started bool
 	col     collector
 }
@@ -718,6 +1317,53 @@ func anthropicID(id string) string {
 	}
 	return "msg_" + strings.TrimPrefix(id, "chatcmpl-")
 }
+
+// Anthropic's Messages API, and Claude Code with it, takes a tool_use id
+// only of [A-Za-z0-9_-]: Claude Code drops a call whose id has another
+// character, and the turn fails "could not be parsed" (#1304). Other
+// vendors' ids can have one (Devin's "Bash:0#a65b…", a plugin's or a
+// relay's), so a call's id goes to an Anthropic client as anthropicOutID
+// makes it, and an id that comes back in the client's request is turned
+// back by anthropicInID, so the upstream that made the call gets its own
+// id on the next turn. An id that is already
+// safe goes both ways byte for byte, and Devin's "dv_…" ids, safe already,
+// are not encoded twice.
+const anthropicIDMark = "mp_"
+
+func anthropicOutID(id string) string {
+	if id == "" {
+		return id
+	}
+	return safeCallID(anthropicIDMark, id)
+}
+
+func anthropicInID(id string) string { return rawCallID(anthropicIDMark, id) }
+
+// safeCallID is id as one of [A-Za-z0-9_-] only: an id with another
+// character, or one beginning with mark, is mark and its base64url, which
+// rawCallID turns back; any other id is itself. It keeps no state, so an
+// id comes back the same from any request, after any restart.
+func safeCallID(mark, id string) string {
+	if safeIDChars.MatchString(id) && !strings.HasPrefix(id, mark) {
+		return id
+	}
+	return mark + base64.RawURLEncoding.EncodeToString([]byte(id))
+}
+
+// rawCallID is the id safeCallID was given for id, or id itself when
+// safeCallID didn't make it.
+func rawCallID(mark, id string) string {
+	if !strings.HasPrefix(id, mark) || !safeIDChars.MatchString(id) {
+		return id
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(id[len(mark):])
+	if err != nil || len(raw) == 0 || !utf8.Valid(raw) || safeCallID(mark, string(raw)) != id {
+		return id
+	}
+	return string(raw)
+}
+
+var safeIDChars = regexp.MustCompile(`^[A-Za-z0-9_-]+$`)
 
 func (e *anthropicEncoder) start(ev Event) {
 	if e.started {
@@ -753,10 +1399,20 @@ func (e *anthropicEncoder) openBlock(k Kind, block map[string]any) {
 		return
 	}
 	e.close()
-	e.args = false
+	e.args, e.fresh = false, false
 	block["type"] = map[Kind]string{Text: "text", Thinking: "thinking", ToolCall: "tool_use"}[k]
 	e.w.event("content_block_start", map[string]any{"type": "content_block_start", "index": e.index, "content_block": block})
 	e.open = k
+}
+
+// thinking makes the open block a thinking block: the one open, unless a
+// new one has begun since (KThinkStart).
+func (e *anthropicEncoder) thinking() {
+	if e.fresh {
+		e.close()
+		e.fresh = false
+	}
+	e.openBlock(Thinking, map[string]any{"thinking": ""})
 }
 
 func (e *anthropicEncoder) delta(d map[string]any) {
@@ -776,22 +1432,38 @@ func (e *anthropicEncoder) event(ev Event) {
 		}
 		e.openBlock(Text, map[string]any{"text": ""})
 		e.delta(map[string]any{"type": "text_delta", "text": ev.Text})
+	case KThinkStart:
+		// opened with what it says first: one that says nothing isn't
+		e.fresh = true
+		e.col.add(ev)
+		return
 	case KThink:
 		if ev.Text == "" {
 			return
 		}
-		e.openBlock(Thinking, map[string]any{"thinking": ""})
+		e.thinking()
 		e.delta(map[string]any{"type": "thinking_delta", "thinking": ev.Text})
 	case KSig:
-		if e.open == Thinking {
+		// a block signed with no text goes as it came, signed (#1445)
+		if e.open == Thinking || e.fresh {
+			e.thinking()
 			e.delta(map[string]any{"type": "signature_delta", "signature": ev.Text})
+		}
+	case KSealed:
+		if ev.Name == sealAnthropic {
+			// a redacted_thinking block, whole as Anthropic wrote it
+			e.close()
+			e.fresh = false
+			e.w.event("content_block_start", map[string]any{"type": "content_block_start", "index": e.index, "content_block": json.RawMessage(ev.Text)})
+			e.w.event("content_block_stop", map[string]any{"type": "content_block_stop", "index": e.index})
+			e.index++
 		}
 	case KToolStart:
 		id := ev.ID
 		if id == "" {
 			id = "toolu_" + newID()
 		}
-		e.openBlock(ToolCall, map[string]any{"id": id, "name": ev.Name, "input": map[string]any{}})
+		e.openBlock(ToolCall, map[string]any{"id": anthropicOutID(id), "name": ev.Name, "input": map[string]any{}})
 	case KToolArgs:
 		if e.open == ToolCall && ev.Text != "" {
 			e.args = true
@@ -839,6 +1511,9 @@ func (e *anthropicEncoder) finish() {
 	if len(res.SafeguardResults) > 0 {
 		delta["safeguard_results"] = res.SafeguardResults
 	}
+	if len(res.StopDetails) > 0 {
+		delta["stop_details"] = res.StopDetails
+	}
 	e.w.event("message_delta", map[string]any{"type": "message_delta",
 		"delta": delta,
 		"usage": res.Usage.anthropic()})
@@ -847,19 +1522,29 @@ func (e *anthropicEncoder) finish() {
 
 // renderAnthropic is the non-streaming reply.
 func renderAnthropic(res Result, model string) []byte {
-	content := []map[string]any{}
+	content := []any{}
 	for _, p := range res.Parts {
 		switch p.Kind {
 		case Text:
+			if p.Text == "" && p.Signature != "" {
+				continue // only Gemini's signature, which is Gemini's
+			}
 			content = append(content, map[string]any{"type": "text", "text": p.Text})
 		case Thinking:
-			content = append(content, map[string]any{"type": "thinking", "thinking": p.Text, "signature": p.Signature})
+			switch {
+			case p.sealedBy(sealAnthropic):
+				content = append(content, p.Sealed)
+			case p.Text == "" && p.Signature == "":
+				// another API's sealed reasoning, nothing to Messages
+			default:
+				content = append(content, map[string]any{"type": "thinking", "thinking": p.Text, "signature": p.Signature})
+			}
 		case ToolCall:
 			id := p.ID
 			if id == "" {
 				id = "toolu_" + newID()
 			}
-			content = append(content, map[string]any{"type": "tool_use", "id": id, "name": p.Name, "input": argsOf(p)})
+			content = append(content, map[string]any{"type": "tool_use", "id": anthropicOutID(id), "name": p.Name, "input": argsOf(p)})
 		case Search:
 			id := "srvtoolu_" + newID()
 			content = append(content,
@@ -875,6 +1560,9 @@ func renderAnthropic(res Result, model string) []byte {
 		"content": content, "stop_reason": stopToAnthropic(res.Stop), "stop_sequence": nil, "usage": res.Usage.anthropic()}
 	if len(res.SafeguardResults) > 0 {
 		reply["safeguard_results"] = res.SafeguardResults
+	}
+	if len(res.StopDetails) > 0 {
+		reply["stop_details"] = res.StopDetails
 	}
 	b, _ := json.Marshal(reply)
 	return b
@@ -921,7 +1609,7 @@ func objectSchema(schema json.RawMessage) json.RawMessage {
 		return schema
 	}
 	var m map[string]any
-	if json.Unmarshal(schema, &m) != nil || !provider.ObjectRoot(m) {
+	if decodeJSON(schema, &m) != nil || !provider.ObjectRoot(m) {
 		return schema
 	}
 	b, err := json.Marshal(m)
@@ -929,4 +1617,12 @@ func objectSchema(schema json.RawMessage) json.RawMessage {
 		return schema
 	}
 	return b
+}
+
+// stopDetails is a reply's stop_details, or nil when it had none.
+func stopDetails(raw json.RawMessage) json.RawMessage {
+	if len(raw) == 0 || string(raw) == "null" {
+		return nil
+	}
+	return raw
 }

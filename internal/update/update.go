@@ -10,6 +10,7 @@
 package update
 
 import (
+	"cmp"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -125,15 +126,42 @@ func Newer(a, b string) bool {
 			return x.n[i] > y.n[i]
 		}
 	}
+	return comparePre(x.pre, y.pre) > 0
+}
+
+// comparePre orders two pre-releases the way semver does (§11): no
+// pre-release comes after any; otherwise identifier by identifier, numbers
+// as numbers ("beta.10" after "beta.9"), a number before a word, and a
+// shorter list before a longer one it starts.
+func comparePre(a, b string) int {
 	switch {
-	case x.pre == y.pre:
-		return false
-	case x.pre == "":
-		return true
-	case y.pre == "":
-		return false
+	case a == b:
+		return 0
+	case a == "":
+		return 1
+	case b == "":
+		return -1
 	}
-	return x.pre > y.pre
+	x, y := strings.Split(a, "."), strings.Split(b, ".")
+	for i := 0; i < len(x) && i < len(y); i++ {
+		m, errM := strconv.ParseUint(x[i], 10, 64)
+		n, errN := strconv.ParseUint(y[i], 10, 64)
+		switch {
+		case errM == nil && errN == nil:
+			if m != n {
+				return cmp.Compare(m, n)
+			}
+		case errM == nil:
+			return -1
+		case errN == nil:
+			return 1
+		default:
+			if c := strings.Compare(x[i], y[i]); c != 0 {
+				return c
+			}
+		}
+	}
+	return cmp.Compare(len(x), len(y))
 }
 
 type semver struct {
@@ -143,6 +171,8 @@ type semver struct {
 
 func parse(v string) *semver {
 	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
+	// build metadata ("+sha.5d0c1dc") plays no part in the order
+	v, _, _ = strings.Cut(v, "+")
 	v, pre, _ := strings.Cut(v, "-")
 	parts := strings.Split(v, ".")
 	if len(parts) != 3 {
@@ -376,8 +406,22 @@ func StageBinary(ctx context.Context, rel *Release) (string, error) {
 // InstallBinary swaps a staged binary in for exe, the running one, which
 // keeps going until it exits.
 func InstallBinary(staged, exe string) error {
+	_, err := InstallBinaryAside(staged, exe)
+	return err
+}
+
+// InstallBinaryAside is InstallBinary, saying where the running exe was
+// moved to on Windows ("" elsewhere), for RelaunchBinary to put it back
+// should the new version not start. A download this computer won't start
+// (Smart App Control, #894) isn't put in: a *BlockedError, and the
+// download removed.
+func InstallBinaryAside(staged, exe string) (string, error) {
 	var old string
 	if runtime.GOOS == "windows" {
+		if err := canStart(staged); err != nil {
+			os.Remove(staged)
+			return "", &BlockedError{Err: err}
+		}
 		// A running .exe cannot be overwritten, but it can be moved aside.
 		// What the last update moved aside may still be running too (a
 		// `magpie serve` started before it), and can't be removed or
@@ -386,20 +430,20 @@ func InstallBinary(staged, exe string) error {
 		RemoveOld(exe)
 		var err error
 		if old, err = moveAside(exe); err != nil {
-			return err
+			return "", err
 		}
 	}
 	if err := os.Rename(staged, exe); err != nil {
 		if old != "" {
 			if restoreErr := os.Rename(old, exe); restoreErr != nil {
-				return errors.Join(err, fmt.Errorf("couldn't restore %s from %s: %w", filepath.Base(exe), old, restoreErr))
+				return "", errors.Join(err, fmt.Errorf("couldn't restore %s from %s: %w", filepath.Base(exe), old, restoreErr))
 			}
 		} else if !NeedsAdmin(err) { // kept for InstallBinaryAsAdmin
 			os.Remove(staged)
 		}
-		return err
+		return "", err
 	}
-	return nil
+	return old, nil
 }
 
 // renameFile is os.Rename; tests make it fail.
@@ -523,16 +567,18 @@ func InstallBinaryAsAdmin(staged, exe string) error {
 // RelaunchBinary starts exe again: with its window on view when window is
 // set (the window was open), else as the tray app alone, as autostart
 // starts it. The new process waits for this one to exit before it takes
-// the gateway's port; see AwaitPredecessor.
-func RelaunchBinary(exe string, window bool, view string) error {
-	cmd := proc.Command(exe, RelaunchArgs(window, view)...)
-	cmd.Env = append(os.Environ(), "MAGPIE_REPLACES="+strconv.Itoa(os.Getpid()))
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = nil, nil, nil
-	detach(cmd)
-	if err := cmd.Start(); err != nil {
-		return err
+// the gateway's port; see AwaitPredecessor. With old, where this one was
+// moved aside to (Windows), it waits for the new one to say it is up, and
+// when it can't start puts old back and says so (a *BlockedError): this
+// one then runs on rather than quitting.
+func RelaunchBinary(exe, old string, window bool, view string) error {
+	args := RelaunchArgs(window, view)
+	env := append(os.Environ(), "MAGPIE_REPLACES="+strconv.Itoa(os.Getpid()))
+	if old != "" {
+		return startChecked(exe, old, args, env)
 	}
-	return cmd.Process.Release()
+	_, _, err := launch(exe, args, env)
+	return err
 }
 
 // RelaunchArgs is what RelaunchBinary starts magpie with: `gui [view]` for
@@ -550,6 +596,7 @@ func RelaunchArgs(window bool, view string) []string {
 // AwaitPredecessor blocks, for a while at most, until the magpie that
 // relaunched this one has exited.
 func AwaitPredecessor() {
+	reportStarted() // first: the one that started this waits for it
 	pid, err := strconv.Atoi(os.Getenv("MAGPIE_REPLACES"))
 	os.Unsetenv("MAGPIE_REPLACES")
 	if err != nil || pid <= 0 {
@@ -600,12 +647,15 @@ func fetch(ctx context.Context, a Asset, path string) error {
 	}
 	res, err := source.Do(client, req)
 	if err != nil {
+		if u != a.URL {
+			return &MirrorError{Mirror: strings.TrimSuffix(u, a.URL), Err: err}
+		}
 		return err
 	}
 	defer res.Body.Close()
 	if res.StatusCode != 200 {
 		if u != a.URL {
-			return fmt.Errorf("download %s through the mirror %s: %s", filepath.Base(path), strings.TrimSuffix(u, a.URL), res.Status)
+			return &MirrorError{Mirror: strings.TrimSuffix(u, a.URL), Err: fmt.Errorf("download %s through the mirror %s: %s", filepath.Base(path), strings.TrimSuffix(u, a.URL), res.Status)}
 		}
 		return fmt.Errorf("download %s: %s", filepath.Base(path), res.Status)
 	}
@@ -632,6 +682,9 @@ func fetch(ctx context.Context, a Asset, path string) error {
 		if u != a.URL {
 			err = fmt.Errorf("%s from the mirror %s does not match its checksum from %s; not installed", filepath.Base(path), strings.TrimSuffix(u, a.URL), Site)
 		}
+	}
+	if err != nil && u != a.URL && !errors.As(err, new(*MirrorError)) {
+		err = &MirrorError{Mirror: strings.TrimSuffix(u, a.URL), Err: err}
 	}
 	if err != nil {
 		os.Remove(path)

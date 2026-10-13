@@ -23,7 +23,10 @@ var quotaReadSequence atomic.Uint64
 
 // quotaReading orders reads when they start, not when the vendor answers.
 // A card refresh shares its order across the three kinds of usage.
+// A read the user didn't ask for, while they have allowances read only
+// when asked, sends nothing (holdUnasked).
 func quotaReading(ctx context.Context) (context.Context, uint64) {
+	ctx = holdUnasked(ctx)
 	if seq, ok := ctx.Value(quotaReadKey{}).(uint64); ok {
 		return ctx, seq
 	}
@@ -96,11 +99,11 @@ func RefreshUsage(ctx context.Context, provider, user string) {
 		return
 	}
 	r := cardRefresh{provider, user}
-	ctx = context.WithValue(ctx, cardRefreshKey{}, r)
+	ctx = context.WithValue(Asked(ctx), cardRefreshKey{}, r) // a card's refresh is the user asking
 	ctx, seq := quotaReading(ctx)
 	if provider == "claude" {
 		// Claude Code's /usage, run when the user asks (claudeWindows)
-		claudeAsked.Store(time.Now().UnixNano())
+		markClaudeUsageAsked()
 	}
 	var wg sync.WaitGroup
 	wg.Add(3)

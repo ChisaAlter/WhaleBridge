@@ -137,7 +137,7 @@ func TestGooseRunsOnMagpie(t *testing.T) {
 		t.Fatalf("%v: %s", err, readFile(file))
 	}
 	if p.Name != "magpie" || p.Engine != "openai" || p.BaseURL != gatewayV1() ||
-		p.Headers["Authorization"] != "Bearer "+gateway.Token || p.APIKeyEnv == nil || *p.APIKeyEnv != "" ||
+		p.Headers["Authorization"] != "Bearer "+gateway.TokenFor("goose") || p.APIKeyEnv == nil || *p.APIKeyEnv != "" ||
 		p.RequiresAuth == nil || *p.RequiresAuth || p.DynamicModels == nil || *p.DynamicModels || !p.Skip {
 		t.Fatalf("provider: %s", readFile(file))
 	}
@@ -180,6 +180,41 @@ func TestGooseRunsOnMagpie(t *testing.T) {
 	}
 	if f.Get() != "" {
 		t.Fatalf("model left: %q", f.Get())
+	}
+}
+
+// goose sends no User-Agent, so the key magpie hands it is the one that
+// names it (#1083, EZN7L2C3: Goose's requests showed as "your agent" on
+// Routing and "other" in Usage). A custom provider an older magpie wrote
+// with the plain key counts as drift, and a sync puts the named key in.
+func TestGooseKeyNamesGoose(t *testing.T) {
+	home := syncHome(t)
+	t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
+	a := goose(home, filepath.Join(home, ".config"))
+	if err := a.Fields[0].Set("magpie/relay/glm-4.6"); err != nil {
+		t.Fatal(err)
+	}
+	file := gooseProviderPath(a.Path)
+	want := "Bearer " + gateway.TokenFor("goose")
+	if got, _ := edit.GetJSON(file, "headers.Authorization"); got != want {
+		t.Fatalf("Authorization = %q, want %q", got, want)
+	}
+	if c := a.Check(); c != "" {
+		t.Fatalf("check: %s", c)
+	}
+
+	// the file an older magpie wrote
+	if err := edit.SetJSON(file, edit.KV{Path: "headers.Authorization", Value: "Bearer " + gateway.Token}); err != nil {
+		t.Fatal(err)
+	}
+	if a.Check() == "" {
+		t.Fatal("the plain key not noticed")
+	}
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := edit.GetJSON(file, "headers.Authorization"); got != want || a.Check() != "" {
+		t.Fatalf("after sync Authorization = %q, check %q", got, a.Check())
 	}
 }
 

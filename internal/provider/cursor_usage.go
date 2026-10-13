@@ -18,6 +18,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"math"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -40,6 +41,9 @@ var cursorKeychain = runtime.GOOS == "darwin"
 // cursorToken is the access token cursor-agent signed in with: in the
 // Keychain on a Mac, in its auth.json elsewhere.
 func cursorToken() (string, error) {
+	if discoveryOff() {
+		return "", errAccountDiscoveryOff
+	}
 	if cursorKeychain {
 		if tok := cursorKeychainToken(false); tok != "" {
 			return tok, nil
@@ -79,6 +83,10 @@ func cursorAuthPath() string {
 
 func cursorSubscriptionUsage(ctx context.Context, plan string) SubscriptionQuota {
 	q := SubscriptionQuota{Provider: "cursor", Name: "Cursor", Icon: "cursor", Plan: plan, Windows: []QuotaWindow{}}
+	if holding(ctx) {
+		q.Error = errNotAsked.Error()
+		return q
+	}
 	tok, err := cursorToken()
 	if err == nil {
 		q.Windows, err = cursorWindows(ctx, tok)
@@ -89,35 +97,136 @@ func cursorSubscriptionUsage(ctx context.Context, plan string) SubscriptionQuota
 	return q
 }
 
-// cursorWindows: the plan's included usage this billing period. An
-// enterprise plan reports spend instead, and gets no windows.
-func cursorWindows(ctx context.Context, token string) ([]QuotaWindow, error) {
-	var data struct {
-		BillingCycleEnd  string   `json:"billingCycleEnd"` // epoch millis
-		AutoBucketModels []string `json:"autoBucketModels"`
-		PlanUsage        *struct {
-			Auto  float64 `json:"autoPercentUsed"`
-			API   float64 `json:"apiPercentUsed"`
-			Total float64 `json:"totalPercentUsed"`
-		} `json:"planUsage"`
+// cursorPeriod is GetCurrentPeriodUsage's reply (Connect JSON).
+type cursorPeriod struct {
+	BillingCycleEnd  string   `json:"billingCycleEnd"` // epoch millis
+	AutoBucketModels []string `json:"autoBucketModels"`
+	PlanUsage        *struct {
+		Auto  float64 `json:"autoPercentUsed"`
+		API   float64 `json:"apiPercentUsed"`
+		Total float64 `json:"totalPercentUsed"`
+	} `json:"planUsage"`
+	SpendLimitUsage *cursorSpend `json:"spendLimitUsage"`
+}
+
+// cursorSpend is the period's on-demand spend, in cents. IndividualLimit
+// is nil when the user has no limit of their own.
+type cursorSpend struct {
+	IndividualUsed  json.Number  `json:"individualUsed"`
+	IndividualLimit *json.Number `json:"individualLimit"`
+	LimitType       string       `json:"limitType"`
+	PooledLimit     json.Number  `json:"pooledLimit"` // an int64 string
+	PooledUsed      json.Number  `json:"pooledUsed"`
+}
+
+// cursorHardLimit is GetHardLimit's reply: the on-demand limit, in dollars.
+type cursorHardLimit struct {
+	HardLimit           float64 `json:"hardLimit"`
+	NoUsageBasedAllowed bool    `json:"noUsageBasedAllowed"`
+}
+
+// cursorOnDemand is what Cursor still serves once the included usage is
+// spent: kind is "fixed" (up to limit dollars), "unlimited", "disabled" or
+// "unavailable" (not known). mine is the member's own spend when used is
+// their team's pool's (pool is set).
+type cursorOnDemand struct {
+	kind              string
+	used, limit, mine float64 // dollars
+	pool              bool
+}
+
+// cursorOnDemandOf derives the On-demand state as cursor-agent 2026.10.01's
+// usage view does (usage-data.ts), and as the plugin's onDemandOf: from the
+// period's spendLimitUsage and, where that sets no limit of the user's,
+// GetHardLimit's reply (nil when it couldn't be read). A team member with
+// no limit of their own spends the team's pool, which cursor-agent's view
+// calls unlimited but which runs out at pooledLimit for the whole team
+// (#1868): that is a fixed limit on the pool's spend.
+func cursorOnDemandOf(p cursorPeriod, hard *cursorHardLimit) cursorOnDemand {
+	num := func(n json.Number) float64 { f, _ := n.Float64(); return f }
+	s := p.SpendLimitUsage
+	if s == nil {
+		s = &cursorSpend{}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cursorBase+"/aiserver.v1.DashboardService/GetCurrentPeriodUsage", bytes.NewReader([]byte("{}")))
+	used := num(s.IndividualUsed) / 100
+	var own *cursorOnDemand
+	if s.IndividualLimit != nil {
+		if l := num(*s.IndividualLimit); l > 0 {
+			own = &cursorOnDemand{kind: "fixed", used: used, limit: l / 100}
+		} else {
+			own = &cursorOnDemand{kind: "disabled", used: used}
+		}
+	}
+	if s.LimitType == "team" {
+		switch {
+		case own != nil:
+			return *own
+		case hard != nil && (hard.NoUsageBasedAllowed || hard.HardLimit <= 0):
+			return cursorOnDemand{kind: "disabled", used: used}
+		case num(s.PooledLimit) > 0:
+			return cursorOnDemand{kind: "fixed", used: num(s.PooledUsed) / 100, limit: num(s.PooledLimit) / 100, mine: used, pool: true}
+		case hard != nil:
+			return cursorOnDemand{kind: "unlimited", used: used}
+		}
+		return cursorOnDemand{kind: "unavailable", used: used}
+	}
+	switch {
+	case hard == nil && own != nil:
+		return *own
+	case hard == nil:
+		return cursorOnDemand{kind: "unavailable", used: used}
+	case hard.NoUsageBasedAllowed:
+		return cursorOnDemand{kind: "disabled", used: used}
+	case hard.HardLimit >= 2147483647:
+		return cursorOnDemand{kind: "unlimited", used: used}
+	case hard.HardLimit > 0:
+		return cursorOnDemand{kind: "fixed", used: used, limit: hard.HardLimit}
+	}
+	return cursorOnDemand{kind: "disabled", used: used}
+}
+
+// cursorDashboard posts {} to one of Cursor's DashboardService methods and
+// decodes its reply into v.
+func cursorDashboard(ctx context.Context, token, method string, v any) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cursorBase+"/aiserver.v1.DashboardService/"+method, bytes.NewReader([]byte("{}")))
 	if err != nil {
-		return []QuotaWindow{}, err
+		return err
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Connect-Protocol-Version", "1")
 	res, err := http.DefaultClient.Do(req)
 	if err != nil {
-		return []QuotaWindow{}, err
+		return err
 	}
 	defer res.Body.Close()
 	b, _ := io.ReadAll(io.LimitReader(res.Body, 1<<20))
 	if res.StatusCode < 200 || res.StatusCode >= 300 {
-		return []QuotaWindow{}, &accountStatusError{status: res.StatusCode}
+		return &accountStatusError{status: res.StatusCode}
 	}
-	if err := json.Unmarshal(b, &data); err != nil {
+	return json.Unmarshal(b, v)
+}
+
+// cursorWindows: the plan's included usage this billing period. An
+// enterprise plan reports spend instead, and gets no windows. An account
+// that may spend on-demand once its included usage is gone (a team or
+// enterprise that pays for more, #1476) is still served when the pools are
+// spent, so they are shown aside, and its On-demand spend is what can run
+// out: at its limit, or never when it has none.
+func cursorWindows(ctx context.Context, token string) ([]QuotaWindow, error) {
+	var data cursorPeriod
+	var hard *cursorHardLimit
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		var h cursorHardLimit
+		if cursorDashboard(ctx, token, "GetHardLimit", &h) == nil {
+			hard = &h
+		}
+	}()
+	err := cursorDashboard(ctx, token, "GetCurrentPeriodUsage", &data)
+	<-done
+	if err != nil {
 		return []QuotaWindow{}, err
 	}
 	if data.PlanUsage == nil {
@@ -138,12 +247,38 @@ func cursorWindows(ctx context.Context, token string) ([]QuotaWindow, error) {
 		// effort or speed (grok-4.8-high-fast)
 		return slices.ContainsFunc(data.AutoBucketModels, func(m string) bool { return cursorPoolBase(m) == model }) || cursorFirstPartyModel(model)
 	}
+	od := cursorOnDemandOf(data, hard)
+	pooled := od.kind == "fixed" || od.kind == "unlimited"
 	// the two pools fit the line; the total goes in its tooltip
-	return []QuotaWindow{
-		{Name: "Cursor Models", Used: u.Auto, ResetsAt: resets, matches: inCursorPool},
-		{Name: "Other Models", Used: u.API, ResetsAt: resets, matches: func(model string) bool { return !inCursorPool(model) }},
-		{Name: "Total", Used: u.Total, ResetsAt: resets, Aside: true},
-	}, nil
+	ws := []QuotaWindow{
+		{Name: "Cursor Models", Used: u.Auto, ResetsAt: resets, matches: inCursorPool, Aside: pooled},
+		{Name: "Other Models", Used: u.API, ResetsAt: resets, matches: func(model string) bool { return !inCursorPool(model) }, Aside: pooled},
+	}
+	switch od.kind {
+	case "fixed":
+		display := cursorDollars(od.used) + " / " + cursorDollars(od.limit)
+		if od.pool {
+			display += " (you: " + cursorDollars(od.mine) + ")"
+		}
+		ws = append(ws, QuotaWindow{Name: "On-demand", Used: max(0, min(100, 100*od.used/od.limit)), Display: display, ResetsAt: resets})
+	case "unlimited":
+		ws = append(ws, QuotaWindow{Name: "On-demand", Display: cursorDollars(od.used), ResetsAt: resets, Aside: true})
+	}
+	return append(ws, QuotaWindow{Name: "Total", Used: u.Total, ResetsAt: resets, Aside: true}), nil
+}
+
+// cursorDollars says a dollar amount to the cent, thousands grouped, as the
+// plugin does: a team's pool runs to six figures ($451,200.00).
+func cursorDollars(d float64) string {
+	s := strconv.FormatFloat(math.Abs(d), 'f', 2, 64)
+	whole, cents, _ := strings.Cut(s, ".")
+	for i := len(whole) - 3; i > 0; i -= 3 {
+		whole = whole[:i] + "," + whole[i:]
+	}
+	if d < 0 && s != "0.00" {
+		return "-$" + whole + "." + cents
+	}
+	return "$" + whole + "." + cents
 }
 
 // cursorPoolBase names a model's family: lower case, without cursor- and

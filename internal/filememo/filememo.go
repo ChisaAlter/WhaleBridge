@@ -4,7 +4,10 @@ package filememo
 
 import (
 	"bytes"
+	"errors"
+	"io/fs"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +40,10 @@ var (
 	// on by every write magpie makes (Forget)
 	holds int
 	gen   uint64
+	// gone is the files found not there last time looked at, not waited
+	// on again (steady.Stat): one there before and not now may be being
+	// replaced (Windows), and is
+	gone = map[string]bool{}
 )
 
 // heldFor is how long a file found unchanged is taken as unchanged, while
@@ -67,6 +74,20 @@ func Forget() {
 	mu.Unlock()
 }
 
+// Look has the file at path looked at on its next read, even while a
+// request holds what was read (Hold): another magpie may have written it,
+// which Forget, moved on by this one's writes alone, can't know of.
+func Look(path string) {
+	mu.Lock()
+	defer mu.Unlock()
+	for k, e := range seen {
+		if strings.HasSuffix(k, "\x00"+path) && !e.checked.IsZero() {
+			e.checked = time.Time{}
+			seen[k] = e
+		}
+	}
+}
+
 // Read is parse of the file at path, from what it gave last time when the
 // file has the same size and time as then (and, written just now, the same
 // bytes). kind tells apart two parses of
@@ -82,7 +103,7 @@ func Read[T any](kind, path string, parse func([]byte) (T, error)) (T, error) {
 	}
 	g := gen
 	mu.Unlock()
-	fi, err := os.Stat(path)
+	fi, err := statFile(path)
 	if err != nil {
 		return zero, err
 	}
@@ -95,7 +116,7 @@ func Read[T any](kind, path string, parse func([]byte) (T, error)) (T, error) {
 		mu.Unlock()
 		return e.v.(T), nil
 	}
-	b, err := steady.ReadFile(path)
+	b, err := steady.ReadThere(path)
 	if err != nil {
 		return zero, err
 	}
@@ -122,4 +143,30 @@ func Read[T any](kind, path string, parse func([]byte) (T, error)) (T, error) {
 	seen[key] = e
 	mu.Unlock()
 	return v, nil
+}
+
+// statFile is os.Stat of path, waiting out a moment of it not there
+// (another process replacing it, on Windows) unless it wasn't there last
+// time either: taken for gone, a file of accounts read as no accounts, and
+// the next write left them all out (Packing1 on Discord, Windows 11:
+// Antigravity's account gone after an update).
+func statFile(path string) (os.FileInfo, error) {
+	mu.Lock()
+	wasGone := gone[path]
+	mu.Unlock()
+	var fi os.FileInfo
+	var err error
+	if wasGone {
+		fi, err = os.Stat(path)
+	} else {
+		fi, err = steady.Stat(path)
+	}
+	mu.Lock()
+	if errors.Is(err, fs.ErrNotExist) {
+		gone[path] = true
+	} else {
+		delete(gone, path)
+	}
+	mu.Unlock()
+	return fi, err
 }

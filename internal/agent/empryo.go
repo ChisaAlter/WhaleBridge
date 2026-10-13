@@ -102,11 +102,11 @@ func empryoAt(at place) *Agent {
 		return edit.SetJSON(path, edit.KV{Path: empryoModel, Value: v})
 	}
 	return atomic(&Agent{
-		ID: "empryo", Name: "Empryo", Icon: "empryo-color", Aliases: []string{"soulforge"}, Spelled: prefixed,
+		ID: "empryo", Name: "Empryo", Icon: "empryo-color", Aliases: []string{"soulforge"}, Spelled: prefixed, NoNames: true,
 		Bin: "empryo", Dir: dir, Path: path,
 		Notice: func() string {
 			if Running(`(^|/)empryo( |$)`) {
-				return "Empryo reads its config at start-up — restart open empryo sessions to use this."
+				return noticeEmpryo.String()
 			}
 			return ""
 		},
@@ -175,3 +175,8 @@ func empryoAt(at place) *Agent {
 		}},
 	}, path)
 }
+
+// what empryo says after a change (notice.go)
+var (
+	noticeEmpryo = newNotice("Empryo reads its config at start-up — restart open empryo sessions to use this.")
+)

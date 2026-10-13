@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // StartPluginSignIn begins signing in to a plugin's provider (OpenCode's
@@ -19,8 +20,20 @@ import (
 // is. A built-in moved onto its plugin installs the CLI it runs through
 // first, as the built-in's sign-in did.
 func StartPluginSignIn(id string, method int, inputs map[string]string) (SignInState, error) {
+	return StartPluginSignInWith(id, method, inputs, SignInOptions{})
+}
+
+// StartPluginSignInWith is StartPluginSignIn through the proxy o picks,
+// else the one the provider's requests go through (#1663).
+func StartPluginSignInWith(id string, method int, inputs map[string]string, o SignInOptions) (SignInState, error) {
+	if settings.AccountDiscoveryOff() {
+		return SignInState{}, errAccountDiscoveryOff
+	}
 	s := &signInFlow{done: make(chan struct{})}
-	s.st = SignInState{ID: randomToken(9), Agent: PluginID(id), State: "waiting"}
+	if err := s.pickProxy(PluginID(id), o); err != nil {
+		return SignInState{}, err
+	}
+	s.st = SignInState{ID: randomToken(9), Agent: PluginID(id), State: "waiting", Proxy: s.proxy}
 	var cli agentCLI
 	install := false
 	if Moved(s.st.Agent) {
@@ -69,7 +82,7 @@ var pluginRunsCLI = map[string]bool{"grok": true}
 // pluginBegin asks the plugin for the page to open and waits for the
 // sign-in to finish there, or for the code the page shows.
 func (s *signInFlow) pluginBegin(id string, method int, inputs map[string]string) error {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	ctx, cancel := context.WithTimeout(s.via(context.Background()), time.Minute)
 	a, err := plugin.Authorize(ctx, id, method, inputs, plugin.NewAccount)
 	cancel()
 	if err != nil {
@@ -165,7 +178,8 @@ func PluginAPIKey(ctx context.Context, id string, method int, inputs map[string]
 	if strings.TrimSpace(key) == "" {
 		return "", errors.New("enter the key")
 	}
-	saved, err := plugin.APIKey(ctx, id, method, inputs, strings.TrimSpace(key), plugin.NewAccount)
+	// through the proxy the provider's requests go through (#1663)
+	saved, err := plugin.APIKey(Via(ctx, PluginID(id)), id, method, inputs, strings.TrimSpace(key), plugin.NewAccount)
 	if err != nil {
 		return "", err
 	}

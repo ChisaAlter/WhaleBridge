@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/filememo"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // SessionIdentity is an account's public identity, without its credentials.
@@ -23,22 +25,57 @@ type SessionIdentity struct {
 // Callers must match the IDs recorded in a session; presence alone is not evidence
 // that the account served that session's requests.
 func SessionIdentities(codexDir string) []SessionIdentity {
+	if settings.AccountDiscoveryOff() {
+		return nil
+	}
 	out := currentSessionIdentities(codexDir)
+	var saved []SessionIdentity
 	for _, l := range readLogins() {
+		if id, ok := savedSessionIdentity(l); ok {
+			saved = append(saved, id)
+		}
+	}
+	for i, id := range out {
+		// the account Codex is signed in to goes by the name it is saved
+		// under: a second Team seat of one email is "email · Team ·
+		// <workspace>", not the other seat's codexUser name (#1424)
+		if id.Agent == "codex" {
+			out[i].User = savedCodexName(saved, id)
+		}
+	}
+	for _, id := range saved {
 		// The account signed in now is saved too once rememberLogins has
 		// seen it. It is listed once, so the usage cache keyed on this list
 		// isn't thrown away when that copy is saved.
-		if id, ok := savedSessionIdentity(l); ok && !slices.Contains(out, id) {
+		if !slices.Contains(out, id) {
 			out = append(out, id)
 		}
 	}
 	return out
 }
 
+// savedCodexName is the name the Codex identity id, read from auth.json
+// by codexUser's name, is saved under: that of the saved one of its
+// workspace and member whose name is codexUser's, or codexUser's with
+// codexName's workspace after it. Not saved yet, it is codexUser's.
+func savedCodexName(saved []SessionIdentity, id SessionIdentity) string {
+	for _, s := range saved {
+		if s.Agent == "codex" && s.AccountID == id.AccountID && s.UserID == id.UserID &&
+			(strings.EqualFold(s.User, id.User) || strings.HasPrefix(strings.ToLower(s.User), strings.ToLower(id.User)+" · ")) {
+			return s.User
+		}
+	}
+	return id.User
+}
+
 func savedSessionIdentity(l savedLogin) (SessionIdentity, bool) {
 	switch l.Agent {
 	case "codex":
-		return codexSessionIdentity(l.Auth)
+		id, ok := codexSessionIdentity(l.Auth)
+		if ok && l.User != "" {
+			id.User = l.User // as it is saved (codexName), not codexUser's
+		}
+		return id, ok
 	case "claude":
 		return claudeSessionIdentity(l.Profile)
 	}
@@ -71,6 +108,9 @@ func claudeSessionIdentity(b []byte) (SessionIdentity, bool) {
 }
 
 func currentSessionIdentities(codexDir string) []SessionIdentity {
+	if settings.AccountDiscoveryOff() {
+		return nil
+	}
 	var out []SessionIdentity
 	// Cache only the identity parse, not another copy of the credential blob.
 	current, _ := filememo.Read("session codex identity", filepath.Join(codexDir, "auth.json"), func(b []byte) ([]SessionIdentity, error) {

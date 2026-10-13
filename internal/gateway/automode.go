@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"slices"
 	"strings"
 
 	"github.com/tidwall/gjson"
@@ -12,12 +13,21 @@ import (
 // Claude Code's auto mode checks each action with a classifier (#250).
 // Behind a gateway, its first requests ask the API to do it: the
 // dangerous-tool-use beta and a `safeguards` field, answered by
-// `safeguard_results` in the reply. Anthropic's own API (and a relay in front
-// of it) gets them through passthrough as they were sent and hands the
-// reply back as it came. Any other model neither sees them nor answers
-// them, and Claude Code, finding no result in a whole reply, classifies
-// locally for the rest of the session. magpie says nothing on the API's
-// behalf.
+// `safeguard_results` in the reply: a whole reply's own, a stream's in its
+// message_delta. Anthropic's own API (and a relay in front of it) gets them
+// as they were sent, relayed or built (buildAnthropic), and the results
+// come back as it gave them, on a stream made of a whole reply too
+// (anthropicWholeEvents). Any other model neither sees them nor answers
+// them (serverReview), and Claude Code, finding no result, classifies
+// locally for the rest of the session, naming the gateway in a notice.
+// magpie says nothing on the API's behalf. Where no model Claude Code can
+// reach through magpie is reviewed (AutoModeReviewed), the agent's wiring
+// turns the review off in Claude Code's settings instead
+// (CLAUDE_CODE_AUTO_MODE_SERVER=0, as Anthropic's page on the notice says to
+// for a gateway that can't run the checks), so it classifies locally from
+// the start and says nothing about the gateway (1EFLOPS on X). Where one
+// is, it is left on: /model can take the same session to that model,
+// which reviews it.
 //
 // Locally, the classifier is a request of its own on the session's model:
 // the transcript in <transcript> blocks, a system prompt asking for
@@ -25,6 +35,48 @@ import (
 // first stage 64 tokens to answer in (stopping at </block>). A model that
 // reasons whatever it is told spends those 64 tokens reasoning and answers
 // nothing, which Claude Code reads as no verdict and blocks the action.
+
+// serverReviewBeta begins the beta Claude Code asks the review by
+// (dangerous-tool-use-2026-09-03).
+const serverReviewBeta = "dangerous-tool-use-"
+
+func isServerReviewBeta(b string) bool { return strings.HasPrefix(b, serverReviewBeta) }
+
+// serverReview fits auto mode's review to what a request to an Anthropic
+// endpoint reaches: the betas asked, fitted to p (betas), and the body.
+// Only Claude reviews actions, so a body naming another vendor's model
+// (DeepSeek's, Kimi's, behind their Anthropic APIs) goes without the beta
+// and the safeguards: a vendor that checks the fields it is sent turns the
+// whole request away over them. Neither does a body p is no longer asked
+// the beta for, having turned it away (Bedrock's "Unexpected value(s)"):
+// the safeguards ask for a review that the beta turns on. A body that names
+// no model (the model in Bedrock's path), or goes to Anthropic's own API,
+// is Claude's.
+func (s *Server) serverReview(p provider.Provider, asked []string, body []byte) ([]string, []byte) {
+	model := gjson.GetBytes(body, "model").String()
+	claude := model == "" || AutoModeReviewed(p, model)
+	if !claude {
+		asked = slices.DeleteFunc(slices.Clone(asked), isServerReviewBeta)
+	}
+	betas := s.betas(p, asked)
+	if !claude || slices.ContainsFunc(asked, isServerReviewBeta) && !slices.ContainsFunc(betas, isServerReviewBeta) {
+		if gjson.GetBytes(body, "safeguards").Exists() {
+			body = withoutFields(body, "safeguards")
+		}
+	}
+	return betas, body
+}
+
+// AutoModeReviewed reports whether a request for model on p can have its
+// actions reviewed by Anthropic for Claude Code's auto mode: the Claude
+// subscription (the bridge hands the review to Claude Code's own binary),
+// a Claude model (Anthropic's API, a relay in front of it, Bedrock's or
+// Vertex's names for it), or anything on Anthropic's own API. No other
+// vendor runs Anthropic's classifier, and magpie answers none on its
+// behalf.
+func AutoModeReviewed(p provider.Provider, model string) bool {
+	return p.Account != nil && p.Account.Agent == "claude" || anthropicModel.MatchString(model) || provider.HostOf(p.Base(provider.Anthropic)) == "api.anthropic.com"
+}
 
 // classifierRoom is what a model that reasons is given on top of the
 // classifier's own budget, as Claude Code gives a Claude model that can't

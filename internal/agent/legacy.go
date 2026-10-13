@@ -7,7 +7,6 @@ import (
 	"strings"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
-	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
@@ -56,7 +55,7 @@ func RenameLegacy() {
 			os.Remove(filepath.Join(a.Dir, legacyID+"-models.json"))
 		case "claude":
 			if t, _ := edit.GetJSON(a.Path, "env.ANTHROPIC_AUTH_TOKEN"); t == legacyID {
-				_ = edit.SetJSON(a.Path, edit.KV{Path: "env.ANTHROPIC_AUTH_TOKEN", Value: gateway.Token})
+				_ = edit.SetJSON(a.Path, edit.KV{Path: "env.ANTHROPIC_AUTH_TOKEN", Value: hereKey()})
 			}
 		}
 	}

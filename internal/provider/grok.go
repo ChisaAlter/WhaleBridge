@@ -24,13 +24,16 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -190,8 +193,17 @@ func grokSigned(acct *Account, home string) {
 			return err
 		}
 		grokHeaders(req, c.Key)
-		if m := bodyModel(body); m != "" {
+		if m, window := grokWindowed(bodyModel(body)); m != "" {
 			req.Header.Set("x-grok-model-override", m)
+			if window > 0 {
+				// grok-4.7@500k goes as grok-4.7 at that window, as the
+				// CLI's /context-window 500k sends it
+				req.Header.Set("x-grok-context-window", strconv.Itoa(window))
+				nb := withModel(body, m)
+				req.Body = io.NopCloser(bytes.NewReader(nb))
+				req.ContentLength = int64(len(nb))
+				req.GetBody = func() (io.ReadCloser, error) { return io.NopCloser(bytes.NewReader(nb)), nil }
+			}
 		}
 		var v struct {
 			Key string `json:"prompt_cache_key"`
@@ -223,9 +235,12 @@ var grokTools = map[string]bool{"function": true, "web_search": true, "x_search"
 // A tool_choice with no tools
 // left goes too: the backend turns the request away over it ("A
 // tool_choice was set on the request but no tools were specified"), as it
-// would Codex's compaction summary, sent without tools (#378).
+// would Codex's compaction summary, sent without tools (#378). A Codex
+// agent_message (a subagent's task, or its reply in the lead's history),
+// which the backend turns away with 422 "unknown item type", goes as the
+// user's message, its sender and recipient said first (grokAgentMessage).
 func grokBody(body []byte) []byte {
-	if !bytes.Contains(body, []byte(`"tools"`)) && !bytes.Contains(body, []byte(`"reasoning"`)) && !bytes.Contains(body, []byte(`"tool_choice"`)) && !bytes.Contains(body, []byte(`"namespace"`)) {
+	if !bytes.Contains(body, []byte(`"tools"`)) && !bytes.Contains(body, []byte(`"reasoning"`)) && !bytes.Contains(body, []byte(`"tool_choice"`)) && !bytes.Contains(body, []byte(`"namespace"`)) && !bytes.Contains(body, []byte(`"agent_message"`)) {
 		return body
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
@@ -279,7 +294,11 @@ func grokBody(body []byte) []byte {
 		}
 	}
 	input, _ := m["input"].([]any)
-	for _, it := range input {
+	for i, it := range input {
+		if msg, ok := grokAgentMessage(it); ok {
+			input[i], it = msg, msg
+			dirty = true
+		}
 		if im, ok := it.(map[string]any); ok && flatCall(im) {
 			dirty = true
 		}
@@ -298,6 +317,57 @@ func grokBody(body []byte) []byte {
 		return body
 	}
 	return b
+}
+
+// grokAgentMessage is a plain Codex agent_message as the user's message
+// Grok's backend takes: "From <author> to <recipient>" first, then its text
+// and images as they came, in its place among the input. One sealed
+// (encrypted_content on it or on a part), empty, or with a part of another
+// kind is left as it is: magpie reads no sealed task, and the gateway's
+// guard for one (hasSealedAgentMessage) still sees it. The plugin does the
+// same (@magpie-community/opencode-grok-auth 0.1.11, plugins#61).
+func grokAgentMessage(it any) (map[string]any, bool) {
+	im, ok := it.(map[string]any)
+	if !ok || im["type"] != "agent_message" {
+		return nil, false
+	}
+	if _, sealed := im["encrypted_content"]; sealed {
+		return nil, false
+	}
+	parts, _ := im["content"].([]any)
+	if len(parts) == 0 {
+		return nil, false
+	}
+	for _, p := range parts {
+		pm, ok := p.(map[string]any)
+		if !ok {
+			return nil, false
+		}
+		if _, sealed := pm["encrypted_content"]; sealed {
+			return nil, false
+		}
+		_, isText := pm["text"].(string)
+		_, isURL := pm["image_url"].(string)
+		if !(pm["type"] == "input_text" && isText || pm["type"] == "input_image" && isURL) {
+			return nil, false
+		}
+	}
+	from, _ := im["author"].(string)
+	to, _ := im["recipient"].(string)
+	header := ""
+	switch {
+	case from != "" && to != "":
+		header = "From " + from + " to " + to
+	case from != "":
+		header = "From " + from
+	case to != "":
+		header = "To " + to
+	}
+	content := parts
+	if header != "" {
+		content = append([]any{map[string]any{"type": "input_text", "text": header + "\n\n"}}, parts...)
+	}
+	return map[string]any{"type": "message", "role": "user", "content": content}, true
 }
 
 // liteNamespace is the namespace Codex's Responses Lite groups its own
@@ -352,9 +422,18 @@ func objectRoot(fn map[string]any) bool {
 // oneOf, allOf, or anyOf at the top level", #646). allOf's branches are
 // all merged, properties and required alike. Of anyOf's and oneOf's object
 // branches the properties are merged, a field each of them requires stays
-// required, and the other branches go. It reports whether it changed
-// anything.
+// required, and the other branches go. A branch that is a union itself, as
+// zod writes a discriminated union inside another (Codex desktop's
+// automation_update, #1271), is folded the same way first, so its fields
+// are kept; a field the branches give different schemas takes any of them.
+// It reports whether it changed anything.
 func ObjectRoot(ps map[string]any) bool {
+	return objectRootIn(ps, ps, 0)
+}
+
+// objectRootIn is ObjectRoot on ps, a schema whose local $refs name root's
+// $defs; depth bounds how far unions inside unions are followed.
+func objectRootIn(root, ps map[string]any, depth int) bool {
 	_, any1 := ps["anyOf"]
 	_, one := ps["oneOf"]
 	_, all := ps["allOf"]
@@ -372,7 +451,7 @@ func ObjectRoot(ps map[string]any) bool {
 	list, _ := ps["allOf"].([]any)
 	for _, b := range list {
 		bm, _ := b.(map[string]any)
-		if bm = grokRef(ps, bm); bm == nil {
+		if bm = grokRef(root, bm); bm == nil {
 			continue
 		}
 		bp, _ := bm["properties"].(map[string]any)
@@ -390,8 +469,13 @@ func ObjectRoot(ps map[string]any) bool {
 		list, _ := ps[k].([]any)
 		for _, b := range list {
 			bm, _ := b.(map[string]any)
-			if bm = grokRef(ps, bm); bm == nil {
+			if bm = grokRef(root, bm); bm == nil {
 				continue
+			}
+			if nestedUnion(bm) && depth < 8 {
+				// folded on a copy: the branch may be a $def others name
+				bm = maps.Clone(bm)
+				objectRootIn(root, bm, depth+1)
 			}
 			if _, has := bm["properties"]; bm["type"] != "object" && !has {
 				continue
@@ -400,30 +484,59 @@ func ObjectRoot(ps map[string]any) bool {
 		}
 		delete(ps, k)
 	}
+	// a field every branch requires stays required, beside the root's and
+	// allOf's own, which no branch can drop
+	var common []any
+	// the schemas the branches give a field the root doesn't define
+	from := map[string][]any{}
+	var order []string
 	for i, b := range branches {
 		bp, _ := b["properties"].(map[string]any)
-		for k, v := range bp {
-			if _, ok := props[k]; !ok {
-				props[k] = v
+		for _, k := range slices.Sorted(maps.Keys(bp)) {
+			if _, own := props[k]; own {
+				continue
 			}
+			if _, seen := from[k]; !seen {
+				order = append(order, k)
+			}
+			from[k] = appendDistinct(from[k], bp[k])
 		}
 		br, _ := b["required"].([]any)
 		if i == 0 {
-			required = append(required, br...)
+			common = append(common, br...)
 			continue
 		}
 		in := map[any]bool{}
 		for _, r := range br {
 			in[r] = true
 		}
-		kept := required[:0]
-		for _, r := range required {
+		kept := common[:0]
+		for _, r := range common {
 			if in[r] {
 				kept = append(kept, r)
 			}
 		}
-		required = kept
+		common = kept
 	}
+	for _, k := range order {
+		if vs := from[k]; len(vs) == 1 {
+			props[k] = vs[0]
+		} else {
+			props[k] = map[string]any{"anyOf": vs}
+		}
+	}
+	seen := map[string]bool{}
+	var merged []any
+	for _, r := range append(required, common...) {
+		if name, ok := r.(string); ok {
+			if seen[name] {
+				continue
+			}
+			seen[name] = true
+		}
+		merged = append(merged, r)
+	}
+	required = merged
 	ps["type"] = "object"
 	ps["properties"] = props
 	if len(required) > 0 {
@@ -432,6 +545,27 @@ func ObjectRoot(ps map[string]any) bool {
 		delete(ps, "required")
 	}
 	return true
+}
+
+// nestedUnion reports whether a branch of a union is a union itself.
+func nestedUnion(b map[string]any) bool {
+	for _, k := range []string{"anyOf", "oneOf", "allOf"} {
+		if _, ok := b[k]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+// appendDistinct adds v to vs unless one there is the same schema.
+func appendDistinct(vs []any, v any) []any {
+	vb, _ := json.Marshal(v)
+	for _, w := range vs {
+		if wb, _ := json.Marshal(w); bytes.Equal(vb, wb) {
+			return vs
+		}
+	}
+	return append(vs, v)
 }
 
 // grokRef is a branch of a schema, or what its local $ref names in the
@@ -551,6 +685,7 @@ func parseGrokModels(b []byte) []catalog.Model {
 			ID      string `json:"id"`
 			Name    string `json:"name"`
 			Context int    `json:"context_window"`
+			Windows []int  `json:"context_windows"`
 			Backend string `json:"api_backend"`
 			Efforts []struct {
 				Value string `json:"value"`
@@ -575,9 +710,71 @@ func parseGrokModels(b []byte) []catalog.Model {
 				m.Efforts = append(m.Efforts, e)
 			}
 		}
-		ms = append(ms, m)
+		ms = append(ms, grokContextModels(m, d.Windows)...)
 	}
 	return ms
+}
+
+// grokContextModels is one model for each context window Grok lists it at
+// (#1608). context_window is the default and keeps the plain id
+// (grok-4.7), so a saved agent stays where it was; each other size in
+// context_windows is offered beside it (grok-4.7@500k), the way the CLI's
+// /context-window offers it, and asked for with x-grok-context-window
+// (grokWindowed). The same as the grok plugin's windowsOf (plugins#83).
+func grokContextModels(m catalog.Model, listed []int) []catalog.Model {
+	var windows []int
+	for _, w := range listed {
+		if w > 0 && !slices.Contains(windows, w) {
+			windows = append(windows, w)
+		}
+	}
+	if len(windows) == 0 {
+		return []catalog.Model{m}
+	}
+	if !slices.Contains(windows, m.Context) {
+		m.Context = windows[0]
+	}
+	out := []catalog.Model{m}
+	for _, w := range windows {
+		if w == m.Context {
+			continue
+		}
+		at := grokWindowLabel(w)
+		o := m
+		o.ID, o.Name, o.Context = m.ID+"@"+at, m.Name+" @ "+at, w
+		o.Efforts = slices.Clone(m.Efforts)
+		o.APIs = slices.Clone(m.APIs)
+		out = append(out, o)
+	}
+	return out
+}
+
+// grokWindowLabel is a window as an id names it: 500000 is "500k".
+func grokWindowLabel(n int) string {
+	if n%1000 == 0 {
+		return strconv.Itoa(n/1000) + "k"
+	}
+	return strconv.Itoa(n)
+}
+
+// grokWindowed splits a requested id into the model Grok lists and the
+// window the id names: grok-4.7 is grok-4.7 at its default window (0, no
+// header), grok-4.7@500k is grok-4.7 at 500000 tokens. A size no multiple
+// of 1000 is the window itself, as grokWindowLabel writes it (131072).
+func grokWindowed(id string) (string, int) {
+	model, size, ok := strings.Cut(id, "@")
+	if !ok {
+		return id, 0
+	}
+	k, isK := strings.CutSuffix(size, "k")
+	n, err := strconv.Atoi(k)
+	if err != nil || n <= 0 || model == "" {
+		return id, 0
+	}
+	if isK {
+		n *= 1000
+	}
+	return model, n
 }
 
 // grokRefreshMargin is how close to its expiry a borrowed token has the CLI
@@ -685,7 +882,7 @@ func withProxy(cmd *exec.Cmd) *exec.Cmd {
 func runCLISignIn(s *signInFlow, what string, env []string, using bool, failed func(), identity func() (user, plan string, ok bool), whole func(link string) bool, path string, args ...string) error {
 	cmd := proc.Command(path, args...)
 	cmd.Dir, _ = os.UserHomeDir()
-	cmd.Env = netproxy.Env(env)
+	cmd.Env = netproxy.EnvWith(s.proxy, env)
 	out, err := cmd.StdoutPipe()
 	if err != nil {
 		return err

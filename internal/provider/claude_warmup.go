@@ -44,15 +44,10 @@ func warmClaudeLogin(send func(ctx context.Context, configDir string) error) fun
 		if i < 0 {
 			return fmt.Errorf("no Claude account %q", user)
 		}
-		dir := ""
 		if !ls[i].Active {
-			d, err := claudeSavedDir(ls[i].User)
-			if err != nil {
-				return err
-			}
-			dir = d
+			return inSavedClaudeDir(ls[i].User, func(dir string) error { return send(ctx, dir) })
 		}
-		return send(ctx, dir)
+		return send(ctx, "")
 	}
 }
 
@@ -84,5 +79,5 @@ func ClaudeWarmed() map[string]time.Time { return codexWarmedIn(claudeWarmPath()
 func KeepClaudeWindowsWarm(ctx context.Context, send func(ctx context.Context, configDir string) error) {
 	w := codexWarmer{path: claudeWarmPath(), now: time.Now, usage: claudeWarmUsage, send: warmClaudeLogin(send),
 		expect: claudeWindowsExpected, warmed: claudeWarmedNow}
-	keepWarm(ctx, "claude", w, func() (string, string) { s := settings.Load(); return s.ClaudeWarmup, s.ClaudeWarmAt })
+	keepWarm(ctx, "claude", w, func() (string, []string) { s := settings.Load(); return s.ClaudeWarmup, s.ClaudeWarmAts })
 }

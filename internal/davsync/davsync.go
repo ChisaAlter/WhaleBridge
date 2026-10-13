@@ -1,5 +1,5 @@
 // Package davsync keeps magpie's setup the same on every computer through
-// a WebDAV folder or an S3-compatible bucket. What goes there is a backup (see internal/backup),
+// a WebDAV folder, an S3-compatible bucket or a GitHub repository. What goes there is a backup (see internal/backup),
 // sealed with a passphrase before it leaves the computer, so the server
 // only ever holds a file it can't read.
 //
@@ -34,10 +34,14 @@ import (
 
 	"github.com/ChisaAlter/WhaleBridge/internal/backup"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
+	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 	"github.com/ChisaAlter/WhaleBridge/internal/usage"
 )
+
+// addPlugins is backup.AddPlugins: a var so a test installs nothing.
+var addPlugins = backup.AddPlugins
 
 // Every is how often the gateway's magpie syncs.
 const Every = 3 * time.Minute
@@ -48,7 +52,9 @@ var Parts = []string{"providers", "settings"}
 // Config is the sync's setup, kept in sync.json beside magpie's other
 // files, readable by the user alone, as provider keys are. An s3://bucket/prefix
 // address is an S3-compatible bucket, User its access key ID and Password
-// the secret, kept as a WebDAV password is.
+// the secret, kept as a WebDAV password is. For github://owner/repo/prefix,
+// Password is the repository's Contents token, independent of GitHubToken
+// in settings (the library's).
 type Config struct {
 	URL        string `json:"url"`
 	User       string `json:"user,omitempty"`
@@ -59,18 +65,21 @@ type Config struct {
 	Endpoint  string `json:"endpoint,omitempty"`
 	Region    string `json:"region,omitempty"`
 	PathStyle bool   `json:"pathStyle,omitempty"`
-	Keys      bool   `json:"keys"`   // providers carry their API keys
-	Agents    bool   `json:"agents"` // the agents' models go too
+	// GitHub alone: an empty branch uses the repository's default branch.
+	Branch string `json:"branch,omitempty"`
+	Keys   bool   `json:"keys"`   // providers carry their API keys
+	Agents bool   `json:"agents"` // the agents' models go too
 	// Library is whether the library goes too; nil, as in a setup made
 	// before it could, is yes
 	Library *bool `json:"library,omitempty"`
 	// Usage is whether this computer shares its usage with the others
 	// syncing to the server, and sees theirs (#542)
 	Usage bool `json:"usage,omitempty"`
-	// Other is the other kind's server, kept when sync moved from it (a
-	// WebDAV folder's while an S3 bucket is synced to, or the other way):
-	// moving back finds it as it was, its password too. Nothing syncs to it.
+	// Other is the most recently left server, retained for older clients.
+	// Servers holds every inactive kind. Nothing syncs to them.
 	Other *Server `json:"other,omitempty"`
+	// Servers keeps every inactive kind, including Other for older clients.
+	Servers map[string]Server `json:"servers,omitempty"`
 	// AutoEvery is how many minutes apart the gateway's magpie syncs by
 	// itself: 0 is Every's 3, Manual never — then only Sync now syncs
 	// (#847). Set by SetAuto alone; Configure keeps it.
@@ -103,21 +112,37 @@ type Server struct {
 	Endpoint  string `json:"endpoint,omitempty"`
 	Region    string `json:"region,omitempty"`
 	PathStyle bool   `json:"pathStyle,omitempty"`
+	Branch    string `json:"branch,omitempty"`
 }
 
 func (c Config) where() Server {
-	return Server{URL: c.URL, User: c.User, Password: c.Password, Endpoint: c.Endpoint, Region: c.Region, PathStyle: c.PathStyle}
+	return Server{URL: c.URL, User: c.User, Password: c.Password, Endpoint: c.Endpoint, Region: c.Region, PathStyle: c.PathStyle, Branch: c.Branch}
 }
 
 func (s Server) config() Config {
-	return Config{URL: s.URL, User: s.User, Password: s.Password, Endpoint: s.Endpoint, Region: s.Region, PathStyle: s.PathStyle}
+	return Config{URL: s.URL, User: s.User, Password: s.Password, Endpoint: s.Endpoint, Region: s.Region, PathStyle: s.PathStyle, Branch: s.Branch}
+}
+
+// Kept is an inactive server, including setups saved before Servers existed.
+func (c Config) Kept(kind string) (Server, bool) {
+	kind = strings.ToLower(kind)
+	if s, ok := c.Servers[kind]; ok {
+		return s, true
+	}
+	if c.Other != nil && strings.EqualFold(c.Other.config().Kind(), kind) {
+		return *c.Other, true
+	}
+	return Server{}, false
 }
 
 // saved is the setup whose password c may keep: old, or, for c of the
 // other kind, the server of c's kind kept beside it, when there is one.
 func (old Config) saved(c Config) Config {
-	if o := old.Other; o != nil && old.S3() != c.S3() && o.config().S3() == c.S3() {
-		return o.config()
+	if old.Kind() != c.Kind() {
+		if s, ok := old.Kept(c.Kind()); ok {
+			return s.config()
+		}
+		return Config{}
 	}
 	return old
 }
@@ -129,8 +154,16 @@ func (c Config) S3() bool {
 	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(c.URL)), "s3://")
 }
 
-// Kind is the server's kind, as the user reads it: "WebDAV" or "S3".
+// GitHub is whether c keeps the file in a GitHub repository.
+func (c Config) GitHub() bool {
+	return strings.HasPrefix(strings.ToLower(strings.TrimSpace(c.URL)), "github://")
+}
+
+// Kind is the server's kind, as the user reads it.
 func (c Config) Kind() string {
+	if c.GitHub() {
+		return "GitHub"
+	}
 	if c.S3() {
 		return "S3"
 	}
@@ -166,6 +199,28 @@ type state struct {
 	// Undo is the file the last Restore kept this computer's setup in, from
 	// just before it: Undo brings it back
 	Undo string `json:"undo,omitempty"`
+	// File is what the server held where the backup should be, when the
+	// last sync couldn't read it as one
+	File *ServerFile `json:"file,omitempty"`
+	// Blind is the last write, when the server didn't check the version
+	// it went over (version.Blind), until a sync reads it back
+	Blind *blind `json:"blind,omitempty"`
+}
+
+// blind is a write the server didn't check: the file it wrote (Sum), and
+// the parts on the server and here as they were before it, by hash. When
+// the next sync finds another file, another computer's write may have
+// gone over this one in the moment between the HEAD and the PUT, both
+// told they wrote (#1776); that sync merges from before this write, so
+// what this computer changed counts as changed here again and goes back
+// up beside the other's, where taking the other's file as having seen
+// this one's would bring the old parts in over this computer's changes.
+// Remote and Local are nil for a write to an empty server: the next sync
+// is then a first one, as it would have been.
+type blind struct {
+	Sum    string            `json:"sum"`
+	Remote map[string]string `json:"remote,omitempty"`
+	Local  map[string]string `json:"local,omitempty"`
 }
 
 func path(name string) string { return filepath.Join(settings.Dir(), name) }
@@ -185,10 +240,18 @@ func Load() (Config, bool) {
 // and user: it is never sent to another, and is asked for again there.
 func Configure(c Config) error {
 	c.Other = nil // kept here, never given
+	c.Servers = nil
 	c.URL, c.User = strings.TrimSpace(c.URL), strings.TrimSpace(c.User)
 	c.Endpoint, c.Region = strings.TrimSpace(c.Endpoint), strings.TrimSpace(c.Region)
+	c.Branch = strings.TrimSpace(c.Branch)
 	if !c.S3() { // WebDAV's own: nothing of an S3 setup left behind
 		c.Endpoint, c.Region, c.PathStyle = "", "", false
+	}
+	if !c.GitHub() {
+		c.Branch = ""
+	} else {
+		c.User = ""
+		c.Password = strings.TrimSpace(c.Password)
 	}
 	if err := Check(c); err != nil {
 		return err
@@ -205,6 +268,9 @@ func Configure(c Config) error {
 				c.Password = old.saved(c).Password
 			}
 			if needed {
+				if c.GitHub() {
+					return errors.New("type a GitHub token for this repository: the saved token is only used with the repository it was given for")
+				}
 				if c.S3() {
 					return fmt.Errorf("type the secret for the access key %s on %s: the one saved is only used with the server and key it was given for", c.User, c.server())
 				}
@@ -220,11 +286,23 @@ func Configure(c Config) error {
 			// the other kind's server is kept: the one moved from, or the
 			// one kept before
 			c.Other = old.Other
+			c.Servers = maps.Clone(old.Servers)
+			if c.Servers == nil {
+				c.Servers = map[string]Server{}
+			}
+			if old.Other != nil {
+				c.Servers[strings.ToLower(old.Other.config().Kind())] = *old.Other
+			}
 			c.AutoEvery = old.AutoEvery // SetAuto's, not the form's
-			if old.S3() != c.S3() {
+			if old.Kind() != c.Kind() {
 				o := old.where()
 				c.Other = &o
+				c.Servers[strings.ToLower(old.Kind())] = o
 			}
+			delete(c.Servers, strings.ToLower(c.Kind()))
+		}
+		if c.GitHub() && c.Password == "" {
+			return errors.New("GitHub sync needs a token with Contents read and write permission for the repository")
 		}
 		if c.S3() && c.Password == "" {
 			return fmt.Errorf("type the secret for the access key %s", c.User)
@@ -233,6 +311,9 @@ func Configure(c Config) error {
 			return errors.New("sync needs a passphrase: the file is sealed with it before it leaves this computer")
 		}
 		if c.Password != "" && c.Passphrase == c.Password {
+			if c.GitHub() {
+				return errors.New("the passphrase is the GitHub token: GitHub receives it, and could open the file with it. Pick a passphrase of its own")
+			}
 			// the server is sent the password (an S3 server holds the
 			// secret): with it, it could open the file
 			if c.S3() {
@@ -305,6 +386,11 @@ func SavedPassword(c Config) (kept, needed bool) {
 // sameAccount is whether c and o are one user on one server: the password
 // given for one is only ever sent to the other when they are.
 func (c Config) sameAccount(o Config) bool {
+	if c.GitHub() || o.GitHub() {
+		a, ea := newGitHub(c)
+		b, eb := newGitHub(o)
+		return c.GitHub() && o.GitHub() && ea == nil && eb == nil && strings.EqualFold(a.repo, b.repo)
+	}
 	if c.S3() || o.S3() { // one access key at one endpoint, whatever the bucket
 		return c.S3() && o.S3() && strings.TrimSpace(c.User) == strings.TrimSpace(o.User) &&
 			strings.EqualFold(s3Endpoint(c.Endpoint, ""), s3Endpoint(o.Endpoint, ""))
@@ -354,10 +440,11 @@ type View struct {
 	PassphraseSet bool   `json:"passphraseSet,omitempty"`
 	Keys          bool   `json:"keys"`
 	Agents        bool   `json:"agents"`
-	Kind          string `json:"kind,omitempty"` // "webdav" or "s3", when on
+	Kind          string `json:"kind,omitempty"` // "webdav", "s3" or "github", when on
 	Endpoint      string `json:"endpoint,omitempty"`
 	Region        string `json:"region,omitempty"`
 	PathStyle     bool   `json:"pathStyle,omitempty"`
+	Branch        string `json:"branch,omitempty"`
 	Library       bool   `json:"library"`
 	Usage         bool   `json:"usage,omitempty"`
 	// UsageError is why usage couldn't be shared the last time it was tried
@@ -367,47 +454,71 @@ type View struct {
 	Notice     *Notice   `json:"notice,omitempty"`
 	// Other is the other kind's server, kept for moving back to: not
 	// synced to
-	Other *OtherView `json:"other,omitempty"`
+	Other   *OtherView           `json:"other,omitempty"`
+	Servers map[string]OtherView `json:"servers,omitempty"`
 	// Auto is how many minutes apart it syncs by itself; 0 never: only when
 	// asked
 	Auto int `json:"auto"`
 	// Undo is whether the last Restore can be undone
 	Undo bool `json:"undo,omitempty"`
+	// File is what the server holds instead of a backup, when Error is
+	// that it isn't one; File.Replace offers Upload
+	File *ServerFile `json:"serverFile,omitempty"`
+	// SignIn is the subscriptions whose settings sync brought with no
+	// account here: sync carries no sign-in, so each is to be signed in to
+	// on this computer before it is listed
+	SignIn []string `json:"signIn,omitempty"`
 }
 
 // OtherView is the other kind's server as the Settings page shows it.
 type OtherView struct {
-	Kind        string `json:"kind"` // "webdav" or "s3"
+	Kind        string `json:"kind"` // "webdav", "s3" or "github"
 	URL         string `json:"url"`
 	User        string `json:"user,omitempty"`
 	PasswordSet bool   `json:"passwordSet,omitempty"`
 	Endpoint    string `json:"endpoint,omitempty"`
 	Region      string `json:"region,omitempty"`
 	PathStyle   bool   `json:"pathStyle,omitempty"`
+	Branch      string `json:"branch,omitempty"`
 }
 
 // Status is sync's setup and how the last sync went.
 func Status() View {
 	c, ok := Load()
 	if !ok {
-		return View{Keys: true, Agents: true, Library: true}
+		return View{Keys: true}
 	}
 	st := loadState()
 	v := View{On: true, URL: c.URL, User: c.User, PasswordSet: c.Password != "", PassphraseSet: c.Passphrase != "",
-		Keys: c.Keys, Agents: c.Agents, Library: c.library(), Error: st.Error, Notice: st.Notice,
-		Kind: strings.ToLower(c.Kind()), Endpoint: c.Endpoint, Region: c.Region, PathStyle: c.PathStyle,
+		Keys: c.Keys, Agents: false, Library: false, Error: st.Error, Notice: st.Notice,
+		Kind: strings.ToLower(c.Kind()), Endpoint: c.Endpoint, Region: c.Region, PathStyle: c.PathStyle, Branch: c.Branch,
 		Auto: int(c.auto() / time.Minute)}
 	if st.Key == stateKey(c) {
 		v.Last = st.Last
 		v.Undo = st.Undo != "" && isFile(st.Undo)
+		if st.Error != "" {
+			v.File = st.File
+		}
 		if c.Usage && st.Usage != nil {
 			v.UsageError = st.Usage.Error
+		}
+		if !st.Last.IsZero() {
+			if ps, err := provider.Stored(); err == nil {
+				v.SignIn = provider.NotSignedIn(ps)
+			}
 		}
 	}
 	v.Usage = c.Usage
 	if o := c.Other; o != nil {
 		v.Other = &OtherView{Kind: strings.ToLower(o.config().Kind()), URL: o.URL, User: o.User, PasswordSet: o.Password != "",
-			Endpoint: o.Endpoint, Region: o.Region, PathStyle: o.PathStyle}
+			Endpoint: o.Endpoint, Region: o.Region, PathStyle: o.PathStyle, Branch: o.Branch}
+	}
+	for kind, s := range c.Servers {
+		if v.Servers == nil {
+			v.Servers = map[string]OtherView{}
+		}
+		v.Servers[kind] = OtherView{Kind: kind, URL: s.URL, User: s.User, PasswordSet: s.Password != "",
+			Endpoint: s.Endpoint, Region: s.Region, PathStyle: s.PathStyle, Branch: s.Branch}
 	}
 	return v
 }
@@ -440,6 +551,9 @@ func stateKey(c Config) string {
 	k := c.URL
 	if c.Endpoint != "" {
 		k += "\x00" + c.Endpoint
+	}
+	if c.GitHub() {
+		k += "\x00" + c.Branch
 	}
 	return sum([]byte(k + "\x00" + c.User + "\x00" + c.Passphrase))
 }
@@ -476,21 +590,27 @@ func cached(want string) []byte {
 // that always answers the same unreadable way) would otherwise pile up a
 // copy each time. The name is sorted by time, so the oldest are the first
 // to go.
-func keepDamaged(data []byte) {
+func keepDamaged(data []byte) { keepAside(data, "server-damaged", 3) }
+
+// keepAside writes data under the sync folder as <time>-<tag>, keeping the
+// newest n so tagged.
+func keepAside(data []byte, tag string, n int) error {
 	dir := path("sync")
-	if os.MkdirAll(dir, 0o700) != nil {
-		return
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return err
 	}
-	name := filepath.Join(dir, time.Now().Format("2006-01-02-150405")+"-server-damaged"+backup.Ext)
-	if edit.WriteAtomic(name, data) != nil {
-		return
+	name := filepath.Join(dir, time.Now().Format("2006-01-02-150405")+"-"+tag+backup.Ext)
+	if err := edit.WriteAtomic(name, data); err != nil {
+		return err
 	}
-	old, _ := filepath.Glob(filepath.Join(dir, "*-server-damaged"+backup.Ext))
+	os.Chmod(name, 0o600)
+	old, _ := filepath.Glob(filepath.Join(dir, "*-"+tag+backup.Ext))
 	slices.Sort(old) // names begin with the time, so oldest first
-	for len(old) > 3 {
+	for len(old) > n {
 		os.Remove(old[0])
 		old = old[1:]
 	}
+	return nil
 }
 
 func sum(b []byte) string {
@@ -536,7 +656,20 @@ func syncNow(ctx context.Context, force bool) error {
 	if errors.Is(err, errChanged) { // another computer got in between: again, over its version
 		err = syncOnce(ctx, c, &st)
 	}
-	st.Error = ""
+	// A server without conditional writes cannot confirm that our merge stayed
+	// there. Read it back now, using the pre-write baselines kept in Blind, so
+	// a competing write is merged during this sync instead of the next tick.
+	if err == nil && st.Blind != nil {
+		err = syncOnce(ctx, c, &st)
+		if errors.Is(err, errChanged) {
+			err = syncOnce(ctx, c, &st)
+		}
+	}
+	st.Error, st.File = "", nil
+	var nb *notBackup
+	if errors.As(err, &nb) {
+		st.File = &nb.f
+	}
 	if err != nil {
 		st.Error = err.Error()
 	} else {
@@ -635,6 +768,10 @@ func collect(c Config) (backup.Bundle, error) {
 		s := settings.Load()
 		b.Settings = &s
 	}
+	// Fonts belong to each application. New remote bundles carry none;
+	// take keeps existing remote font fields opaque on later merges.
+	b.Settings.UIFont, b.Settings.CodeFont = nil, nil
+	backup.KeepOtherAgentSettings(b.Settings, settings.Settings{})
 	if !c.Agents {
 		b.Agents = nil
 	}
@@ -652,6 +789,7 @@ func hashes(b backup.Bundle) map[string]string {
 		s = *b.Settings
 	}
 	s.KeepOwn(settings.Settings{}) // this computer's own: never synced
+	backup.KeepOtherAgentSettings(&s, settings.Settings{})
 	settingsHash := h(s)
 	if b.GatewayKeys != nil { // a missing store keeps older bundles' hash
 		settingsHash = h([]any{s, *b.GatewayKeys})
@@ -665,6 +803,9 @@ func hashes(b backup.Bundle) map[string]string {
 	}
 	if len(b.GroupOrder) > 0 { // as before it, when never arranged
 		providers = append(providers, map[string][]string{"groupOrder": b.GroupOrder})
+	}
+	if b.Plugins != nil && len(*b.Plugins) > 0 { // as before them, without one
+		providers = append(providers, map[string][]plugin.Entry{"plugins": *b.Plugins})
 	}
 	return map[string]string{
 		"providers": h(providers),
@@ -704,18 +845,18 @@ func take(to *backup.Bundle, from backup.Bundle, part string) {
 	case "providers":
 		keys := from.Keys || (from.ProvidersKeys != nil && *from.ProvidersKeys)
 		ps := from.Providers
-		if !keys && (to.Keys || (to.ProvidersKeys != nil && *to.ProvidersKeys)) { // sent without keys: keep the ones the server has
-			keys := map[string]provider.Provider{}
+		if to.Keys || (to.ProvidersKeys != nil && *to.ProvidersKeys) {
+			// Keep the server's secrets the upload hasn't: all its keys when
+			// it was sent without, and an access key or balance token a
+			// keyed one from an older magpie doesn't know (#1821).
+			server := map[string]provider.Provider{}
 			for _, p := range to.Providers {
-				keys[p.ID] = p
+				server[p.ID] = p
 			}
 			ps = slices.Clone(ps)
 			for i, p := range ps {
-				if k, ok := keys[p.ID]; ok && p.Key == "" && len(p.Keys) == 0 {
-					ps[i].Key, ps[i].KeyName, ps[i].Keys, ps[i].KeyProtocol, ps[i].KeyWeight = k.Key, k.KeyName, k.Keys, k.KeyProtocol, k.KeyWeight
-					if p.BalanceToken == "" {
-						ps[i].BalanceToken = k.BalanceToken
-					}
+				if k, ok := server[p.ID]; ok {
+					ps[i] = provider.KeepSecrets(p, k, !keys && p.Key == "" && len(p.Keys) == 0)
 				}
 			}
 		}
@@ -734,6 +875,7 @@ func take(to *backup.Bundle, from backup.Bundle, part string) {
 			searches = &ss
 		}
 		to.Providers, to.Icons, to.Groups, to.Searches, to.Order, to.GroupOrder = ps, from.Icons, from.Groups, searches, from.Order, from.GroupOrder
+		to.Plugins = from.Plugins
 		to.ProvidersKeys = backup.Flag(keys || (to.ProvidersKeys != nil && *to.ProvidersKeys))
 		to.Keys = to.Keys || keys // the whole-bundle bit follows it, for a magpie that reads no per-part ones: it keeps the server's keys on its own upload then
 	case "settings":
@@ -746,6 +888,9 @@ func take(to *backup.Bundle, from backup.Bundle, part string) {
 			copy.UIFont, copy.CodeFont = nil, nil
 			if to.Settings != nil {
 				copy.UIFont, copy.CodeFont = to.Settings.UIFont, to.Settings.CodeFont
+				backup.KeepOtherAgentSettings(&copy, *to.Settings)
+			} else {
+				backup.KeepOtherAgentSettings(&copy, settings.Settings{})
 			}
 			s = &copy
 		}
@@ -810,6 +955,15 @@ func bring(b backup.Bundle, part string) error {
 		if err := provider.MirrorGroupOrder(b.GroupOrder); err != nil {
 			return err
 		}
+		// the plugins the providers come from, added here; never taken
+		// away, and one that can't be added is said, not a failed sync
+		if b.Plugins != nil {
+			if _, failed := addPlugins(*b.Plugins); len(failed) > 0 {
+				for spec, err := range failed {
+					log.Printf("sync: plugin %s: %s", spec, err)
+				}
+			}
+		}
 		if b.Searches == nil { // from a magpie before them: the ones here stay
 			return nil
 		}
@@ -834,6 +988,14 @@ func syncOnce(ctx context.Context, c Config, st *state) error {
 	if err != nil && !unchanged {
 		return err
 	}
+	// a blind write read back: the server still has it, or another
+	// computer's write went over it (blind)
+	if b := st.Blind; b != nil {
+		if !unchanged && sum(data) != b.Sum {
+			st.Remote, st.Local = b.Remote, b.Local
+		}
+		st.Blind = nil
+	}
 	local, err := collect(c)
 	if err != nil {
 		return err
@@ -853,7 +1015,9 @@ func syncOnce(ctx context.Context, c Config, st *state) error {
 	}
 	etag := ver.ETag
 	rebuilt := false // a damaged server file replaced by this computer's merge
-	push := func(b backup.Bundle, etag string) error {
+	// push writes b over etag; were, as the parts on the server and here
+	// were before it, is kept when the write is blind
+	push := func(b backup.Bundle, etag string, were blind) error {
 		b.Created, b.App = time.Now().UTC(), "magpie"
 		sealed, err := backup.Seal(b, c.Passphrase)
 		if err != nil {
@@ -864,11 +1028,15 @@ func syncOnce(ctx context.Context, c Config, st *state) error {
 			return err
 		}
 		st.Sum, st.Server, st.Remote = sum(sealed), v, hashes(b)
+		if v.Blind {
+			were.Sum = st.Sum
+			st.Blind = &were
+		}
 		remember(sealed)
 		return nil
 	}
 	if data == nil { // nothing there yet: this computer's setup is the first
-		if err := push(local, ""); err != nil {
+		if err := push(local, "", blind{}); err != nil {
 			return err
 		}
 		st.Local = L
@@ -906,7 +1074,7 @@ func syncOnce(ctx context.Context, c Config, st *state) error {
 		// still checked against the server and another computer's parts
 		// survive the way they would on any sync.
 		if !errors.Is(err, backup.ErrCorrupt) || st.Local == nil {
-			return err
+			return described(c, data, err)
 		}
 		good := cached(st.Sum) // the version this computer last read whole
 		// The damaged body must be that version cut short — a prefix of it,
@@ -926,7 +1094,7 @@ func syncOnce(ctx context.Context, c Config, st *state) error {
 		// smallest — and a relay cuts a real write deep into the data, well
 		// past "data", so legit rebuilds still go.
 		if good == nil || !bytes.HasPrefix(good, data) || len(data) <= bytes.Index(good, []byte(`"data"`)) {
-			return err
+			return described(c, data, err)
 		}
 		remote, err = backup.Open(good, c.Passphrase)
 		if err != nil {
@@ -1013,7 +1181,7 @@ func syncOnce(ctx context.Context, c Config, st *state) error {
 	// A rebuild always writes back: the server's file is the damaged one,
 	// so even a merge that matches the cached copy must replace it.
 	if rebuilt || !maps.Equal(M, R) {
-		if err := push(merged, etag); err != nil {
+		if err := push(merged, etag, blind{Remote: R, Local: pending}); err != nil {
 			return err
 		}
 	}

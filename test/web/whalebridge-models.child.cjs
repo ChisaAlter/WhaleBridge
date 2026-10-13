@@ -183,7 +183,7 @@ async function run() {
     assert.equal(groupWrites.at(-1).context,128000); assert.deepEqual(groupWrites.at(-1).levels,['high']);
     assert.equal(groupWrites.at(-1).classifier,'qa/long'); assert.equal(groupWrites.at(-1).effort,'auto');
     assert.equal(groupWrites.at(-1).affinity,'turn'); assert.equal(groupWrites.at(-1).sink,true);
-    assert.deepEqual(groupWrites.at(-1).rules,[{use:'qa/long:high',tokens:64000,effort:'',images:true,compact:false,intent:'代码调试',agents:[],time:null}]);
+    assert.deepEqual(groupWrites.at(-1).rules,[{use:'qa/long:high',tokens:64000,effort:'',images:true,compact:false,intent:'代码调试',agents:[],folders:[],exceptFolders:[],pause:false,time:null}]);
     // Saving closes the editor before its state reload completes. A click on
     // the still-disabled refresh button would not request the next fixture.
     await wait(`!document.querySelector('#refresh').disabled && document.querySelector('#content').getAttribute('aria-busy')==='false'`);

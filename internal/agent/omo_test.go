@@ -18,6 +18,7 @@ import (
 // Pi's ~/.pi is left alone; its own model takes magpie out again.
 func TestOmo(t *testing.T) {
 	home := syncHome(t)
+	t.Setenv("PATH", t.TempDir()) // no omo on PATH: only its folder tells (#1646)
 	var a *Agent
 	for _, x := range All() {
 		if x.ID == "omo" {

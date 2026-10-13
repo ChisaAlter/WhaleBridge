@@ -78,12 +78,30 @@ type gRequest struct {
 		ResponseMimeType   string          `json:"responseMimeType,omitempty"`
 		ResponseSchema     json.RawMessage `json:"responseSchema,omitempty"`
 		ResponseJSONSchema json.RawMessage `json:"responseJsonSchema,omitempty"`
-		ThinkingConfig     *struct {
-			ThinkingBudget  *int   `json:"thinkingBudget,omitempty"`
-			ThinkingLevel   string `json:"thinkingLevel,omitempty"`
-			IncludeThoughts bool   `json:"includeThoughts,omitempty"`
-		} `json:"thinkingConfig,omitempty"`
+		ThinkingConfig     *gThinking      `json:"thinkingConfig,omitempty"`
 	} `json:"generationConfig,omitempty"`
+}
+
+// gThinking is a Gemini request's generationConfig.thinkingConfig.
+type gThinking struct {
+	ThinkingBudget  *int   `json:"thinkingBudget,omitempty"`
+	ThinkingLevel   string `json:"thinkingLevel,omitempty"`
+	IncludeThoughts bool   `json:"includeThoughts,omitempty"`
+}
+
+// effort is the reasoning the thinkingConfig asks for: its level, else its
+// budget as the level it is nearest, -1 (the model decides) as medium. ""
+// when it asks for none: a budget of 0, or includeThoughts alone.
+func (tc *gThinking) effort() string {
+	switch {
+	case tc.ThinkingLevel != "":
+		return effortOf(tc.ThinkingLevel)
+	case tc.ThinkingBudget != nil && *tc.ThinkingBudget < 0:
+		return "medium" // -1: let the model decide
+	case tc.ThinkingBudget != nil:
+		return effortOfBudget(*tc.ThinkingBudget)
+	}
+	return ""
 }
 
 // buildGemini is a generateContent body for an upstream that speaks Gemini
@@ -100,8 +118,9 @@ func buildGemini(r *Request, model string) ([]byte, error) {
 	return json.Marshal(req)
 }
 
-// geminiRequest is the request inside the Code Assist envelope, without
-// the envelope's model and Google's internal stream field.
+// geminiRequest is the request inside the Code Assist envelope that
+// buildCodeAssistSent builds for agent, unwrapped, with no stream field
+// and a systemInstruction with no role.
 func geminiRequest(r *Request, model, agent string) (map[string]any, error) {
 	var wrap struct {
 		Request map[string]any `json:"request"`
@@ -203,21 +222,18 @@ func parseGemini(body []byte) (*Request, error) {
 	if gc := g.GenerationConfig; gc != nil {
 		r.MaxTokens, r.Temp, r.TopP, r.Stop = gc.MaxOutputTokens, gc.Temperature, gc.TopP, gc.StopSequences
 		if tc := gc.ThinkingConfig; tc != nil {
-			switch {
-			case tc.ThinkingLevel != "":
-				r.Effort = effortOf(tc.ThinkingLevel)
-			case tc.ThinkingBudget != nil && *tc.ThinkingBudget < 0:
-				r.Effort = "medium" // -1: let the model decide
-			case tc.ThinkingBudget != nil:
-				r.Effort = effortOfBudget(*tc.ThinkingBudget)
-			}
+			r.Effort = tc.effort()
 			r.Thinking = r.Effort != ""
 		}
-		// structured output has no seat in the other APIs; ask for it
+		// structured output, asked for in the upstream's own field
+		// (Format) and in words as well: a Gemini client doesn't know
+		// OpenAI's rule that a json_object's prompt say "JSON"
 		if strings.HasPrefix(gc.ResponseMimeType, "application/json") {
 			ask := "Respond with a single JSON value and nothing else"
+			r.Format = &Format{Type: "json_object"}
 			if s := firstJSON(gc.ResponseJSONSchema, gc.ResponseSchema); s != "" {
 				ask += ", matching this JSON schema:\n" + s
+				r.Format = &Format{Type: "json_schema", Name: formatName, Schema: json.RawMessage(s)}
 			}
 			if r.System != "" {
 				r.System += "\n\n"
@@ -260,7 +276,8 @@ func parseGemini(body []byte) (*Request, error) {
 					id = "call_" + newID()
 				}
 				names[fc.Name] = id
-				msg.Parts = append(msg.Parts, Part{Kind: ToolCall, ID: id, Name: fc.Name, Args: parseArgs(string(fc.Args))})
+				// its thought signature goes back to Gemini as it came (#1445)
+				msg.Parts = append(msg.Parts, Part{Kind: ToolCall, ID: id, Name: fc.Name, Args: parseArgs(string(fc.Args)), Signature: p.Signature})
 			case p.FunctionResponse != nil:
 				fr := p.FunctionResponse
 				id := fr.ID
@@ -287,8 +304,8 @@ func parseGemini(body []byte) (*Request, error) {
 				}
 			case p.Thought:
 				msg.Parts = append(msg.Parts, Part{Kind: Thinking, Text: p.Text, Signature: p.Signature})
-			case p.Text != "":
-				msg.Parts = append(msg.Parts, Part{Kind: Text, Text: p.Text})
+			case p.Text != "" || p.Signature != "":
+				msg.Parts = append(msg.Parts, Part{Kind: Text, Text: p.Text, Signature: p.Signature})
 			}
 		}
 		if len(msg.Parts) > 0 {
@@ -538,8 +555,12 @@ func geminiParts(parts []Part) []map[string]any {
 	for _, p := range parts {
 		switch p.Kind {
 		case Text:
-			if p.Text != "" {
-				out = append(out, map[string]any{"text": p.Text})
+			if p.Text != "" || p.Signature != "" {
+				part := map[string]any{"text": p.Text}
+				if p.Signature != "" {
+					part["thoughtSignature"] = p.Signature
+				}
+				out = append(out, part)
 			}
 		case Thinking:
 			if p.Text != "" {
@@ -550,11 +571,16 @@ func geminiParts(parts []Part) []map[string]any {
 				out = append(out, map[string]any{"inlineData": map[string]any{"mimeType": p.MediaType, "data": p.Data}})
 			}
 		case ToolCall:
-			id := p.ID
+			// a signature that rode in the id goes where Gemini has it
+			id, sig := unsignedID(p.ID)
 			if id == "" {
 				id = "call_" + newID()
 			}
-			out = append(out, map[string]any{"functionCall": map[string]any{"id": id, "name": p.Name, "args": argsOf(p)}})
+			part := map[string]any{"functionCall": map[string]any{"id": id, "name": p.Name, "args": argsOf(p)}}
+			if sig != "" {
+				part["thoughtSignature"] = sig
+			}
+			out = append(out, part)
 		}
 	}
 	return out
@@ -633,6 +659,10 @@ func (e *geminiEncoder) event(ev Event) {
 	case KThink:
 		e.flushTool()
 		e.chunk(geminiParts([]Part{{Kind: Thinking, Text: ev.Text}}), "", nil)
+	case KTextSig:
+		// Gemini's signature on its text, as Gemini streams it (#1445)
+		e.flushTool()
+		e.chunk([]map[string]any{{"text": "", "thoughtSignature": ev.Text}}, "", nil)
 	case KImage:
 		e.flushTool()
 		e.chunk(geminiParts([]Part{{Kind: Image, MediaType: ev.Name, Data: ev.Text}}), "", nil)

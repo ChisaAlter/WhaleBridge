@@ -49,7 +49,6 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
-	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
 )
 
 // hanakoProbe gives up quickly, as OpenHanako's own liveness probe does:
@@ -116,7 +115,7 @@ func hanako(home string) *Agent {
 				return ""
 			}
 			cur, _ := hanakoCurrent(dir)
-			file, kvs := path, []string{"base_url", gatewayV1(), "api_key", gateway.TokenFor("hanako")}
+			file, kvs := path, []string{"base_url", gatewayV1(), "api_key", agentKey("hanako")}
 			if hanakoSealed(path) { // its key is sealed: unknown, not gone; the address is in the plugin
 				file, kvs = filepath.Join(hanakoPlugin(dir), "providers", magpieID+".json"), kvs[:2]
 			}
@@ -228,7 +227,7 @@ func hanakoProvider() hanakoProviderEntry {
 			Image: m.Images, Reasoning: len(m.Efforts) > 0, XHigh: slices.Contains(m.Efforts, "xhigh")})
 	}
 	return hanakoProviderEntry{DisplayName: magpieID, BaseURL: gatewayV1(), API: "openai-completions",
-		APIKey: gateway.TokenFor("hanako"), Models: ms}
+		APIKey: agentKey("hanako"), Models: ms}
 }
 
 func hanakoPlugin(dir string) string { return filepath.Join(dir, "provider-plugins", magpieID) }

@@ -18,7 +18,7 @@ import (
 // exits. ctx must end (a timeout): the probe is forgotten when it does.
 func ProbeContext(ctx context.Context, name string, args ...string) *exec.Cmd {
 	ctx, cancel := context.WithCancel(ctx)
-	p := &probe{cancel: cancel, ended: make(chan struct{})}
+	p := &probe{cancel: cancel, killing: make(chan struct{}), ended: make(chan struct{})}
 	cmd := CommandContext(ctx, name, args...)
 	probeGroup(cmd, p)
 	probes.Lock()
@@ -33,24 +33,29 @@ func ProbeContext(ctx context.Context, name string, args ...string) *exec.Cmd {
 }
 
 type probe struct {
-	cancel context.CancelFunc
-	once   sync.Once
-	ended  chan struct{} // closed once it was killed
+	cancel         context.CancelFunc
+	killOnce, once sync.Once
+	killing, ended chan struct{} // closed once its kill began, and once it was over
 }
 
-func (p *probe) end() { p.once.Do(func() { close(p.ended) }) }
+func (p *probe) kill() { p.killOnce.Do(func() { close(p.killing) }) }
+func (p *probe) end()  { p.once.Do(func() { close(p.ended) }) }
 
 var probes = struct {
 	sync.Mutex
 	m map[*probe]struct{}
 }{m: map[*probe]struct{}{}}
 
-// endWait is how long EndProbes waits for the probes to be killed.
+// endWait is how long EndProbes waits for a probe's kill to begin: one that
+// had answered, or never started, has none.
 var endWait = time.Second
 
 // EndProbes kills every probe still running, with what it started, and
-// waits a moment for that: magpie is exiting or putting a new version in its
-// place, and nothing would end them after.
+// waits until none of that is left: magpie is exiting or putting a new
+// version in its place, and nothing would end them after. A kill that missed
+// a process being forked signals the group again until it is empty, and an
+// exit before that left the missed one running, adopted by init (#1278); the
+// wait is bounded by how long a kill goes on (killFor on Unix).
 func EndProbes() {
 	probes.Lock()
 	ps := make([]*probe, 0, len(probes.m))
@@ -61,12 +66,18 @@ func EndProbes() {
 	for _, p := range ps {
 		p.cancel()
 	}
-	deadline := time.After(endWait)
+	begun := time.Now().Add(endWait)
+	over := begun.Add(killWait())
 	for _, p := range ps {
 		select {
+		case <-p.killing:
+		case <-time.After(time.Until(begun)):
+			continue // one that had answered already, or never started
+		}
+		select {
 		case <-p.ended:
-		case <-deadline:
-			return // one that had answered already, or never started
+		case <-time.After(time.Until(over)):
+			return
 		}
 	}
 }

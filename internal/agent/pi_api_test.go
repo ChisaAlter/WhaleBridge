@@ -12,8 +12,9 @@ import (
 // Pi asks each model on the API its provider serves it on, so the gateway
 // relays the request as it is: a Responses-only provider's models and GPT
 // on OpenAI's API go on openai-responses; a Messages-only provider's on
-// anthropic-messages at the gateway; a Chat provider's and a group's stay
-// on the provider's openai-completions.
+// anthropic-messages at the gateway; a Chat provider's stay on the
+// provider's openai-completions. A group whose members are all best on
+// Responses goes there too (#1594); any other group stays on Chat.
 func TestPiModelsAskedOnTheirNativeAPI(t *testing.T) {
 	home := syncHome(t)
 	for _, p := range []provider.Provider{
@@ -22,6 +23,18 @@ func TestPiModelsAskedOnTheirNativeAPI(t *testing.T) {
 		{ID: "anth", Name: "Anth", Key: "k", Anthropic: "http://127.0.0.1:1", Models: []string{"claude-sonnet-5", "kimi-k3"}},
 	} {
 		if err := provider.Save(p); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// a group goes on Responses only when every member is best served there
+	// (#1594): one with a Chat member, or of Messages ones, stays on Chat
+	for _, g := range []provider.Group{
+		{ID: "gpts", Name: "GPTs", Members: []string{"resp/gpt-5.5", "openai/gpt-5.5", "resp/grok-5"}},
+		{ID: "mixed", Name: "Mixed", Members: []string{"resp/grok-5", "relay/glm-4.6"}},
+		{ID: "claudes", Name: "Claudes", Members: []string{"anth/claude-sonnet-5", "anth/kimi-k3"}},
+		{ID: "outer", Name: "Outer", Members: []string{"group/gpts", "openai/gpt-5.5"}},
+	} {
+		if err := provider.SaveGroup(g); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -49,7 +62,11 @@ func TestPiModelsAskedOnTheirNativeAPI(t *testing.T) {
 		"relay/glm-4.6":        nil,
 		"anth/claude-sonnet-5": "anthropic-messages",
 		"anth/kimi-k3":         "anthropic-messages",
-		"group/auto-gpt-5-5":   nil,
+		"group/auto-gpt-5-5":   "openai-responses",
+		"group/gpts":           "openai-responses",
+		"group/outer":          "openai-responses",
+		"group/mixed":          nil,
+		"group/claudes":        nil,
 	} {
 		got, ok := apis[id]
 		if !ok {

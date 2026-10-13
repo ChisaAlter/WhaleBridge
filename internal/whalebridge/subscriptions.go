@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/usage"
 )
 
 func subscriptionRoutes(mux *http.ServeMux) {
@@ -22,9 +24,9 @@ func subscriptionRoutes(mux *http.ServeMux) {
 	})
 	mux.HandleFunc("POST /api/subscription/adapter", func(w http.ResponseWriter, r *http.Request) {
 		var b struct {
-			ID, Package, Action string
-			Enabled             *bool
-			Options             map[string]any
+			ID, Package, Action, Provider string
+			Enabled                       *bool
+			Options                       map[string]any
 		}
 		if err := decode(w, r, &b); err != nil {
 			http.Error(w, err.Error(), 400)
@@ -110,6 +112,12 @@ func subscriptionRoutes(mux *http.ServeMux) {
 			} else {
 				err = plugin.SetOptions(pkg, b.Options)
 			}
+		case "prefer":
+			name := pkg
+			if name == "" {
+				name = b.ID
+			}
+			err = plugin.Prefer(name, b.Provider)
 		case "move":
 			err = provider.Move(ctx, b.ID)
 		case "adopt":
@@ -131,12 +139,16 @@ func subscriptionRoutes(mux *http.ServeMux) {
 				}
 			}
 		}
-		if _, err = plugin.Providers(ctx); err != nil {
-			fail(err.Error(), 400)
-			return
+		if len(plugin.Load().Plugins) > 0 {
+			if _, err = plugin.Providers(ctx); err != nil {
+				fail(err.Error(), 400)
+				return
+			}
 		}
 		provider.ForgetAccounts()
-		if err = syncDSH(); err != nil {
+		err = syncDSH()
+		syncManagedAgents()
+		if err != nil {
 			fail("订阅适配器已更新，但 DSH 渠道同步失败: "+err.Error(), 500)
 			return
 		}
@@ -167,14 +179,31 @@ func subscriptionRoutes(mux *http.ServeMux) {
 		}
 		s := settings.Load()
 		patch := map[string]json.RawMessage{}
-		for _, k := range strings.Fields("codexWarmup claudeWarmup codexWarmAt claudeWarmAt workbuddyCheckin traeCheckin minimaxCheckin qoderCheckin pluginCheckins quotaLeft proxy usageAlert balanceAlert resetReminder chinaMirror") {
+		for _, k := range strings.Fields("codexWarmup claudeWarmup codexWarmAt claudeWarmAt codexWarmAts claudeWarmAts workbuddyCheckin traeCheckin minimaxCheckin qoderCheckin pluginCheckins checkinOff quotaLeft proxy usageAlert balanceAlert resetReminder chinaMirror") {
 			if v, ok := in[k]; ok {
 				patch[k] = v
+			}
+		}
+		if _, changed := in["codexWarmAt"]; changed {
+			if _, multiple := in["codexWarmAts"]; !multiple {
+				s.CodexWarmAts = nil
+			}
+		}
+		if _, changed := in["claudeWarmAt"]; changed {
+			if _, multiple := in["claudeWarmAts"]; !multiple {
+				s.ClaudeWarmAts = nil
 			}
 		}
 		data, _ := json.Marshal(patch)
 		if err := json.Unmarshal(data, &s); err != nil {
 			return err
+		}
+		// The array is authoritative when both forms are sent, including [].
+		if _, changed := in["codexWarmAts"]; changed {
+			s.CodexWarmAt = ""
+		}
+		if _, changed := in["claudeWarmAts"]; changed {
+			s.ClaudeWarmAt = ""
 		}
 		mirrorChanged := s.ChinaMirror != settings.Load().ChinaMirror
 		if err := settings.Save(s); err != nil {
@@ -221,6 +250,10 @@ func subscriptionRoutes(mux *http.ServeMux) {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 		id := r.PathValue("id")
+		if r.URL.Query().Get("refresh") == "true" {
+			ctx = provider.Asked(ctx)
+			provider.RefreshUsage(ctx, id, "")
+		}
 		qs := provider.LoginUsage(ctx, id)
 		if id == "cursor" && !provider.Moved(id) {
 			qs = map[string]provider.SubscriptionQuota{}
@@ -230,14 +263,26 @@ func subscriptionRoutes(mux *http.ServeMux) {
 				}
 			}
 		}
-		writeJSON(w, provider.WithCapped(qs))
+		capped := provider.WithCapped(qs)
+		cards := make([]provider.SubscriptionQuota, 0, len(capped))
+		for user, q := range capped {
+			q.Provider, q.User = id, user
+			cards = append(cards, q)
+		}
+		out := map[string]provider.SubscriptionQuota{}
+		for _, q := range componentQuotaCards(cards) {
+			out[q.User] = q
+		}
+		writeJSON(w, out)
 	})
 	mux.HandleFunc("POST /api/accounts/{action}", mutate(func(w http.ResponseWriter, r *http.Request) error {
 		var b struct {
 			ID, User, Account, Proxy           string
+			Alias, Window, Key                 string
 			Models, Allow, Order, AccountOrder []string
 			Cap                                int
 			Limit                              *int
+			On                                 *bool
 		}
 		if err := decode(w, r, &b); err != nil {
 			return err
@@ -261,6 +306,27 @@ func subscriptionRoutes(mux *http.ServeMux) {
 			return provider.SetAccountModels(b.ID, ref, allow)
 		case "cap":
 			return provider.SetAccountCap(b.ID, ref, b.Cap)
+		case "name", "alias":
+			return provider.SetAccountName(b.ID, ref, b.Alias)
+		case "windowcap":
+			return provider.SetWindowCap(b.ID, ref, b.Window, b.Cap)
+		case "checkin":
+			if b.On == nil {
+				return fmt.Errorf("缺少账号签到开关")
+			}
+			key := b.Key
+			if key == "" {
+				key = accountCheckinKey(b.ID, ref, provider.CheckinAccounts())
+			}
+			if key == "" {
+				return fmt.Errorf("该账号不支持每日签到")
+			}
+			s := settings.Load()
+			s.CheckinOff = slices.DeleteFunc(slices.Clone(s.CheckinOff), func(k string) bool { return k == key })
+			if !*b.On {
+				s.CheckinOff = append(s.CheckinOff, key)
+			}
+			return settings.Save(s)
 		case "concurrency":
 			return provider.SetAccountConcurrency(b.ID, ref, b.Limit)
 		case "proxy":
@@ -343,8 +409,10 @@ func importAccounts(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), 400)
 		return
 	}
-	if err := syncDSH(); err != nil {
-		http.Error(w, "账号已导入，但 DSH 渠道同步失败: "+err.Error(), 500)
+	syncErr := syncDSH()
+	syncManagedAgents()
+	if syncErr != nil {
+		http.Error(w, "账号已导入，但 DSH 渠道同步失败: "+syncErr.Error(), 500)
 		return
 	}
 	writeJSON(w, map[string]any{"results": res, "ok": true})
@@ -352,7 +420,7 @@ func importAccounts(w http.ResponseWriter, r *http.Request) {
 
 func subscriptionSettings() map[string]any {
 	s := settings.Load()
-	out := map[string]any{"codexWarmup": s.CodexWarmup, "claudeWarmup": s.ClaudeWarmup, "codexWarmAt": s.CodexWarmAt, "claudeWarmAt": s.ClaudeWarmAt, "codexWarmAtOf": s.CodexWarmAtOf, "codexAutoReset": s.CodexAutoReset, "codexNoCredits": s.CodexNoCredits, "workbuddyCheckin": s.WorkBuddyCheckin, "traeCheckin": s.TraeCheckin, "minimaxCheckin": s.MiniMaxCheckin, "qoderCheckin": s.QoderCheckin, "pluginCheckins": s.PluginCheckins, "quotaLeft": s.QuotaLeft, "proxy": s.Proxy, "usageAlert": s.UsageAlert, "balanceAlert": s.BalanceAlert, "resetReminder": s.ResetReminder, "chinaMirror": s.ChinaMirror, "codexWarmed": latestWarm(provider.CodexWarmed()), "claudeWarmed": latestWarm(provider.ClaudeWarmed())}
+	out := map[string]any{"codexWarmup": s.CodexWarmup, "claudeWarmup": s.ClaudeWarmup, "codexWarmAt": s.CodexWarmAt, "claudeWarmAt": s.ClaudeWarmAt, "codexWarmAts": s.CodexWarmAts, "claudeWarmAts": s.ClaudeWarmAts, "codexWarmAtOf": s.CodexWarmAtOf, "codexAutoReset": s.CodexAutoReset, "codexNoCredits": s.CodexNoCredits, "workbuddyCheckin": s.WorkBuddyCheckin, "traeCheckin": s.TraeCheckin, "minimaxCheckin": s.MiniMaxCheckin, "qoderCheckin": s.QoderCheckin, "pluginCheckins": s.PluginCheckins, "checkinOff": s.CheckinOff, "checkinAccounts": provider.CheckinAccounts(), "quotaLeft": s.QuotaLeft, "proxy": s.Proxy, "usageAlert": s.UsageAlert, "balanceAlert": s.BalanceAlert, "resetReminder": s.ResetReminder, "chinaMirror": s.ChinaMirror, "codexWarmed": latestWarm(provider.CodexWarmed()), "claudeWarmed": latestWarm(provider.ClaudeWarmed())}
 	effective := map[string]bool{}
 	for _, p := range provider.WhaleBridgeSubscriptions() {
 		if p.Plugin && p.Checkin {
@@ -368,9 +436,10 @@ func quotaRoutes(mux *http.ServeMux) {
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
 		if r.URL.Query().Get("asked") == "1" {
+			ctx = provider.Asked(ctx)
 			provider.AskClaudeUsage()
 		}
-		qs := provider.WithCheckins(provider.Quotas(ctx))
+		qs := componentQuotaCards(provider.Quotas(ctx))
 		if provider.SubscriptionUsageReading() {
 			w.Header().Set("X-Magpie-Reading", "1")
 		}
@@ -387,6 +456,7 @@ func quotaRoutes(mux *http.ServeMux) {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
 		defer cancel()
+		ctx = provider.Asked(ctx)
 		if b.Provider == "" {
 			for _, p := range provider.All() {
 				provider.RefreshUsage(ctx, p.ID, "")
@@ -394,7 +464,7 @@ func quotaRoutes(mux *http.ServeMux) {
 		} else {
 			provider.RefreshUsage(ctx, b.Provider, b.User)
 		}
-		writeJSON(w, provider.WithCheckins(provider.Quotas(ctx)))
+		writeJSON(w, componentQuotaCards(provider.Quotas(ctx)))
 	})
 	mux.HandleFunc("GET /api/quotas/history", func(w http.ResponseWriter, r *http.Request) {
 		q := r.URL.Query()
@@ -466,6 +536,37 @@ func quotaRoutes(mux *http.ServeMux) {
 	})
 }
 
+// componentQuotaCards adds display-only metadata without starting another read.
+// Window estimates are based only on requests this component recorded.
+func componentQuotaCards(qs []provider.SubscriptionQuota) []provider.SubscriptionQuota {
+	qs = slices.Clone(qs)
+	served := provider.LastServed()
+	for i := range qs {
+		q := &qs[i]
+		if q.From != "" {
+			continue
+		}
+		if q.Seat == "" {
+			q.Seat = provider.SeatNameOf(q.Provider, q.User)
+		}
+		if alias := provider.AccountNameOf(q.Provider, q.User); alias != "" {
+			q.Alias = alias
+		} else if q.Alias == "" {
+			q.Alias = q.Seat
+		}
+		if q.Provider == "codex" {
+			q.ResetsUsed = provider.ResetsUsed(q.User)
+		}
+		if q.LastServedAt == nil {
+			if at, ok := served[q.Provider+"@"+strings.ToLower(q.User)]; ok {
+				t := at.UTC()
+				q.LastServedAt = &t
+			}
+		}
+	}
+	return usage.WithWindowHolds(provider.WithCheckins(qs), time.Now())
+}
+
 func keyAction(w http.ResponseWriter, r *http.Request) {
 	var b struct {
 		ID, Ref, Action, Name, Key string
@@ -531,8 +632,10 @@ func keyAction(w http.ResponseWriter, r *http.Request) {
 			cancel()
 		}
 	}
-	if err := syncDSH(); err != nil {
-		http.Error(w, "密钥设置已保存，但 DSH 渠道同步失败: "+err.Error(), 500)
+	syncErr := syncDSH()
+	syncManagedAgents()
+	if syncErr != nil {
+		http.Error(w, "密钥设置已保存，但 DSH 渠道同步失败: "+syncErr.Error(), 500)
 		return
 	}
 	writeJSON(w, map[string]any{"ok": true, "added": added, "had": had, "removed": removed})

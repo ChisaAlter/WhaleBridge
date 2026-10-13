@@ -8,7 +8,7 @@ import (
 
 func TestAsideOfflineWriteRequiresExplicitStage(t *testing.T) {
 	settings, _ := asideHome(t)
-	asideRead = func() (map[string]json.RawMessage, error) { return nil, errors.New("offline") }
+	asideRead = func(string) (map[string]json.RawMessage, error) { return nil, errors.New("offline") }
 	asideSet = func(string, string) error { return errors.New("offline") }
 	a := mustFindAside(t)
 	before := readFile(settings)

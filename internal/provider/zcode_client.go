@@ -28,8 +28,6 @@ import (
 	_ "embed"
 	"bytes"
 	"encoding/json"
-	"os"
-	"path/filepath"
 	"regexp"
 	"runtime"
 	"strings"
@@ -112,44 +110,46 @@ func zcodeStartProvider(base string) string {
 // (Claude Code's "Primary working directory: …", Codex's <cwd>…</cwd>).
 var zcodeCwdRe = regexp.MustCompile(`(?m)(?:^\s*-?\s*(?:Primary working directory|Working directory):[ \t]*([^\r\n]+?)[ \t]*$|<cwd>([^<\r\n]+)</cwd>)`)
 
-// zcodeCwd is the agent's working directory, as the environment section's
-// process.cwd(): the one its request names, else the user's home.
-func zcodeCwd(texts []string) string {
+// zcodePlace is where the agent works, as the environment section says
+// it: the working directory its request names, and whether that folder is
+// in a git repository as the agent says it, else as this computer's disk
+// says ("yes", "no"). Each is "" when unknown, and the section then leaves
+// its line out rather than say the user's home, or "no", for it
+// (magpie-community/plugins#86).
+func zcodePlace(texts []string) (dir, git string) {
 	for _, t := range texts {
 		if m := zcodeCwdRe.FindStringSubmatch(t); m != nil {
-			return strings.TrimSpace(m[1] + m[2])
+			dir, git = strings.TrimSpace(m[1]+m[2]), GitSaid(t)
+			break
 		}
 	}
-	if h, err := os.UserHomeDir(); err == nil && h != "" {
-		return h
+	if dir != "" && git == "" {
+		git = GitOnDisk(dir)
 	}
-	return "unknown"
-}
-
-// zcodeShell is the shell as the environment section names it: the
-// basename of $SHELL, or of %ComSpec% on Windows (cmd.exe).
-func zcodeShell() string {
-	for _, k := range []string{"SHELL", "ComSpec"} {
-		if s := os.Getenv(k); s != "" {
-			return filepath.Base(s)
-		}
-	}
-	return "unknown"
+	return dir, git
 }
 
 // zcodeEnvironment is the prompt's environment section for model on
-// provider, cwd being where the agent runs.
-func zcodeEnvironment(provider, model, cwd string) string {
+// provider, dir and git being where the agent works (zcodePlace), each
+// line left out when it is unknown. The agent's shell isn't known here, so
+// it isn't said; the platform and OS version are this computer's, as the
+// X-Os-* headers say them.
+func zcodeEnvironment(provider, model, dir, git string) string {
 	e := zcodePrompt.Environment
-	lines := []string{
-		e.Heading,
-		e.InvokedLine,
-		"- " + e.CwdLabel + ": " + cwd,
-		"- " + e.GitLabel + ": " + e.GitNo,
-		"- " + e.PlatformLabel + ": " + zcodePlatform(),
-		"- " + e.ShellLabel + ": " + zcodeShell(),
-		"- " + e.OSVersionLabel + ": " + zcodeOSVersion(),
+	lines := []string{e.Heading, e.InvokedLine}
+	if dir != "" {
+		lines = append(lines, "- "+e.CwdLabel+": "+dir)
+		switch git {
+		case "yes":
+			lines = append(lines, "- "+e.GitLabel+": yes")
+		case "no":
+			lines = append(lines, "- "+e.GitLabel+": "+e.GitNo)
+		}
 	}
+	lines = append(lines,
+		"- "+e.PlatformLabel+": "+zcodePlatform(),
+		"- "+e.OSVersionLabel+": "+zcodeOSVersion(),
+	)
 	if model != "" {
 		lines = append(lines, strings.NewReplacer("{provider}", provider, "{model}", model).Replace(e.PoweredByLine))
 	}
@@ -161,11 +161,11 @@ func zcodeEnvironment(provider, model, cwd string) string {
 func zcodeStable() string { return zcodePrompt.Stable + "\n\n" + zcodePrompt.Desktop }
 
 // zcodeSystem is ZCode's three system blocks for model on provider.
-func zcodeSystem(provider, model, cwd string) []any {
+func zcodeSystem(provider, model, dir, git string) []any {
 	cached := func(text string) map[string]any {
 		return map[string]any{"type": "text", "text": text, "cache_control": map[string]any{"type": "ephemeral"}}
 	}
-	dynamic := strings.Join([]string{zcodePrompt.BeforeEnvironment, zcodeEnvironment(provider, model, cwd), zcodePrompt.AfterEnvironment}, "\n\n")
+	dynamic := strings.Join([]string{zcodePrompt.BeforeEnvironment, zcodeEnvironment(provider, model, dir, git), zcodePrompt.AfterEnvironment}, "\n\n")
 	return []any{cached(zcodePrompt.Prefix), cached(zcodeStable()), cached("\n\n" + dynamic)}
 }
 
@@ -248,7 +248,8 @@ func zcodeStartBody(body []byte, provider string, now time.Time) []byte {
 			}
 		}
 	}
-	system, _ := zcodeEncode(append(zcodeSystem(provider, model, zcodeCwd(texts)), own...))
+	dir, git := zcodePlace(texts)
+	system, _ := zcodeEncode(append(zcodeSystem(provider, model, dir, git), own...))
 
 	msgs = append([]map[string]any{zcodeDateReminder(now)}, msgs...)
 	lastAt := -1

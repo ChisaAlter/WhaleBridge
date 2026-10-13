@@ -110,7 +110,7 @@ func mimoAccountGet(ctx context.Context, client *http.Client, u, deviceID string
 func startMiMoSignIn(s *signInFlow) error {
 	base := mimoBaseOf(mimoDefaultRegion)
 	deviceID := mimoDeviceID()
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(s.via(context.Background()))
 	start, stop := context.WithTimeout(ctx, 20*time.Second)
 	defer stop()
 	sid, callback := mimoServiceOf(start, base)

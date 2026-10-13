@@ -717,6 +717,7 @@ func factoryProvider(a factoryLogin) Provider {
 	}
 	acct.explain = factoryExplain
 	acct.models = factoryCatalog
+	acct.magpieList = true
 	acct.fetch = func(ctx context.Context) ([]catalog.Model, error) {
 		ms := factoryCatalog()
 		return ms, catalog.SaveLive("factory", factoryAPI+"/api/llm/o/v1", ms)

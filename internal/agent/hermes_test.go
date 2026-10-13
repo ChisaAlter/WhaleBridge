@@ -3,9 +3,12 @@ package agent
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"gopkg.in/yaml.v3"
 )
@@ -20,7 +23,7 @@ func TestHermes(t *testing.T) {
 	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Chat: "https://api.deepseek.com/v1", Key: "k", Models: []string{"pro", "flash"}}); err != nil {
 		t.Fatal(err)
 	}
-	dir := filepath.Join(home, ".hermes")
+	dir := appdir.HermesHomeIn(home)
 	path := filepath.Join(dir, "config.yaml")
 	read := func() (map[string]any, map[string]any, string) {
 		var c map[string]any
@@ -62,33 +65,210 @@ func TestHermes(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// its own model: the user's provider comes back, magpie's entry goes
+	// its own model: the user's provider comes back, magpie's entry stays
+	// beside it, so Hermes's session picker still offers magpie's models
+	// and it is still connected (lijiho96940561 on X)
 	if err := f.Set("moonshotai/kimi-k3"); err != nil {
 		t.Fatal(err)
 	}
 	c, m, raw = read()
-	if m["default"] != "moonshotai/kimi-k3" || m["provider"] != "openrouter" || providers(c)["magpie"] != nil || providers(c)["mine"] == nil {
+	if m["default"] != "moonshotai/kimi-k3" || m["provider"] != "openrouter" || providers(c)["magpie"] == nil || providers(c)["mine"] == nil {
 		t.Fatalf("own:\n%s", raw)
 	}
+	a := hermes(home)
+	if !a.Wired() || a.Drift() != nil {
+		t.Fatalf("own model: wired %v, drift %+v", a.Wired(), a.Drift())
+	}
 
-	// reset from magpie: back to what the user had
-	f.Set("magpie/deepseek/flash")
-	if err := f.Set(""); err != nil {
+	// the default changed in Hermes itself (`hermes model`): still connected,
+	// not told as drift
+	if err := a.Apply("model", "magpie/deepseek/flash"); err != nil {
+		t.Fatal(err)
+	}
+	if err := edit.SetYAML(path, edit.KV{Path: "model.provider", Value: "anthropic"}, edit.KV{Path: "model.default", Value: "claude-opus-5"}); err != nil {
+		t.Fatal(err)
+	}
+	if !a.Wired() || a.Drift() != nil {
+		t.Fatalf("changed in Hermes: wired %v, drift %+v", a.Wired(), a.Drift())
+	}
+
+	// Disconnect takes magpie's entry out
+	if err := a.Disconnect(); err != nil {
 		t.Fatal(err)
 	}
 	c, m, raw = read()
-	if m["default"] != "moonshotai/kimi-k3" || m["provider"] != "openrouter" || providers(c)["magpie"] != nil {
-		t.Fatalf("reset:\n%s", raw)
+	if m["default"] != "claude-opus-5" || m["provider"] != "anthropic" || providers(c)["magpie"] != nil || providers(c)["mine"] == nil || a.Wired() {
+		t.Fatalf("disconnect, own model:\n%s", raw)
+	}
+
+	// Disconnect from magpie's model: back to what the user had
+	f.Set("magpie/deepseek/flash")
+	if err := a.Disconnect(); err != nil {
+		t.Fatal(err)
+	}
+	c, m, raw = read()
+	if m["default"] != "claude-opus-5" || m["provider"] != "anthropic" || providers(c)["magpie"] != nil {
+		t.Fatalf("disconnect:\n%s", raw)
 	}
 
 	// a config with no provider of its own: none comes back
 	os.WriteFile(path, []byte("agent:\n  max_turns: 60\n"), 0o644)
 	f.Set("magpie/deepseek/pro")
-	if err := f.Set(""); err != nil {
+	if err := a.Disconnect(); err != nil {
 		t.Fatal(err)
 	}
 	c, m, raw = read()
 	if m["provider"] != nil || m["default"] != nil || providers(c)["magpie"] != nil || c["agent"] == nil {
-		t.Fatalf("reset, no provider:\n%s", raw)
+		t.Fatalf("disconnect, no provider:\n%s", raw)
+	}
+}
+
+// Each of Hermes's bots is a profile under ~/.hermes/profiles/<name> with a
+// config.yaml of its own, which doesn't read the main one's: connected,
+// magpie is offered in every bot's picker, each keeps its own model, and
+// Disconnect takes magpie out of each (lijiho96940561 on X: only the main
+// bot had magpie).
+func TestHermesProfiles(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("HERMES_HOME", "")
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Chat: "https://api.deepseek.com/v1", Key: "k", Models: []string{"pro"}}); err != nil {
+		t.Fatal(err)
+	}
+	root := appdir.HermesHomeIn(home)
+	write := func(rel, s string) string {
+		p := filepath.Join(root, rel)
+		os.MkdirAll(filepath.Dir(p), 0o755)
+		os.WriteFile(p, []byte(s), 0o644)
+		return p
+	}
+	write("config.yaml", "model:\n  default: anthropic/claude-opus-5\n  provider: openrouter\n")
+	// as `hermes profile create` leaves them: config.yaml, .env, SOUL.md
+	bot := write("profiles/coder/config.yaml", "# coder bot\nmodel:\n  default: kimi-k3\n  provider: moonshot\nproviders:\n  mine:\n    base_url: https://x\n")
+	write("profiles/coder/SOUL.md", "coder\n")
+	// cloned from a main config already on magpie
+	clone := write("profiles/writer/config.yaml", "model:\n  default: deepseek/pro\n  provider: magpie\n")
+	// deleted (a tombstone beside it), and a name Hermes doesn't allow
+	gone := write("profiles/old/config.yaml", "model:\n  default: x\n")
+	write("profiles/.deleted/old", "")
+	bad := write("profiles/Bad/config.yaml", "model:\n  default: x\n")
+	read := func(p string) (map[string]any, string) {
+		var c map[string]any
+		b, _ := os.ReadFile(p)
+		yaml.Unmarshal(b, &c)
+		return c, string(b)
+	}
+	has := func(p string) bool {
+		c, _ := read(p)
+		ps, _ := c["providers"].(map[string]any)
+		return ps["magpie"] != nil
+	}
+
+	a := hermes(home)
+	if err := a.Apply("model", "magpie/deepseek/pro"); err != nil {
+		t.Fatal(err)
+	}
+	c, raw := read(bot)
+	m, _ := c["model"].(map[string]any)
+	if !has(bot) || !has(clone) || m["default"] != "kimi-k3" || m["provider"] != "moonshot" || !strings.Contains(raw, "# coder bot") ||
+		c["providers"].(map[string]any)["mine"] == nil {
+		t.Fatalf("coder after connect:\n%s", raw)
+	}
+	if has(gone) || has(bad) {
+		t.Fatal("a deleted or invalid profile got magpie")
+	}
+
+	// a profile made later gets it at the next sync
+	later := write("profiles/later/config.yaml", "model:\n  default: x\n")
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if !has(later) {
+		t.Fatal("sync left a new profile out")
+	}
+
+	if err := a.Disconnect(); err != nil {
+		t.Fatal(err)
+	}
+	c, raw = read(bot)
+	m, _ = c["model"].(map[string]any)
+	if has(bot) || has(later) || m["default"] != "kimi-k3" || m["provider"] != "moonshot" || c["providers"].(map[string]any)["mine"] == nil {
+		t.Fatalf("coder after disconnect:\n%s", raw)
+	}
+	// the clone isn't left naming a provider that is gone
+	c, raw = read(clone)
+	m, _ = c["model"].(map[string]any)
+	if has(clone) || m["provider"] != nil || m["default"] != nil {
+		t.Fatalf("writer after disconnect:\n%s", raw)
+	}
+	// disconnected: a sync doesn't put it back
+	if err := a.Sync(); err != nil || has(bot) {
+		t.Fatalf("sync after disconnect: %v", err)
+	}
+}
+
+// HERMES_HOME set to a profile outside ~/.hermes (Docker): magpie connects
+// that profile, and the root's config and its other profiles get the
+// provider too
+func TestHermesProfilesOfCustomRoot(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Chat: "https://api.deepseek.com/v1", Key: "k", Models: []string{"pro"}}); err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(home, "data")
+	for _, p := range []string{"config.yaml", "profiles/a/config.yaml", "profiles/b/config.yaml"} {
+		os.MkdirAll(filepath.Dir(filepath.Join(root, p)), 0o755)
+		os.WriteFile(filepath.Join(root, p), []byte("model:\n  default: x\n"), 0o644)
+	}
+	t.Setenv("HERMES_HOME", filepath.Join(root, "profiles", "a"))
+	if got := hermesProfiles(here(home)); len(got) != 3 {
+		t.Fatalf("profiles: %v", got)
+	}
+	if err := hermes(home).Apply("model", "magpie/deepseek/pro"); err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range []string{"config.yaml", "profiles/b/config.yaml"} {
+		v, ok := edit.GetYAML(filepath.Join(root, p), "providers.magpie.base_url")
+		if !ok || !strings.HasSuffix(v, "/v1") {
+			t.Fatalf("%s: %q", p, v)
+		}
+	}
+	if v, _ := edit.GetYAML(filepath.Join(root, "config.yaml"), "model.default"); v != "x" {
+		t.Fatalf("root model: %q", v)
+	}
+}
+
+// TestHermesFolder (新v学员 on Discord): on this machine Hermes's folder is
+// its own default, %LOCALAPPDATA%\hermes on native Windows, not ~/.hermes
+// there, and its profiles are under it; in a WSL distro, which is Linux and
+// whose variables magpie can't read, it is ~/.hermes.
+func TestHermesFolder(t *testing.T) {
+	home := t.TempDir()
+	local := filepath.Join(home, "AppData", "Local")
+	t.Setenv("LOCALAPPDATA", local)
+	t.Setenv("HERMES_HOME", "")
+	want := filepath.Join(home, ".hermes")
+	if runtime.GOOS == "windows" {
+		want = filepath.Join(local, "hermes")
+	}
+	if a := hermes(home); a.Dir != want || a.Path != filepath.Join(want, "config.yaml") {
+		t.Fatalf("Hermes at %s (%s), want %s", a.Dir, a.Path, want)
+	}
+	os.MkdirAll(filepath.Join(want, "profiles", "bot"), 0o755)
+	os.WriteFile(filepath.Join(want, "profiles", "bot", "config.yaml"), []byte("model: {}\n"), 0o644)
+	if got := hermesProfiles(here(home)); len(got) != 2 || got[0] != filepath.Join(want, "config.yaml") {
+		t.Fatalf("profiles %v, want under %s", got, want)
+	}
+	t.Setenv("HERMES_HOME", filepath.Join(home, "custom"))
+	wsl := place{home: home, spell: func(s string) string { return s }}
+	if a := hermesIn(wsl); a.Dir != filepath.Join(home, ".hermes") {
+		t.Fatalf("Hermes in WSL at %s, want ~/.hermes", a.Dir)
 	}
 }

@@ -19,6 +19,12 @@ type Stats struct {
 	// spent in it, the most recently active first. Too many to send the
 	// page over a long range: Overview sums them up.
 	Sessions []Summary `json:"-"`
+	// Keys are those sessions' keys, agent:id, in the same order: which of
+	// the sessions the page lists were at work in the range. The list is
+	// every session ever, so without them it guessed from each one's last
+	// line — and a session whose last line is a setting or a fork's seed,
+	// written long after its last call, was listed but not counted.
+	Keys []string `json:"keys"`
 }
 
 // Summary is one session's share of a range.
@@ -101,7 +107,7 @@ func statsAt(days int, now time.Time) Stats {
 		since = today.AddDate(0, 0, 1-days)
 		from = since.Format(time.DateOnly)
 	}
-	out := Stats{From: from, To: today.Format(time.DateOnly), Days: []Day{}, Sessions: []Summary{}}
+	out := Stats{From: from, To: today.Format(time.DateOnly), Days: []Day{}, Sessions: []Summary{}, Keys: []string{}}
 
 	dbReadMu.Lock()
 	defer dbReadMu.Unlock()
@@ -210,6 +216,10 @@ func statsAt(days int, now time.Time) Stats {
 			}
 			sh.prompts += d.Prompts
 			sh.replies += d.Replies
+			if d.Prompts+d.Replies > 0 {
+				sh.dates[date] = true
+				dates[date] = true
+			}
 			pd.messages += d.Prompts + d.Replies
 			for name, n := range d.Tools {
 				sh.tools[name] += n
@@ -337,6 +347,10 @@ func statsAt(days int, now time.Time) Stats {
 		}
 		return a.Key < b.Key
 	})
+	// keys after the sort, so they name the sessions in the order they are in
+	for _, s := range out.Sessions {
+		out.Keys = append(out.Keys, s.Key)
+	}
 	return out
 }
 

@@ -30,19 +30,81 @@ func CompactSet(id string) int {
 	return compactSet(settings.Load(), id, GroupFinder())
 }
 
-// CompactSetIn is CompactSet for a caller that already holds the settings
-// and the group finder: an agent's list is built for hundreds of models at
-// magpie's start, and reading both again for each is what EffectivePriceIn
-// saves the same loop.
-func CompactSetIn(s settings.Settings, id string, find func(string) (Group, []Member, bool)) int {
-	return compactSet(s, id, find)
+// CompactFor is where Codex compacts a conversation on e (catalog.Model's
+// Compact): the threshold the user set on it or its provider (CompactSet),
+// else, when its window is one the user typed (Entry.WindowSet) and no
+// size of theirs is typed in Settings, that whole window (#1809: a group
+// set to 500K was told Codex as magpie's default 272K, which Codex runs
+// to 95% of). magpie's default gives way to a window the user typed as
+// it does to one they set in Claude Code (#876); a threshold they typed
+// still comes first. 0 leaves it to settings.Compact. It takes the
+// settings and the group finder from its caller: an agent's list is built
+// for hundreds of models at magpie's start, and reading both again for
+// each is what EffectivePriceIn saves the same loop.
+func CompactFor(s settings.Settings, e Entry, find func(string) (Group, []Member, bool)) int {
+	if n := compactSet(s, e.ID, find); n > 0 {
+		return n
+	}
+	if e.WindowSet && s.CompactAt == 0 {
+		return e.Context
+	}
+	return 0
+}
+
+// WindowTyped says the window agents are told for a model, by its
+// catalog id (as CompactSet takes it), is one the user typed: the
+// group's own size, or one set on the provider for the model or all of
+// its models. Claude Code then isn't handed magpie's default compaction
+// window for it (CompactFor's rule).
+func WindowTyped(id string) bool {
+	id = catalogID(id)
+	if strings.HasPrefix(id, GroupPrefix) {
+		g, _, ok := GroupFinder()(id)
+		return ok && g.Context > 0
+	}
+	pid, model, ok := strings.Cut(id, "/")
+	if !ok {
+		return false
+	}
+	p, err := Find(pid)
+	return err == nil && p.ContextOf(model) > 0
+}
+
+// ClaudeGroup says a model id (as CompactSet takes it) is a routing
+// group whose every member is one of Anthropic's Claude models, by the
+// name it is listed under or the one the vendor is asked for. Claude Code
+// runs such a group as it runs a Claude model, to its own window, so it
+// isn't handed magpie's default compaction window (#1741: a group of
+// Claude [1m] models was told 272000, its id's last part not starting
+// with "claude"). A group with any other member, or none, isn't.
+func ClaudeGroup(id string) bool {
+	id = catalogID(id)
+	if !strings.HasPrefix(id, GroupPrefix) {
+		return false
+	}
+	_, ms, ok := GroupFinder()(id)
+	if !ok || len(ms) == 0 {
+		return false
+	}
+	for _, m := range ms {
+		if !claudeModel(entryModel(m)) && !claudeModel(m.Model) {
+			return false
+		}
+	}
+	return true
+}
+
+// catalogID is an agent's model id as the catalog has it: magpie/ and
+// Claude Code's [1m] mark taken off.
+func catalogID(id string) string {
+	return strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(id), "magpie/"), "[1m]")
 }
 
 func compactSet(s settings.Settings, id string, find func(string) (Group, []Member, bool)) int {
 	if len(s.ModelCompacts) == 0 {
 		return 0
 	}
-	id = strings.TrimSuffix(strings.TrimPrefix(strings.TrimSpace(id), "magpie/"), "[1m]")
+	id = catalogID(id)
 	if strings.HasPrefix(id, GroupPrefix) {
 		_, ms, _ := find(id)
 		least := 0

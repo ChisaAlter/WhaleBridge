@@ -130,8 +130,16 @@ func (s *usageSniffer) parse(b []byte) {
 	if st := upstreamStop(b); st != "" {
 		s.u.Stop = st
 	}
+	if t := upstreamTier(b); t != "" {
+		s.u.Tier = t
+	}
 	switch s.proto {
 	case provider.Gemini:
+		// a Gemini stream names no type and sends no [DONE]: its end is a
+		// candidate's finishReason (geminiEnds, #1644)
+		if s.sse && geminiEnds(b) {
+			s.ended = true
+		}
 		// Factory's generateContent chunks, the same usageMetadata Code
 		// Assist wraps. Relaying one used to count nothing.
 		var v struct {

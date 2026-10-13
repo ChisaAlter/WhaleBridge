@@ -14,9 +14,15 @@ import (
 // makes to it comes back to Codex as the tool_search_call Codex runs.
 
 // searchAsFunction is a Responses request with Codex's tool search as a
-// plain function, and whether there was one.
+// plain function, and whether there was one. A request that offers no
+// search still has the earlier searches' calls and results in its
+// conversation: Codex leaves the tool out once nothing deferred is left
+// to find, and its compaction sends no tools at all. Those go as a
+// function's too, the tools they found left out, or a vendor that knows
+// no tool_search_call turns the whole request away (#1171 tcxp001, the
+// compaction on Anyrouter; #1755 FivePink, Xiaomi MiMo).
 func searchAsFunction(body []byte) ([]byte, bool) {
-	if !bytes.Contains(body, []byte(`"tool_search"`)) {
+	if !bytes.Contains(body, []byte(`"tool_search`)) {
 		return body, false
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
@@ -33,21 +39,27 @@ func searchAsFunction(body []byte) ([]byte, bool) {
 			search = true
 		}
 	}
-	if !search {
-		return body, false
-	}
 	// a tool found is added once; a namespace found again (another search
-	// in the same MCP server) adds the tools it didn't have
+	// in the same MCP server) adds the tools it didn't have. With no search
+	// offered, nothing is added: the request's tools are what Codex offers
+	// now, and a compaction's are none.
 	have := toolsByName(tools)
-	add := func(tm map[string]any) { tools = addTool(tools, have, tm) }
+	add := func(tm map[string]any) {
+		if search {
+			tools = addTool(tools, have, tm)
+		}
+	}
+	history := false
 	if items, ok := m["input"].([]any); ok {
 		for i, it := range items {
 			im, _ := it.(map[string]any)
 			switch im["type"] {
 			case "tool_search_call":
+				history = true
 				args, _ := json.Marshal(im["arguments"])
 				items[i] = map[string]any{"type": "function_call", "call_id": im["call_id"], "name": toolSearch, "arguments": string(args)}
 			case "tool_search_output":
+				history = true
 				found, _ := im["tools"].([]any)
 				var named []rTool
 				for _, t := range found {
@@ -66,12 +78,17 @@ func searchAsFunction(body []byte) ([]byte, bool) {
 			}
 		}
 	}
-	m["tools"] = tools
+	if !search && !history {
+		return body, false
+	}
+	if search {
+		m["tools"] = tools
+	}
 	out, err := marshalPlain(m)
 	if err != nil {
 		return body, false
 	}
-	return out, true
+	return out, search
 }
 
 // undefer drops defer_loading from a tool a search found, and from a

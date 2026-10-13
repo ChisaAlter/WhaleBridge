@@ -15,7 +15,9 @@ import (
 // Gateway, and its model list never came). A proxy is for reaching
 // vendors; one elsewhere can't reach the user's network, and one on this
 // computer would only go there directly itself. A provider's own proxy
-// (With) is still taken as it is: that one was set for it.
+// (With) is still taken as it is: that one was set for it. The plugin
+// host applies the same rule to plugins' requests (onLAN in
+// internal/plugin/host.js, #1572): a change here is made there too.
 
 // lanLookup resolves a name to its addresses; tests replace it.
 var lanLookup = func(ctx context.Context, host string) ([]net.IPAddr, error) {

@@ -21,6 +21,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // ImportedAccount is what became of one account in an import.
@@ -34,6 +36,10 @@ type ImportedAccount struct {
 	Status string `json:"status"`
 	Plan   string `json:"plan,omitempty"`
 	Error  string `json:"error,omitempty"`
+	// File is the place (from 1) of a file, among several imported at
+	// once, that held no account to read: User is empty then, and Error
+	// says why. A file that can't be read is said so, never passed over.
+	File int `json:"file,omitempty"`
 }
 
 // googleImport is one account read from an export.
@@ -41,6 +47,7 @@ type googleImport struct {
 	n                            int // its place in the file(s), from 1
 	email, refreshToken, project string
 	err                          string // why it can't be imported, found reading it
+	file                         int    // a file that held no account (ImportedAccount.File)
 }
 
 // maxGoogleImport caps the accounts one import takes.
@@ -169,18 +176,23 @@ func jsonStr(x map[string]any, keys ...string) string {
 // (see above), each file's text one element of files, and says what
 // became of each.
 func ImportGoogleAccounts(ctx context.Context, agent string, files []string) ([]ImportedAccount, error) {
+	if settings.AccountDiscoveryOff() {
+		return nil, errAccountDiscoveryOff
+	}
 	app, ok := googleAppOf(agent)
 	if !ok || agent != "antigravity" {
 		return nil, fmt.Errorf("accounts can't be imported for %s", agent)
 	}
 	var all []googleImport
-	for _, f := range files {
+	for i, f := range files {
 		es, err := parseGoogleImport(agent, f)
 		if err != nil {
 			if len(files) == 1 {
 				return nil, err
 			}
-			continue // one file of several that holds none
+			// one file of several that holds none: said, not passed over
+			all = append(all, googleImport{file: i + 1, err: err.Error()})
+			continue
 		}
 		all = append(all, es...)
 	}
@@ -211,12 +223,12 @@ func ImportGoogleAccounts(ctx context.Context, agent string, files []string) ([]
 	sem := make(chan struct{}, 4)
 	for i, e := range all {
 		name := e.email
-		if name == "" {
+		if name == "" && e.file == 0 {
 			name = fmt.Sprintf("#%d", i+1)
 		}
 		switch {
 		case e.err != "":
-			out[i] = ImportedAccount{User: name, Status: "failed", Error: e.err}
+			out[i] = ImportedAccount{User: name, File: e.file, Status: "failed", Error: e.err}
 			continue
 		case haveTok[e.refreshToken] != "":
 			out[i] = ImportedAccount{User: haveTok[e.refreshToken], Status: "exists"}

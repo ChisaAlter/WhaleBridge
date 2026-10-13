@@ -14,17 +14,23 @@ import (
 	"fmt"
 	"slices"
 	"strings"
-	"sync"
 	"time"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/filelock"
 )
 
 // savedTokenMu keeps two requests from refreshing one saved account at
-// once: the second would spend a refresh token the first just rotated.
-var savedTokenMu sync.Mutex
+// once: the second would spend a refresh token the first just rotated. It
+// holds across magpies too (#1674): the gateway's refresh and one by a
+// magpie run from a terminal would each spend the same refresh token.
+var savedTokenMu = filelock.Mutex{Path: func() string { return loginsPath() + ".renew.lock" }}
 
 // SetLoginOn puts a saved account in use beside the agent's own, or takes
 // it out. The account the agent is signed in to is always in use.
 func SetLoginOn(agent, user string, on bool) error {
+	if discoveryOff() {
+		return errAccountDiscoveryOff
+	}
 	if pp, ok := pluginOfAgent(agent); ok {
 		return setPluginLoginOn(pp, user, on)
 	}
@@ -131,8 +137,23 @@ func (p Provider) OwnPaused() bool {
 }
 
 // AlsoOn is a signed-in agent's other accounts that are on, each as a
-// provider of its own, in the order they were saved.
+// provider of its own, in the order they were saved. Each keeps what the
+// user set on the provider, as p has it from All: its queue, limits,
+// routing and models (withPicks). A Claude or Codex account is p with
+// another sign-in, and had them always; one a sign-in of its own makes
+// afresh had none, and a second WorkBuddy AI account queued 62s with the
+// wait set to 1s (#1899).
 func (p Provider) AlsoOn() []Provider {
+	out := p.alsoOn()
+	for i, q := range out {
+		out[i] = withPicks(q, p)
+	}
+	return out
+}
+
+// alsoOn is AlsoOn as each sign-in makes its accounts, without the
+// provider's settings.
+func (p Provider) alsoOn() []Provider {
 	if p.IsPlugin() {
 		return pluginAlsoOn(*p.Account.plugin)
 	}

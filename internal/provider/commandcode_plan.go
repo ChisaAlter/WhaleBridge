@@ -354,12 +354,12 @@ func cmdProvider(who, plan string, a cmdAuth) Provider {
 		}
 		keyed := p
 		keyed.Account, keyed.Key = nil, a.APIKey
-		ms, base, err := keyed.fetchOne(keyed.Via(ctx))
+		l, err := keyed.fetchOne(keyed.Via(ctx))
 		if err != nil {
 			return nil, err
 		}
-		cmdMarkFree(ms)
-		return catalog.Chat(ms), catalog.SaveLive(p.ID, base, ms)
+		cmdMarkFree(l.models)
+		return catalog.Chat(l.models), catalog.SaveLiveSides(p.ID, l.base, l.models, l.sides)
 	}
 	acct.generate = func(ctx context.Context) (string, bool) {
 		return a.APIKey, cmdPlanNow(ctx, a, plan) == "Go"
@@ -780,7 +780,7 @@ func (s *signInFlow) commandCodeCallback(w http.ResponseWriter, r *http.Request)
 		answer(false, "this sign-in is already finishing")
 		return
 	}
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(s.via(r.Context()), 30*time.Second)
 	defer cancel()
 	// the browser comes back for its page after this: the server stays up
 	// a while for it, where finish would close it within a second
@@ -848,7 +848,7 @@ func (s *signInFlow) commandCodeKey(raw string) error {
 	if !s.claim() {
 		return errors.New("this sign-in is already finishing")
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(s.via(context.Background()), 30*time.Second)
 	defer cancel()
 	return s.commandCodeKeep(ctx, cmdAuth{APIKey: key}, false)
 }

@@ -43,6 +43,7 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // t3Instance is the key of magpie's provider instance in T3 Code's
@@ -75,6 +76,8 @@ func t3code(home string) *Agent {
 				return edit.GetJSON(path, t3Instance+`.environment.#(name="`+name+`").value`)
 			}, "ANTHROPIC_BASE_URL", gateway.URL(), "ANTHROPIC_AUTH_TOKEN", gateway.Token)
 		},
+		// its custom models are the models picked for it (#1508)
+		ListsModels: true,
 		Fields: []Field{{
 			Key: "provider", Label: "provider",
 			Get: func() string {
@@ -102,7 +105,7 @@ func t3App(home string) bool {
 	if runtime.GOOS != "darwin" {
 		return false
 	}
-	for _, d := range []string{"/Applications", filepath.Join(home, "Applications")} {
+	for _, d := range macAppFolders(home) {
 		for _, n := range []string{"T3 Code (Alpha).app", "T3 Code.app"} {
 			if _, err := os.Stat(filepath.Join(d, n)); err == nil {
 				return true
@@ -120,7 +123,8 @@ func t3InstanceJSON(path, gw string) map[string]any {
 	mark := claude1MFor("t3code")
 	models := []map[string]any{}
 	for _, m := range magpieModels("t3code") {
-		e := map[string]any{"slug": mark(m.ID), "name": m.Name}
+		// Claude Code reads a dotted Claude version as Claude Opus 4
+		e := map[string]any{"slug": provider.ClaudeSpelled(mark(m.ID)), "name": m.Name}
 		if c := t3Capabilities(m.ID, m.Efforts); c != nil {
 			e["capabilities"] = c
 		}
@@ -138,13 +142,20 @@ func t3InstanceJSON(path, gw string) map[string]any {
 			config[k] = v
 		}
 	}
+	environment := []map[string]any{
+		{"name": "ANTHROPIC_BASE_URL", "value": gw, "sensitive": false},
+		{"name": "ANTHROPIC_AUTH_TOKEN", "value": keyAt(gw), "sensitive": false},
+	}
+	// auto mode's review off while no model it lists is one Anthropic
+	// reviews, as for Claude Code itself (claudeReviewEnv); a value in the
+	// user's ~/.claude settings comes after it
+	if !claudeReviewed([]string{"t3code"}) {
+		environment = append(environment, map[string]any{"name": claudeReviewEnv, "value": "0", "sensitive": false})
+	}
 	return map[string]any{
 		"driver": "claudeAgent", "displayName": "magpie", "enabled": true,
-		"environment": []map[string]any{
-			{"name": "ANTHROPIC_BASE_URL", "value": gw, "sensitive": false},
-			{"name": "ANTHROPIC_AUTH_TOKEN", "value": gateway.Token, "sensitive": false},
-		},
-		"config": config,
+		"environment": environment,
+		"config":      config,
 	}
 }
 

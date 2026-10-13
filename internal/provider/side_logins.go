@@ -42,7 +42,13 @@ func sideLogins(agent, ownUser string, usable func(savedLogin) bool) []sideLogin
 		for i := range ls {
 			if ls[i].Agent == agent && ls[i].own() {
 				found = true
-				changed := false
+				changed, renamed := false, false
+				if agent == "copilot" && copilotRenamed(ls[i].User, ownUser) {
+					// the same account, its host now in its name (#1220):
+					// kept as it was, hidden or not, its settings with it
+					ls[i].renameTo(ownUser)
+					renamed = renameDue()
+				}
 				if !strings.EqualFold(ls[i].User, ownUser) {
 					ls[i].User, ls[i].Seen = ownUser, time.Now().UTC().Truncate(time.Second)
 					if agent == "copilot" {
@@ -59,7 +65,7 @@ func sideLogins(agent, ownUser string, usable func(savedLogin) bool) []sideLogin
 						changed = true
 					}
 				}
-				if changed {
+				if changed || renamed {
 					_ = writeLogins(ls)
 				}
 			}
@@ -70,6 +76,11 @@ func sideLogins(agent, ownUser string, usable func(savedLogin) bool) []sideLogin
 			ls = append(ls, savedLogin{Agent: agent, User: ownUser, Seen: time.Now().UTC().Truncate(time.Second)})
 			_ = writeLogins(ls)
 		}
+	}
+	// a saved account renamed as it was read (nameAlike) is written under
+	// its new name, its settings moved to it, the first time it is listed
+	if agent == "copilot" && renameDue() && slices.ContainsFunc(ls, func(l savedLogin) bool { return l.was != "" }) {
+		_ = writeLogins(slices.Clone(ls)) // sorted there: listed here as added
 	}
 	var out []sideLogin
 	first := -1
@@ -93,7 +104,8 @@ func sideLogins(agent, ownUser string, usable func(savedLogin) bool) []sideLogin
 		if l.First || (first < 0 && l.own()) {
 			first = len(out)
 		}
-		out = append(out, sideLogin{Login{Agent: agent, User: l.User, Plan: l.Plan, Seen: l.Seen, On: l.On, Own: l.own()}, l})
+		// a sign-in its vendor revoked shows on the account (signin_revoked.go)
+		out = append(out, sideLogin{Login{Agent: agent, User: l.User, Plan: l.Plan, Seen: l.Seen, On: l.On, Own: l.own(), Lapsed: revokedLapse(l)}, l})
 	}
 	if len(out) == 0 {
 		return nil
@@ -238,8 +250,14 @@ func ownMark(agent string) string {
 // one it can be read as: the agent's own account remembered from before,
 // while the agent is signed out or keeps its tokens encrypted, takes the
 // new sign-in rather than letting it go — let go, it was listed nowhere
-// (#155).
-func addSideLogin(l savedLogin, ownUser string, dup func(savedLogin)) error {
+// (#155). The account's kept usage reading goes (StaleAllowance): it
+// was read under the old sign-in.
+func addSideLogin(l savedLogin, ownUser string, dup func(savedLogin)) (err error) {
+	defer func() { // after loginsMu is let go: Grok's is read by its accounts
+		if err == nil {
+			StaleAllowance(l.Agent, l.User)
+		}
+	}()
 	loginsMu.Lock()
 	defer loginsMu.Unlock()
 	ls := readLogins()
@@ -261,6 +279,11 @@ func addSideLogin(l savedLogin, ownUser string, dup func(savedLogin)) error {
 			ls[i].Auth, ls[i].Home, ls[i].Plan, ls[i].Seen = l.Auth, l.Home, l.Plan, l.Seen
 			if l.Agent == "copilot" {
 				ls[i].AccessSKU = l.AccessSKU
+			}
+			// a new sign-in: the token its vendor refused is gone
+			// (copilot_lapsed.go, signin_revoked.go)
+			if l.Agent == "copilot" || strings.HasPrefix(ls[i].Refused, revokedPrefix) {
+				ls[i].Lapsed, ls[i].Refused = "", ""
 			}
 			if old.own() {
 				ls[i].On = true

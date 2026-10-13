@@ -35,6 +35,7 @@ import (
 
 	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
+	"github.com/ChisaAlter/WhaleBridge/internal/proc"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
@@ -50,7 +51,7 @@ var cursorLocalApp = func() string {
 	cursorLocalSeen.Lock()
 	defer cursorLocalSeen.Unlock()
 	if time.Since(cursorLocalSeen.at) > 30*time.Second {
-		cursorLocalSeen.app, cursorLocalSeen.at = findCursorLocal(cursorLocalRoots()), time.Now()
+		cursorLocalSeen.app, cursorLocalSeen.at = findCursorLocal(cursorLocalRoots(), cursorLocalInstalls()...), time.Now()
 	}
 	return cursorLocalSeen.app
 }
@@ -64,58 +65,95 @@ var cursorLocalSeen struct {
 }
 
 // cursorLocalRoots are the folders apps are installed in on this system.
+// On Linux the build comes as an AppImage (Cursor_Private_Inference-<v>-
+// x86_64.AppImage), kept wherever it was downloaded, so the folders it is
+// usually kept in are looked in too.
 func cursorLocalRoots() []string {
 	home, _ := os.UserHomeDir()
 	switch runtime.GOOS {
 	case "darwin":
-		return []string{"/Applications", filepath.Join(home, "Applications")}
+		return macAppFolders(home)
 	case "windows":
+		// LOCALAPPDATA is the user's (a test's lies under its home);
+		// ProgramFiles is the machine's, so it goes through SystemDirs
 		var out []string
-		for _, v := range []string{"LOCALAPPDATA", "ProgramFiles"} {
-			if d := os.Getenv(v); d != "" {
+		for _, d := range append([]string{os.Getenv("LOCALAPPDATA")}, proc.SystemDirs(os.Getenv("ProgramFiles"))...) {
+			if d != "" {
 				out = append(out, filepath.Join(d, "Programs"), d)
 			}
 		}
 		return out
 	}
-	return []string{"/opt", "/usr/share", "/usr/lib", filepath.Join(home, ".local", "share"), filepath.Join(home, "Applications")}
+	return append(proc.SystemDirs("/opt", "/usr/share", "/usr/lib"), filepath.Join(home, ".local", "share"), filepath.Join(home, "Applications"),
+		filepath.Join(home, ".local", "bin"), filepath.Join(home, "bin"), filepath.Join(home, "Downloads"), home)
 }
 
 // findCursorLocal is the program of the Cursor Private Inference among the
-// apps in roots: one whose product.json names it, a Mac's bundle by its
-// Info.plist's CFBundleExecutable, else by the applicationName
-// product.json gives (cursor, Cursor.exe).
-func findCursorLocal(roots []string) string {
+// apps in roots, else the first of installs (folders it was installed in,
+// as Windows' list of installed programs gives them, which may be any
+// folder the user picked in its installer).
+func findCursorLocal(roots []string, installs ...string) string {
 	for _, root := range roots {
 		ents, err := os.ReadDir(root)
 		if err != nil {
 			continue
 		}
 		for _, e := range ents {
-			dir := filepath.Join(root, e.Name())
-			if strings.HasSuffix(e.Name(), ".app") {
-				res := filepath.Join(dir, "Contents", "Resources", "app")
-				if p, ok := cursorLocalProduct(res); ok {
-					if exe := plistExecutable(filepath.Join(dir, "Contents", "Info.plist")); exe != "" {
-						return filepath.Join(dir, "Contents", "MacOS", exe)
-					}
-					return filepath.Join(dir, "Contents", "MacOS", p.macExe())
-				}
-				continue
-			}
-			if p, ok := cursorLocalProduct(filepath.Join(dir, "resources", "app")); ok {
-				name := p.exe()
-				if runtime.GOOS == "windows" {
-					name = p.NameShort + ".exe"
-					if !isFile(filepath.Join(dir, name)) {
-						name = p.exe() + ".exe"
-					}
-				}
-				return filepath.Join(dir, name)
+			if exe := cursorLocalAt(filepath.Join(root, e.Name())); exe != "" {
+				return exe
 			}
 		}
 	}
+	for _, dir := range installs {
+		if exe := cursorLocalAt(dir); exe != "" {
+			return exe
+		}
+	}
 	return ""
+}
+
+// cursorLocalAt is the program of the build installed at dir, "" when dir
+// isn't it: one whose product.json names it, a Mac's bundle by its
+// Info.plist's CFBundleExecutable, else by the applicationName product.json
+// gives (cursor, Cursor.exe); or its AppImage on Linux, by the name it is
+// downloaded under.
+func cursorLocalAt(dir string) string {
+	name := filepath.Base(dir)
+	if strings.HasSuffix(name, ".app") {
+		res := filepath.Join(dir, "Contents", "Resources", "app")
+		if p, ok := cursorLocalProduct(res); ok {
+			if exe := plistExecutable(filepath.Join(dir, "Contents", "Info.plist")); exe != "" {
+				return filepath.Join(dir, "Contents", "MacOS", exe)
+			}
+			return filepath.Join(dir, "Contents", "MacOS", p.macExe())
+		}
+		return ""
+	}
+	if cursorLocalAppImage(name) && isFile(dir) {
+		return dir
+	}
+	if p, ok := cursorLocalProduct(filepath.Join(dir, "resources", "app")); ok {
+		exe := p.exe()
+		if runtime.GOOS == "windows" {
+			exe = p.NameShort + ".exe"
+			if !isFile(filepath.Join(dir, exe)) {
+				exe = p.exe() + ".exe"
+			}
+		}
+		return filepath.Join(dir, exe)
+	}
+	return ""
+}
+
+// cursorLocalAppImage says a file's name is the build's AppImage as it is
+// downloaded (Cursor_Private_Inference-3.24.9-x86_64.AppImage), which
+// regular Cursor's (Cursor-3.24.9-x86_64.AppImage) isn't.
+func cursorLocalAppImage(name string) bool {
+	n := strings.ToLower(name)
+	if !strings.HasSuffix(n, ".appimage") {
+		return false
+	}
+	return strings.HasPrefix(strings.NewReplacer("_", "", "-", "", " ", "").Replace(n), "cursorprivateinference")
 }
 
 type cursorProduct struct {
@@ -175,7 +213,7 @@ func plistExecutable(path string) string {
 // the app has the variables; opened from the Dock or Finder it has only
 // the login shell's.
 func CursorLocalLaunch(app, gw string) string {
-	key, base := gateway.TokenFor(CursorLocalID), gw+"/v1"
+	key, base := agentKeyAt(CursorLocalID, gw), gw+"/v1"
 	if runtime.GOOS == "windows" {
 		return `$env:CURSOR_LOCAL_AGENT_BASE_URL="` + base + `"; $env:CURSOR_LOCAL_AGENT_API_KEY="` + key + `"; & '` + strings.ReplaceAll(app, "'", "''") + `'`
 	}
@@ -187,7 +225,7 @@ var cursorLocalVars = []string{"CURSOR_LOCAL_AGENT_BASE_URL", "CURSOR_LOCAL_AGEN
 
 // cursorLocalEnv is what they are set to for the gateway at gw.
 func cursorLocalEnv(gw string) map[string]string {
-	return map[string]string{cursorLocalVars[0]: gw + "/v1", cursorLocalVars[1]: gateway.TokenFor(CursorLocalID)}
+	return map[string]string{cursorLocalVars[0]: gw + "/v1", cursorLocalVars[1]: agentKeyAt(CursorLocalID, gw)}
 }
 
 // cursorLocalMark is magpie's own note that the variables are set for the
@@ -243,7 +281,7 @@ func KeepCursorLocalEnv(context.Context) {
 
 func cursorLocal() *Agent {
 	return &Agent{
-		ID: CursorLocalID, Name: cursorLocalName, Icon: "cursor", Aliases: []string{"cursor-private-inference"},
+		ID: CursorLocalID, Name: cursorLocalName, Icon: "cursor", Aliases: []string{"cursor-private-inference"}, NoNames: true,
 		// its model picker lists the gateway's /models as its key is shown
 		// them, which the row's Models button picks
 		ListsModels: true,
@@ -282,7 +320,7 @@ func cursorLocal() *Agent {
 			},
 		}},
 		Notice: func() string {
-			return cursorLocalName + " reads magpie's gateway from CURSOR_LOCAL_AGENT_BASE_URL and CURSOR_LOCAL_AGENT_API_KEY, now set for your user: quit it (the app, not only its window) and open it again, as it keeps the model list it was first given until it quits. A base URL or API key set in its Open configuration or a model's settings comes first, so leave both empty (or set the base URL to " + gateway.URL() + "/v1 and the key to " + gateway.TokenFor(CursorLocalID) + ")."
+			return noticeCursorLocal.say("agent", cursorLocalName, "url", gateway.URL()+"/v1", "key", agentKey(CursorLocalID))
 		},
 	}
 }
@@ -309,3 +347,6 @@ func cursorLocalEfforts() []Option {
 	}
 	return append([]Option{{Value: ""}}, static(levels...)...)
 }
+
+// what Cursor Private Inference says after a change (notice.go)
+var noticeCursorLocal = newNotice("{agent} reads magpie's gateway from CURSOR_LOCAL_AGENT_BASE_URL and CURSOR_LOCAL_AGENT_API_KEY, now set for your user: quit it (the app, not only its window) and open it again, as it keeps the model list it was first given until it quits. A base URL or API key set in its Open configuration or a model's settings comes first, so leave both empty (or set the base URL to {url} and the key to {key}).")

@@ -122,6 +122,9 @@ type pluginCheckiner struct {
 func (c pluginCheckiner) clock() time.Time { return c.now() }
 
 func (c pluginCheckiner) checkinNow(ctx context.Context, soon bool) []WorkBuddyCheckin {
+	if discoveryOff() {
+		return nil
+	}
 	var out []WorkBuddyCheckin
 	for _, p := range pluginCheckinProviders() {
 		if c.only != nil && !c.only(p.ID) {

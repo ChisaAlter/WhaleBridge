@@ -39,8 +39,9 @@ var (
 	dsmlParam  = regexp.MustCompile(`(?s)<\s*[|｜][\s|｜]*DSML[\s|｜]*parameter\s+name\s*=\s*"([^"]+)"((?:\s+\w+\s*=\s*"[^"]*")*)\s*>(.*?)` + dsmlTag + `parameter\s*>`)
 	dsmlClose  = regexp.MustCompile(`<\s*/\s*[|｜][\s|｜]*DSML[\s|｜]*invoke\s*>`)
 	dsmlString = regexp.MustCompile(`string\s*=\s*"true"`)
-	// what is left of the tags once the calls are read out
-	textCallJunk = regexp.MustCompile(dsmlTag + `[^<>]*>?|</?tool_calls?>`)
+	// what is left of the tags once the calls are read out, and the
+	// braces, quotes or > GLM leaves before a close (#1945)
+	textCallJunk = regexp.MustCompile(dsmlTag + `[^<>]*>?|[}\]"'>]*\s*</tool_calls?>|<tool_calls?>`)
 )
 
 // textCallNames are the tools a request offers, by name.
@@ -67,7 +68,7 @@ func chatToolNames(body []byte) map[string]bool {
 			Name string `json:"name"`
 		} `json:"tools"`
 	}
-	if json.Unmarshal(body, &q) != nil || len(q.Tools) == 0 {
+	if decodeJSON(body, &q) != nil || len(q.Tools) == 0 {
 		return nil
 	}
 	m := map[string]bool{}
@@ -206,8 +207,21 @@ func hermesCall(s string, names map[string]bool) (writtenCall, int, bool) {
 		return writtenCall{}, 0, false
 	}
 	n := lead + back(int(dec.InputOffset()))
-	if t := strings.TrimLeft(s[n:], " \t\r\n"); strings.HasPrefix(t, "</tool_call>") {
-		n = len(s) - len(t) + len("</tool_call>")
+	// what follows the object up to its close: GLM leaves braces,
+	// brackets, quotes or a > of its own there (}}</tool_call>,
+	// "></tool_call>, #1945), taken with the close. Other text right
+	// after the object, before a close, means the object ended early, at
+	// a quote a string's content left unescaped (a heredoc's command cut
+	// short, #1945): no call, rather than one cut wrong
+	junk := len(s[n:]) - len(strings.TrimLeft(s[n:], " \t\r\n}]\"'>"))
+	next := s[n+junk:]
+	if strings.HasPrefix(next, "</tool_call>") {
+		return writtenCall{Name: v.Name, Args: args}, n + junk + len("</tool_call>"), true
+	}
+	if strings.TrimLeft(s[n:n+junk], " \t\r\n") != "" || (junk == 0 && next != "" && next[0] != '<') {
+		if strings.Contains(next, "</tool_call>") {
+			return writtenCall{}, 0, false
+		}
 	}
 	return writtenCall{Name: v.Name, Args: args}, n, true
 }
@@ -256,7 +270,7 @@ func paramCall(s string, names map[string]bool) (writtenCall, int, bool) {
 		val := strings.Trim(s[n:end], "\r\n")
 		val = strings.TrimSuffix(val, cutMark(val))
 		var v any
-		if json.Unmarshal([]byte(strings.TrimSpace(val)), &v) == nil {
+		if decodeJSON([]byte(strings.TrimSpace(val)), &v) == nil {
 			args[key] = v
 		} else {
 			args[key] = val
@@ -301,7 +315,7 @@ func glmCall(s string, names map[string]bool) (writtenCall, int, bool) {
 		}
 		key, val := strings.TrimSpace(s[n+p[2]:n+p[3]]), s[n+p[4]:n+p[5]]
 		var v any
-		if json.Unmarshal([]byte(strings.TrimSpace(val)), &v) == nil {
+		if decodeJSON([]byte(strings.TrimSpace(val)), &v) == nil {
 			args[key] = v
 		} else {
 			args[key] = val
@@ -344,7 +358,7 @@ func dsmlCall(s, name string, open int, names map[string]bool) (writtenCall, int
 			continue
 		}
 		var v any
-		if json.Unmarshal([]byte(strings.TrimSpace(val)), &v) == nil {
+		if decodeJSON([]byte(strings.TrimSpace(val)), &v) == nil {
 			args[p[1]] = v
 		} else {
 			args[p[1]] = val
@@ -366,14 +380,14 @@ func callArgs(raw json.RawMessage) (json.RawMessage, bool) {
 	}
 	if raw[0] == '"' {
 		var s string
-		if json.Unmarshal(raw, &s) != nil {
+		if decodeJSON(raw, &s) != nil {
 			return nil, false
 		}
 		fixed, _ := escapeRawControls(strings.TrimSpace(s))
 		raw = json.RawMessage(fixed)
 	}
 	var m map[string]any
-	if json.Unmarshal(raw, &m) != nil {
+	if decodeJSON(raw, &m) != nil {
 		return nil, false
 	}
 	b, err := json.Marshal(m)
@@ -622,4 +636,58 @@ func (t *textCallTidy) line(line []byte) []byte {
 		return append(pre, line...)
 	}
 	return append(append(append(pre, "data: "...), nb...), line[len(body):]...)
+}
+
+// mayWriteCalls tells whether a whole Chat reply b could carry a call
+// written into its text, for a request that offered names: one of
+// textCallMarks' words is in it, however its JSON escapes the brackets.
+func mayWriteCalls(b []byte, names map[string]bool) bool {
+	return names != nil && (bytes.Contains(b, []byte("tool_call")) || bytes.Contains(b, []byte("DSML")))
+}
+
+// wholeTextCalls reads the calls written into the content of a whole Chat
+// reply's message, as textCallTidy reads a stream's: the text before the
+// first is kept, the blocks become tool_calls and what is left of their
+// tags goes. wrote is whether msg changed, called whether it now calls
+// tools. A message that made a call itself, or whose written blocks
+// aren't all calls of names with arguments that can be read, is left as
+// it came.
+func wholeTextCalls(msg map[string]json.RawMessage, names map[string]bool) (wrote, called bool) {
+	if names == nil {
+		return false, false
+	}
+	var native []json.RawMessage
+	if decodeJSON(msg["tool_calls"], &native) == nil && len(native) > 0 {
+		return false, false
+	}
+	var s string
+	if decodeJSON(msg["content"], &s) != nil {
+		return false, false
+	}
+	at, _ := textCallAt(s)
+	if at < 0 {
+		return false, false
+	}
+	calls, rest, ok := parseTextCalls(s[at:], names)
+	if !ok {
+		return false, false
+	}
+	text := s[:at] + rest
+	if len(calls) == 0 {
+		// tags and nothing else, dropped as a stream drops them
+		msg["content"], _ = marshalPlain(text)
+		return true, false
+	}
+	tcs := make([]map[string]any, len(calls))
+	for i, c := range calls {
+		tcs[i] = map[string]any{"id": textCallID(), "type": "function",
+			"function": map[string]any{"name": c.Name, "arguments": string(c.Args)}}
+	}
+	if text != "" {
+		msg["content"], _ = marshalPlain(text)
+	} else {
+		msg["content"] = json.RawMessage("null")
+	}
+	msg["tool_calls"], _ = marshalPlain(tcs)
+	return true, true
 }

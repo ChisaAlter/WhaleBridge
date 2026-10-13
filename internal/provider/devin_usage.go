@@ -53,8 +53,9 @@ func devinNum(raw json.RawMessage) (float64, bool) {
 
 type devinPlanStatus struct {
 	PlanInfo struct {
-		HideDaily  bool `json:"hideDailyQuota"`
-		HideWeekly bool `json:"hideWeeklyQuota"`
+		HideDaily  bool   `json:"hideDailyQuota"`
+		HideWeekly bool   `json:"hideWeeklyQuota"`
+		Billing    string `json:"billingStrategy"`
 	} `json:"planInfo"`
 	PlanEnd     string          `json:"planEnd"`
 	DailyLeft   json.RawMessage `json:"dailyQuotaRemainingPercent"`
@@ -66,14 +67,18 @@ type devinPlanStatus struct {
 	Overage     json.RawMessage `json:"overageBalanceMicros"`
 }
 
-// devinQuota fills q from a plan's status. A quota Devin leaves out is not
-// taken for used up.
+// devinQuota fills q from a plan's status. JSON leaves a 0 out, so on a
+// quota-billed plan a quota with a reset and no share left is used up: a
+// week at 0% left came as no weeklyQuotaRemainingPercent beside the day's
+// 100, and the day alone was shown, at 0% (面条 on magpie's Discord).
+// Billed otherwise, a share left out is no quota.
 func devinQuota(q *SubscriptionQuota, st devinPlanStatus) {
 	var end *time.Time
 	if t, err := time.Parse(time.RFC3339Nano, st.PlanEnd); err == nil {
 		end = &t
 		q.Until = &t
 	}
+	quota := st.PlanInfo.Billing == "BILLING_STRATEGY_QUOTA"
 	for _, w := range []struct {
 		name        string
 		span        time.Duration
@@ -84,11 +89,12 @@ func devinQuota(q *SubscriptionQuota, st devinPlanStatus) {
 		{"7 days", 7 * 24 * time.Hour, st.WeeklyLeft, st.WeeklyReset, st.PlanInfo.HideWeekly},
 	} {
 		left, ok := devinNum(w.left)
-		if w.hide || !ok {
+		at, _ := devinNum(w.reset)
+		if w.hide || !ok && !(quota && at > 0) {
 			continue
 		}
 		x := QuotaWindow{Name: w.name, Used: min(100, max(0, 100-left)), Span: w.span}
-		if at, _ := devinNum(w.reset); at > 0 {
+		if at > 0 {
 			t := time.Unix(int64(at), 0).UTC()
 			x.ResetsAt = &t
 		}

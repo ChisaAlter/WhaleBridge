@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/access"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
@@ -26,20 +27,25 @@ type SessionRoute struct {
 	Kind        string       `json:"kind,omitempty"`         // a side call's: a title, a subagent…
 	Asked       string       `json:"asked"`                  // the model as the agent asked
 	AskedEffort string       `json:"asked_effort,omitempty"` // the reasoning it asked for
+	AskedTier   string       `json:"asked_tier,omitempty"`   // the service tier it asked for
 	Group       string       `json:"group,omitempty"`        // the routing group's id, when it asked one
 	Rule        *RuleHit     `json:"rule,omitempty"`         // the group's rules, as the Routing page has them
 	Nested      []NestedRule `json:"nested,omitempty"`
 	// Model and Effort: the try under way, or the last, as provider/model
 	// and the reasoning it was sent at
-	Model  string     `json:"model,omitempty"`
-	Effort string     `json:"effort,omitempty"`
-	Served string     `json:"served,omitempty"` // the model the reply says answered
-	Tries  []RouteTry `json:"tries"`
-	Done   bool       `json:"done"`
-	Status int        `json:"status,omitempty"`
-	Error  string     `json:"error,omitempty"`
-	Millis int64      `json:"ms,omitempty"`
-	TTFT   int64      `json:"ttft_ms,omitempty"`
+	Model  string `json:"model,omitempty"`
+	Effort string `json:"effort,omitempty"`
+	// Tier and TierServed: the service tier that try went out at, and the
+	// one its reply said it ran at, when it said one (#1784)
+	Tier       string     `json:"tier,omitempty"`
+	TierServed string     `json:"tier_served,omitempty"`
+	Served     string     `json:"served,omitempty"` // the model the reply says answered
+	Tries      []RouteTry `json:"tries"`
+	Done       bool       `json:"done"`
+	Status     int        `json:"status,omitempty"`
+	Error      string     `json:"error,omitempty"`
+	Millis     int64      `json:"ms,omitempty"`
+	TTFT       int64      `json:"ttft_ms,omitempty"`
 }
 
 // RouteTry is one member trying the request: each failed one was fallen
@@ -47,14 +53,18 @@ type SessionRoute struct {
 type RouteTry struct {
 	Model  string `json:"model"` // provider/model
 	Effort string `json:"effort,omitempty"`
-	Done   bool   `json:"done"`
-	Status int    `json:"status,omitempty"`
-	Fail   string `json:"fail,omitempty"` // why it failed, as the trace tells it
-	Millis int64  `json:"ms,omitempty"`
+	// Tier: the service tier it went out at; TierServed: the one its
+	// reply said it ran at
+	Tier       string `json:"tier,omitempty"`
+	TierServed string `json:"tier_served,omitempty"`
+	Done       bool   `json:"done"`
+	Status     int    `json:"status,omitempty"`
+	Fail       string `json:"fail,omitempty"` // why it failed, as the trace tells it
+	Millis     int64  `json:"ms,omitempty"`
 }
 
 func sessionRouteOf(r Route) SessionRoute {
-	out := SessionRoute{ID: r.ID, Time: r.Time, Kind: r.Kind, Asked: r.Model, AskedEffort: r.Effort, Rule: r.Rule, Nested: r.Nested,
+	out := SessionRoute{ID: r.ID, Time: r.Time, Kind: r.Kind, Asked: r.Model, AskedEffort: r.Effort, AskedTier: r.Tier, Rule: r.Rule, Nested: r.Nested,
 		Served: r.Served, Tries: []RouteTry{}, Done: r.Done, Status: r.Status, Error: r.Error, Millis: r.Millis, TTFT: r.TTFT}
 	if r.Group != nil {
 		out.Group = r.Group.ID
@@ -75,10 +85,11 @@ func sessionRouteOf(r Route) SessionRoute {
 		if p := providerOf(t.ID); p != "" && model != "" {
 			model = p + "/" + model
 		}
-		out.Tries = append(out.Tries, RouteTry{Model: model, Effort: t.Effort, Done: t.Done, Status: t.Status, Fail: t.Fail, Millis: t.Millis})
+		out.Tries = append(out.Tries, RouteTry{Model: model, Effort: t.Effort, Tier: t.Tier, TierServed: t.TierServed, Done: t.Done, Status: t.Status, Fail: t.Fail, Millis: t.Millis})
 	}
 	if n := len(out.Tries); n > 0 {
 		out.Model, out.Effort = out.Tries[n-1].Model, out.Tries[n-1].Effort
+		out.Tier, out.TierServed = out.Tries[n-1].Tier, out.Tries[n-1].TierServed
 	}
 	return out
 }
@@ -88,7 +99,9 @@ func sessionRouteOf(r Route) SessionRoute {
 // session's latest route, null before it has one. With after=<seq> and
 // wait=<seconds> it waits, up to a minute, for the route to change past
 // seq. Like the quotas, it answers this machine, and another only with the
-// shared gateway's key.
+// shared gateway's key. A key held to a budget, models or accounts is told
+// only the routes of its own requests (#1981): a session id is not a
+// secret the key can be trusted to lack.
 func (s *Server) sessionRoute(w http.ResponseWriter, r *http.Request) {
 	if !local(r) && !sharedWith(r) {
 		writeError(w, provider.Chat, http.StatusForbidden, "magpie's routes are told to another machine only when magpie is shared on the local network (Settings → Share on local network) and the request carries its API key (Authorization: Bearer <key> or x-api-key: <key>)")
@@ -109,7 +122,11 @@ func (s *Server) sessionRoute(w http.ResponseWriter, r *http.Request) {
 	after, _ := strconv.ParseInt(q.Get("after"), 10, 64)
 	secs, _ := strconv.ParseFloat(q.Get("wait"), 64)
 	wait := min(time.Duration(secs*float64(time.Second)), routeWaitMax)
-	seq, route := s.trace.sessionLatest(r.Context(), session, after, wait)
+	only := ""
+	if who := access.Caller(r.Context()); heldKey(who) {
+		only = who.KeyID
+	}
+	seq, route := s.trace.sessionLatest(r.Context(), session, only, after, wait)
 	out := map[string]any{"session": session, "seq": seq, "route": nil}
 	if route != nil {
 		out["route"] = sessionRouteOf(*route)
@@ -118,8 +135,9 @@ func (s *Server) sessionRoute(w http.ResponseWriter, r *http.Request) {
 }
 
 // sessionLatest is a copy of session's latest route, and its seq; with
-// wait, it waits up to that long for it to change past after.
-func (t *trace) sessionLatest(ctx context.Context, session string, after int64, wait time.Duration) (int64, *Route) {
+// wait, it waits up to that long for it to change past after. With only
+// set, the routes of the requests made with that gateway key alone.
+func (t *trace) sessionLatest(ctx context.Context, session, only string, after int64, wait time.Duration) (int64, *Route) {
 	deadline := time.NewTimer(max(wait, 0))
 	defer deadline.Stop()
 	for {
@@ -127,7 +145,7 @@ func (t *trace) sessionLatest(ctx context.Context, session string, after int64, 
 		var seq int64
 		var found *Route
 		for i := len(t.routes) - 1; i >= 0; i-- {
-			if r := t.routes[i]; r.Session == session {
+			if r := t.routes[i]; r.Session == session && (only == "" || r.callerKey == only) {
 				c := *r
 				c.Order = append([]Weighed{}, r.Order...) // [] for none: the GUI reads it as a list
 				c.Left = append([]Weighed(nil), r.Left...)

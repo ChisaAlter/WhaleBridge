@@ -20,6 +20,7 @@
 // keychain, the folders the OS reads for autostart and link handling, and
 // temporary folders.
 //
+
 // The decision is made once, from the executable as it was when magpie
 // started: an update moving the running copy aside (into .magpie-update on
 // a Mac, to magpie.exe.old on Windows) leaves it running from somewhere
@@ -57,6 +58,7 @@ func Portable() string {
 			return
 		}
 		portable = Resolve(exe)
+
 	})
 	return portable
 }
@@ -83,6 +85,7 @@ func Resolve(exe string) string {
 		return absolute(data)
 	}
 	if fi, err := os.Stat(filepath.Join(base, MarkerName)); err == nil && !fi.IsDir() {
+
 		return absolute(data)
 	}
 	return ""

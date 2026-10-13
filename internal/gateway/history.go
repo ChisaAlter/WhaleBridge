@@ -40,6 +40,19 @@ func HistoryDir() string { return filepath.Join(filepath.Dir(provider.Path()), "
 // routing directory back into its temporary HOME as that is removed.
 var keepRoutes = true
 
+// testSandbox is testenv.Marker, which gateway can't import outside its
+// tests: set in a test binary testenv isolated.
+const testSandbox = "MAGPIE_TEST_SANDBOX"
+
+// keepsRoutes says whether a done route is written to disk: never in a test
+// binary testenv isolated. The write runs behind the request that ended the
+// route, so one still going when its test ended put routing/ back into the
+// test's config folder as that was removed, failing its TempDir cleanup
+// with "directory not empty": internal/gui's TestContextTextAPI (#1543),
+// and any package whose tests send a request through a gateway (gui, tui,
+// agent, davsync). No test outside this package reads the history back.
+func keepsRoutes() bool { return keepRoutes && os.Getenv(testSandbox) == "" }
+
 var history struct {
 	mu     sync.Mutex
 	pruned time.Time
@@ -84,7 +97,10 @@ func saveRoute(r Route) {
 }
 
 // pruneHistory gzips the days that are over, and drops the days older than
-// historyDays, then the oldest until what is left fits historyBytes.
+// historyDays, then the oldest until what is left fits historyBytes. A day
+// goes whole, as it does once its late routes are in its .gz: a late route's
+// file left beside the .gz (gzipFile) goes with it. A file that can't be
+// removed stays.
 func pruneHistory(dir string, now time.Time) {
 	// a .gz.tmp left by a magpie stopped before renaming it (gzipFile) goes
 	// once it is an hour old: a younger one may be another magpie's, still
@@ -110,10 +126,12 @@ func pruneHistory(dir string, now time.Time) {
 	for _, d := range days {
 		total += d.size
 	}
+	drop := ""               // the day being dropped, whole: historyFiles puts its files next to each other
 	for _, d := range days { // oldest first
-		if d.day >= oldest && total <= historyBytes || d.day == today {
+		if d.day != drop && (d.day >= oldest && total <= historyBytes || d.day == today) {
 			continue
 		}
+		drop = d.day
 		if os.Remove(d.path) == nil {
 			total -= d.size
 		}
@@ -293,12 +311,15 @@ func History(day string) (days []HistoryDay, routes []Route, cut bool) {
 // another magpie's routing group was marked swapped for the member it
 // routed to, and is routed (usage.GroupRouted). A try kept marked swapped
 // for its model spelled with other separators (deepseek-v4.1-flash
-// answered as deepseek-v4-1-flash) wasn't swapped (usage.SameSpelled).
+// answered as deepseek-v4-1-flash) wasn't swapped (usage.SameSpelled), nor
+// was one answered under Google's name for the deployment serving its
+// Gemini model (gemini-3.8-flash as gemini-3.8-flash-n) or xAI's for a Grok
+// one (grok-4.7 as grok-4.7-build), usage.ServingName.
 func (r *Route) routedAgain() {
 	for i := range r.Tries {
 		if tr := &r.Tries[i]; tr.Swapped && usage.GroupRouted(tr.Model, tr.Served) {
 			tr.Swapped, tr.Routed = false, true
-		} else if tr.Swapped && usage.SameSpelled(tr.Model, tr.Served) {
+		} else if tr.Swapped && (usage.SameSpelled(tr.Model, tr.Served) || usage.ServingName(tr.Model, tr.Served)) {
 			tr.Swapped = false
 		}
 	}

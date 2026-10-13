@@ -2,12 +2,12 @@ package agent
 
 import (
 	"fmt"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
+	"github.com/ChisaAlter/WhaleBridge/internal/proc"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
@@ -135,6 +135,15 @@ func geminiIn(at place) *Agent {
 			}
 			return fmt.Errorf("pick a model via magpie instead; that routes Gemini CLI through the gateway")
 		}
+		// an auth it doesn't know is refused before magpie is taken out:
+		// `magpie gemini <a model it has no option for>` comes here, and
+		// unrouted Gemini CLI first, as `magpie snow --help` took magpie
+		// out of Snow (#1457)
+		switch id {
+		case "", "custom", "google", "vertex", "api-key":
+		default:
+			return fmt.Errorf("%q is neither one of Gemini CLI's models nor an auth (google, api-key, vertex): nothing was changed", id)
+		}
 		if err := unroute(); err != nil {
 			return err
 		}
@@ -173,7 +182,7 @@ func geminiIn(at place) *Agent {
 	}
 
 	return &Agent{
-		ID: "gemini", Name: "Gemini CLI", Icon: "geminicli-color", Aliases: []string{"gemini-cli"},
+		ID: "gemini", Name: "Gemini CLI", Icon: "geminicli-color", Aliases: []string{"gemini-cli"}, NoNames: true,
 		UA:  []string{"geminicli", "gemini-cli"},
 		Bin: "gemini", Dir: dir, Path: path,
 		// its model's default forgets what it had before magpie, its
@@ -189,7 +198,7 @@ func geminiIn(at place) *Agent {
 			if Taken(dir) {
 				return false
 			}
-			_, err := exec.LookPath("gemini")
+			_, err := proc.Look("gemini")
 			return err == nil
 		},
 		Check: func() string {
@@ -207,7 +216,7 @@ func geminiIn(at place) *Agent {
 		},
 		Notice: func() string {
 			if Running(`(^|/)gemini( |$)`) {
-				return "Gemini CLI reads its settings at start-up — restart open gemini sessions to see this."
+				return noticeGemini.String()
 			}
 			return ""
 		},
@@ -271,3 +280,8 @@ func delModelName(path string) error {
 	}
 	return nil
 }
+
+// what gemini says after a change (notice.go)
+var (
+	noticeGemini = newNotice("Gemini CLI reads its settings at start-up — restart open gemini sessions to see this.")
+)

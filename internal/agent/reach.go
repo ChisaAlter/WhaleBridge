@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"cmp"
+	"encoding/json"
 	"net"
 	"net/http"
 	"net/url"
@@ -10,6 +12,8 @@ import (
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
+	"github.com/ChisaAlter/WhaleBridge/internal/netproxy"
+	"github.com/ChisaAlter/WhaleBridge/internal/wslrun"
 )
 
 // An agent pointed at magpie by an address other than this machine's
@@ -40,6 +44,97 @@ func realReachProbe(base string) bool {
 	return true
 }
 
+// magpieProbe says whether base answers as a magpie gateway: GET base/ is
+// 200 with {"name":"magpie"} (the gateway's info), as it is through a
+// reverse proxy that forwards base to it. A var for tests.
+var magpieProbe = realMagpieProbe
+
+func realMagpieProbe(base string) bool {
+	c := &http.Client{Timeout: 3 * time.Second}
+	res, err := c.Get(strings.TrimSuffix(base, "/") + "/")
+	if err != nil {
+		return false
+	}
+	return answersAsMagpie(res)
+}
+
+// answersAsMagpie: res, closed here, is the gateway's info (GET /).
+func answersAsMagpie(res *http.Response) bool {
+	defer res.Body.Close()
+	var info struct {
+		Name string `json:"name"`
+	}
+	return res.StatusCode == http.StatusOK && json.NewDecoder(res.Body).Decode(&info) == nil && info.Name == "magpie"
+}
+
+// magpieAt is whether base answers as magpie (magpieProbe), and whether
+// that is known yet: the last probe's answer, a new one started in the
+// background as reachable does, never waited for. A var for tests, which
+// are told no without a probe.
+var magpieAt = func(base string) (ok, known bool) {
+	return probed("magpie "+base, func() bool { return magpieProbe(base) })
+}
+
+// proxyBase is v, the address an agent's config names where magpie wrote
+// want, with want's path (/v1 where want has it) cut off its end, when
+// that can be another way to magpie: a URL on another machine or a name,
+// such as a company's reverse proxy in front of the gateway (davisjiahao,
+// #1985: https://ai.corp.example/magpie forwarding to 127.0.0.1:3425), or
+// one on this machine's loopback with a path of its own before magpie's (a
+// compliance proxy's http://127.0.0.1:8788/claude-code-anthropic/<route>).
+// One on loopback with none is magpie's own on an older port, never
+// another way to it.
+func proxyBase(v, want string) (string, bool) {
+	w, err := url.Parse(want)
+	if err != nil || (w.Scheme != "http" && w.Scheme != "https") || w.Host == "" {
+		return "", false
+	}
+	base, ok := strings.CutSuffix(strings.TrimSuffix(strings.TrimSpace(v), "/"), strings.TrimSuffix(w.Path, "/"))
+	if !ok || !onAnotherMachine(base) && !loopbackWithPath(base) {
+		return "", false
+	}
+	if u, err := url.Parse(base); err != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return "", false
+	}
+	return base, true
+}
+
+// loopbackWithPath says base is an http(s) address on this machine's
+// loopback with a path: a local proxy's route, never the gateway's own
+// address, which has none.
+func loopbackWithPath(base string) bool {
+	u, err := url.Parse(base)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" || onAnotherMachine(base) {
+		return false
+	}
+	return strings.Trim(u.Path, "/") != ""
+}
+
+// reachesMagpie says v reaches magpie another way (proxyBase) whose root
+// answers as magpie. Until it has been tried it is taken as reaching
+// magpie, as an address not yet tried isn't unreachable either: telling
+// drift first would offer Reconnect, which writes the proxy away.
+func reachesMagpie(v, want string) bool {
+	base, ok := proxyBase(v, want)
+	if !ok {
+		return false
+	}
+	ok, known := magpieAt(base)
+	return ok || !known
+}
+
+// surelyMagpie is reachesMagpie once magpie has answered there: what a
+// write that keeps the address waits for, so a relay not yet tried never
+// gets magpie's model or key.
+func surelyMagpie(v, want string) bool {
+	base, ok := proxyBase(v, want)
+	if !ok {
+		return false
+	}
+	ok, known := magpieAt(base)
+	return ok && known
+}
+
 var reach struct {
 	sync.Mutex
 	m map[string]reachAnswer
@@ -54,31 +149,57 @@ type reachAnswer struct {
 // (known); a probe older than reachAge, or none, is started in the
 // background and never waited for, so Drift stays quick.
 func reachable(base string) (ok, known bool) {
+	probe := reachProbe
+	return probed(base, func() bool { return probe(base) })
+}
+
+// probed is reachable for any probe, kept under key: its last answer, and
+// whether there is one, with a new one started in the background when
+// that is older than reachAge.
+func probed(key string, probe func() bool) (ok, known bool) {
 	reach.Lock()
 	defer reach.Unlock()
 	if reach.m == nil {
 		reach.m = map[string]reachAnswer{}
 	}
-	a := reach.m[base]
+	a := reach.m[key]
 	if !a.busy && time.Since(a.at) > reachAge {
 		a.busy = true
-		reach.m[base] = a
-		probe := reachProbe
+		reach.m[key] = a
 		go func() {
-			ok := probe(base)
+			ok := probe()
 			reach.Lock()
-			reach.m[base] = reachAnswer{at: time.Now(), ok: ok}
+			reach.m[key] = reachAnswer{at: time.Now(), ok: ok}
 			reach.Unlock()
 		}()
 	}
 	return a.ok, !a.at.IsZero()
 }
 
-// offLoopback: base is an http address on a host other than this
+// probedNow is probed waited for: the last answer while it is fresh, else
+// one asked now, which the next probed of key gets too.
+func probedNow(key string, probe func() bool) bool {
+	reach.Lock()
+	a := reach.m[key]
+	reach.Unlock()
+	if !a.at.IsZero() && time.Since(a.at) <= reachAge {
+		return a.ok
+	}
+	ok := probe()
+	reach.Lock()
+	if reach.m == nil {
+		reach.m = map[string]reachAnswer{}
+	}
+	reach.m[key] = reachAnswer{at: time.Now(), ok: ok}
+	reach.Unlock()
+	return ok
+}
+
+// offLoopback: base is an http(s) address on a host other than this
 // machine's loopback and the gateway's own.
 func offLoopback(base string) bool {
 	u, err := url.Parse(base)
-	if err != nil || u.Scheme != "http" || u.Hostname() == "" {
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Hostname() == "" {
 		return false
 	}
 	h := u.Hostname()
@@ -118,7 +239,7 @@ func (a *Agent) unreachable(on Field, now string) *Drift {
 		return nil
 	}
 	d := &Drift{Kind: "unreachable", Field: on.Key, Now: now, Want: now, Addr: addr}
-	host := strings.TrimPrefix(addr, "http://")
+	host := strings.TrimPrefix(strings.TrimPrefix(addr, "http://"), "https://")
 	d.Detail = a.Name + " is pointed at magpie at " + addr + ", where nothing answers from this computer, though magpie answers at " + gateway.URL() + ". "
 	if a.WSL != "" || runtime.GOOS == "windows" {
 		d.Detail += "Under WSL's NAT networking, Windows as WSL sees it reaches magpie only while something listens on " + host +
@@ -137,8 +258,9 @@ func (a *Agent) unreachable(on Field, now string) *Drift {
 
 // wslMovedFrom is the address a WSL distro reaches Windows at now, when
 // base is on one it reached Windows at before (its networking's address
-// changed since), and that distro's name; "" otherwise. A host no distro
-// was seen at is the user's own, and is never offered to be moved.
+// changed since, or it is in mirrored or consomme networking now, where
+// that is 127.0.0.1), and that distro's name; "" otherwise. A host no
+// distro was seen at is the user's own, and is never offered to be moved.
 func wslMovedFrom(base string) (to, name string) {
 	u, err := url.Parse(base)
 	if err != nil {
@@ -148,17 +270,46 @@ func wslMovedFrom(base string) (to, name string) {
 	wsl.Lock()
 	defer wsl.Unlock()
 	for n, d := range wsl.seen {
-		if d == nil || d.Gateway == "" || d.Gateway == h {
+		if d == nil {
+			continue
+		}
+		loopback := wslrun.HostLoopback(d.Net)
+		if !loopback && (d.Gateway == "" || d.Gateway == h) {
 			continue
 		}
 		for _, w := range d.Was {
-			if w == h {
-				if port == "" {
-					port = gateway.Port()
-				}
-				return "http://" + net.JoinHostPort(d.Gateway, port), n
+			if w != h {
+				continue
 			}
+			if loopback {
+				return gateway.URL(), n
+			}
+			if port == "" {
+				port = gateway.Port()
+			}
+			return "http://" + net.JoinHostPort(d.Gateway, port), n
 		}
 	}
 	return "", ""
+}
+
+// proxied is the drift of an agent whose requests for the gateway go
+// through a proxy that doesn't pass them on to it, while the gateway
+// answers here; nil when they get there, or it isn't known yet.
+func (a *Agent) proxied(on Field, now string) *Drift {
+	if a.viaProxy == nil {
+		return nil
+	}
+	// with no proxy in the way, nothing is tried; with one, both are asked
+	// at once, so one round of probes settles it
+	ok, known, proxy, from := a.viaProxy()
+	if proxy == "" {
+		return nil
+	}
+	up, upKnown := reachable(gateway.URL())
+	if ok || !known || !up || !upKnown {
+		return nil
+	}
+	base := cmp.Or(a.pointedAt(), gateway.URL())
+	return &Drift{Kind: "proxied", Field: on.Key, Now: now, Want: now, Addr: netproxy.Redact(proxy), Detail: codexProxiedDetail(base, proxy, from)}
 }

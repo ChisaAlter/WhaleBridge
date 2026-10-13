@@ -2,10 +2,8 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"os"
-	"path/filepath"
+	"strings"
 )
 
 // The gateway's port is set in Settings (Magic_zero on Discord): every
@@ -37,18 +35,53 @@ func OnGateway() []*Agent {
 // what one it couldn't move failed with. Cursor Private Inference's
 // variables and dsh's routes, which magpie keeps on its own, follow too.
 func Rewire(as []*Agent) (moved []string, err error) {
-	var errs []error
+	var off []*Agent
 	for _, a := range as {
-		d := a.Drift()
-		if d == nil || d.Kind != "unwired" {
-			continue
+		if d := a.Drift(); d != nil && d.Kind == "unwired" {
+			off = append(off, a)
 		}
+	}
+	moved, errs := setAgain(off)
+	KeepCursorLocalEnv(context.Background())
+	if trouble := dshWiredOnce(); trouble != "" {
+		errs = append(errs, fmt.Errorf("%s", trouble))
+	}
+	return moved, joinErrs(errs)
+}
+
+// Rekey sets again those of as, taken by OnGateway before LAN sharing was
+// turned on or off or its key made anew, that reach the gateway from beyond
+// loopback (an agent in a WSL distro under NAT): the key they send there is
+// the sharing key while sharing is on (keyAt), so it changed with it. One
+// connected while nothing was shared kept gateway.Token, which the gateway
+// turns away from beyond loopback, after sharing was turned on for it.
+func Rekey(as []*Agent) (moved []string, err error) {
+	var away []*Agent
+	for _, a := range as {
+		if a.Gateway != nil && onAnotherMachine(a.Gateway()) {
+			away = append(away, a)
+		}
+	}
+	moved, errs := setAgain(away)
+	return moved, joinErrs(errs)
+}
+
+// setAgain sets each agent's wiring again, keeping what it had before
+// magpie, and says the names of those it set and what one failed with.
+func setAgain(as []*Agent) (moved []string, errs []error) {
+	for _, a := range as {
 		// set again on the old URL, an agent reads as not routed through
 		// magpie yet, and its set notes the old URL, magpie's token and
 		// model as what it had before magpie: what it really had is kept,
 		// for switching it off to put back
 		was := stashLoad()
 		e := reset(a)
+		// the address magpie wrote follows it (wiredAt)
+		for k, v := range stashLoad() {
+			if strings.HasSuffix(k, wiredAt) {
+				was[k] = v
+			}
+		}
 		stashPut(was)
 		if e != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", a.Name, e))
@@ -59,17 +92,18 @@ func Rewire(as []*Agent) (moved []string, err error) {
 		}
 		moved = append(moved, a.Name)
 	}
-	KeepCursorLocalEnv(context.Background())
-	if trouble := dshWiredOnce(); trouble != "" {
-		errs = append(errs, fmt.Errorf("%s", trouble))
-	}
+	return moved, errs
+}
+
+// joinErrs is errs as one error, "; " between them; nil for none.
+func joinErrs(errs []error) (err error) {
 	if len(errs) > 0 {
 		err = errs[0]
 		for _, e := range errs[1:] {
 			err = fmt.Errorf("%w; %w", err, e)
 		}
 	}
-	return moved, err
+	return err
 }
 
 // reset sets an agent's wiring again: one joined beside its own models
@@ -87,9 +121,13 @@ func reset(a *Agent) error {
 	return a.Reapply()
 }
 
+// wiredAt ends a stash key holding the gateway address magpie last wrote
+// into an agent's config, which a move of the gateway updates.
+const wiredAt = ".wired_at"
+
 // stashPut writes the stash as m has it.
 func stashPut(m map[string]string) {
-	b, _ := json.MarshalIndent(m, "", "  ")
-	os.MkdirAll(filepath.Dir(stashPath()), 0o755)
-	os.WriteFile(stashPath(), b, 0o600)
+	stashMu.Lock()
+	defer stashMu.Unlock()
+	stashWrite(m)
 }

@@ -105,7 +105,7 @@ func AutoUseCodexReset(ctx context.Context, user string) (ResetOutcome, error) {
 			return nil, false, err
 		}
 		return weekUsedUp(windows, now), resets != nil && resets.Count > 0, nil
-	}, func() (ResetOutcome, error) { return UseCodexReset(ctx, who) })
+	}, func() (ResetOutcome, error) { return useCodexReset(ctx, who, ResetUsedWeek) })
 }
 
 // use spends one of user's resets by itself if look finds its week used

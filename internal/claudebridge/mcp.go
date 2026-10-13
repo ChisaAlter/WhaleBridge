@@ -15,6 +15,7 @@ import (
 	"net/http"
 	"os"
 	"reflect"
+	"strings"
 	"sync"
 	"time"
 )
@@ -62,6 +63,15 @@ func RunMCP(args []string) error {
 		return errors.New("claude MCP helper expects callback URL and tools file")
 	}
 	callbackURL, toolsPath := args[0], args[1]
+	if !strings.HasPrefix(callbackURL, "http://") && !strings.HasPrefix(callbackURL, "https://") {
+		// the file magpie wrote it in, which keeps its token off the
+		// command line
+		b, err := os.ReadFile(callbackURL)
+		if err != nil {
+			return err
+		}
+		callbackURL = strings.TrimSpace(string(b))
+	}
 	b, err := os.ReadFile(toolsPath)
 	if err != nil {
 		return err

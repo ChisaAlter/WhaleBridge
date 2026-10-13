@@ -22,20 +22,24 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/lastgood"
 	"github.com/ChisaAlter/WhaleBridge/internal/netproxy"
 	"github.com/ChisaAlter/WhaleBridge/internal/proc"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 	"github.com/ChisaAlter/WhaleBridge/internal/steady"
+	"github.com/ChisaAlter/WhaleBridge/internal/update"
 )
 
 // Entry is one plugin the user added.
@@ -58,6 +62,11 @@ type List struct {
 	// section says what a plugin reads of it
 	// (provider.google.options.projectId).
 	Config map[string]any `json:"config,omitempty"`
+	// Prefer is the plugin the user picked for a provider id more than
+	// one plugin signs in to (a plugin of their own beside a third
+	// party's): provider id → that plugin's spec. Without it the last of
+	// them in Plugins serves the id, as in OpenCode.
+	Prefer map[string]string `json:"prefer,omitempty"`
 }
 
 var listMu sync.Mutex
@@ -112,7 +121,9 @@ var pluginsList struct {
 // changed; Load gives the mutable copy.
 func list() List {
 	path := listPath()
-	b, err := steady.ReadFile(path)
+	// one a crash left all zero (#1505) is its last good generation: the
+	// plugins installed are unknown, never none
+	b, err := lastgood.Read(path, lastgood.JSON)
 	if err != nil {
 		// Do not cache read failures; a later call will read the file again.
 		return List{}
@@ -134,7 +145,7 @@ func list() List {
 // copy, so nothing they change reaches what list keeps.
 func Load() List {
 	l := list()
-	return List{Plugins: clonePlugins(l.Plugins), Config: cloneMap(l.Config)}
+	return List{Plugins: clonePlugins(l.Plugins), Config: cloneMap(l.Config), Prefer: maps.Clone(l.Prefer)}
 }
 
 // clonePlugins copies the entries, their options with them.
@@ -180,24 +191,12 @@ func cloneJSON(v any) any {
 }
 
 // writeWhole writes b to p by a rename, so a magpie or the host reading
-// p meanwhile reads the old file or the new one, never one half-written;
-// read back with steady.ReadFile, which waits out the rename on Windows.
+// p meanwhile reads the old file or the new one, never one half-written,
+// and flushed to the disk first, so a machine that goes down meanwhile
+// doesn't leave p all zero (#1505); read back with steady.ReadFile, which
+// waits out the rename on Windows.
 func writeWhole(p string, b []byte) error {
-	f, err := os.CreateTemp(filepath.Dir(p), filepath.Base(p)+".*")
-	if err != nil {
-		return err
-	}
-	_, err = f.Write(b)
-	if cerr := f.Close(); err == nil {
-		err = cerr
-	}
-	if err == nil {
-		err = steady.Rename(f.Name(), p)
-	}
-	if err != nil {
-		os.Remove(f.Name())
-	}
-	return err
+	return steady.WriteFile(p, b, 0o600)
 }
 
 func save(l List) error {
@@ -206,6 +205,9 @@ func save(l List) error {
 		return err
 	}
 	if err := os.MkdirAll(settings.Dir(), 0o700); err != nil {
+		return err
+	}
+	if err := lastgood.Keep(listPath(), lastgood.JSON, 0o600); err != nil {
 		return err
 	}
 	if err := writeWhole(listPath(), append(b, '\n')); err != nil {
@@ -336,13 +338,18 @@ func Target(spec string) string {
 
 // Add installs a plugin and adds it to the list, in place of one of the
 // same package. A package is installed with its scripts left unrun.
-func Add(ctx context.Context, spec string) (Entry, error) {
-	return AddWithProgress(ctx, spec, nil)
+func Add(ctx context.Context, spec string) (Entry, error) { return add(ctx, spec, "") }
+
+// AddWithProgress reports when the packages are present, before registering the adapter.
+func AddWithProgress(ctx context.Context, spec string, downloaded func()) (Entry, error) {
+	return addWithProgress(ctx, spec, "", downloaded)
 }
 
-// AddWithProgress calls downloaded after packages and their dependencies are
-// present, before registering and loading the adapter.
-func AddWithProgress(ctx context.Context, spec string, downloaded func()) (Entry, error) {
+func add(ctx context.Context, spec, version string) (Entry, error) {
+	return addWithProgress(ctx, spec, version, nil)
+}
+
+func addWithProgress(ctx context.Context, spec, version string, downloaded func()) (Entry, error) {
 	spec = strings.TrimSpace(spec)
 	if spec == "" {
 		return Entry{}, errors.New("no plugin given")
@@ -373,9 +380,22 @@ func AddWithProgress(ctx context.Context, spec string, downloaded func()) (Entry
 		if Name(spec) == spec {
 			spec += "@latest"
 		}
-		if err := install(ctx, spec); err != nil {
+		if version != "" {
+			if err := installAt(ctx, Name(spec), version); err != nil {
+				return Entry{}, err
+			}
+		} else if err := install(ctx, spec); err != nil {
 			return Entry{}, err
 		}
+	}
+	if err := notPlugin(Target(spec)); err != nil {
+		// installed just now for this, and nothing loads it: taken out again
+		if !IsPath(spec) && !slices.Contains(slices.Collect(maps.Values(was)), Name(spec)) {
+			if bun, berr := Bun(ctx); berr == nil {
+				_ = bunCommand(ctx, bun, Dir(), "remove", "--ignore-scripts", Name(spec)).Run()
+			}
+		}
+		return Entry{}, err
 	}
 	if err := ensurePi(ctx, Target(spec)); err != nil {
 		return Entry{}, err
@@ -396,6 +416,15 @@ func AddWithProgress(ctx context.Context, spec string, downloaded func()) (Entry
 		return x.Spec == spec || n == name
 	}); i >= 0 {
 		e.Options = l.Plugins[i].Options
+		// whether they turned it off, which an add never changes
+		e.Off = l.Plugins[i].Off
+		// a provider id the user picked it for stays its (another version,
+		// or its package from a git repository in place of npm's)
+		for id, s := range l.Prefer {
+			if s == l.Plugins[i].Spec {
+				l.Prefer[id] = spec
+			}
+		}
 		l.Plugins[i] = e
 	} else {
 		l.Plugins = append(l.Plugins, e)
@@ -407,13 +436,85 @@ func AddWithProgress(ctx context.Context, spec string, downloaded func()) (Entry
 	return e, nil
 }
 
-// Update installs the version of each npm plugin its spec says now
-// (latest, for the most part), and fetches each git one again.
+// indexFiles are the files a package that names none loads, as the host
+// looks for them (host.js's INDEX_FILES).
+var indexFiles = []string{"index.ts", "index.tsx", "index.js", "index.mjs", "index.cjs"}
+
+// notPlugin says why the plugin at target is nothing the host can load,
+// or nil: a package that names no file to import (main, exports), has no
+// index file, and is neither pi's nor a middleware — a command alone
+// (bin), an MCP server like magpie-x-search, is installed fine and then
+// never loads (#1327).
+func notPlugin(target string) error {
+	st, err := os.Stat(target)
+	if err != nil || !st.IsDir() || IsPi(target) {
+		return nil
+	}
+	if f, _ := Middleware(target); f != "" {
+		return nil
+	}
+	if f, _ := Agent(target); f != "" {
+		return nil
+	}
+	var pkg struct {
+		Name    string          `json:"name"`
+		Main    string          `json:"main"`
+		Exports json.RawMessage `json:"exports"`
+		Bin     json.RawMessage `json:"bin"`
+	}
+	b, err := os.ReadFile(filepath.Join(target, "package.json"))
+	if err != nil || json.Unmarshal(b, &pkg) != nil {
+		return nil
+	}
+	if strings.TrimSpace(pkg.Main) != "" || len(pkg.Exports) > 0 && string(pkg.Exports) != "null" {
+		return nil
+	}
+	for _, f := range indexFiles {
+		if _, err := os.Stat(filepath.Join(target, f)); err == nil {
+			return nil
+		}
+	}
+	name := pkg.Name
+	if name == "" {
+		name = filepath.Base(target)
+	}
+	why := fmt.Sprintf("%s isn't an OpenCode or magpie plugin: its package names no file to load (no main or exports in package.json, no index file)", name)
+	if len(pkg.Bin) > 0 && string(pkg.Bin) != "null" {
+		why += ", only a command (bin). If it is an MCP server, add it under Library → MCP servers instead"
+	}
+	return errors.New(why)
+}
+
+// Update installs npm's newest version (asked now, installAt) of each npm
+// plugin, and fetches each git one again. A plugin pinned to a version
+// that npm has a newer one of is updated too, and unpinned, as its row's
+// Update does: the page counts it in Update all, and the CLI's update
+// says it installs the newest of each (ARNO on Discord: a plugin updated
+// with Update all still said an update was out, pinned where it was). A
+// pinned one already at npm's newest stays as its spec says.
 func Update(ctx context.Context) error {
 	var errs []error
 	for _, e := range Load().Plugins {
 		if !IsPath(e.Spec) {
-			if err := reinstall(ctx, e.Spec); err != nil {
+			v := ""
+			if !IsGit(e.Spec) {
+				v = newestOf(ctx, Name(e.Spec))
+			}
+			var err error
+			switch {
+			case v != "" && Pinned(e.Spec):
+				if update.Newer(v, Installed(e.Spec)) {
+					_, err = add(ctx, Name(e.Spec), v)
+				} else {
+					err = reinstall(ctx, e.Spec)
+				}
+			case v != "":
+				err = installAt(ctx, Name(e.Spec), v)
+			default:
+				// a git one, or npm not answering: as its spec says
+				err = reinstall(ctx, e.Spec)
+			}
+			if err != nil {
 				errs = append(errs, fmt.Errorf("%s: %w", e.Spec, err))
 				continue
 			}
@@ -426,17 +527,29 @@ func Update(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// indexOf is the plugin name means in l: the one added as name exactly,
+// else the one of that package. A plugin of the user's own (a folder)
+// beside a third party's is each told apart by its own spec, so taking
+// one away or switching it off never reaches the other.
+func indexOf(l List, name string) int {
+	if i := slices.IndexFunc(l.Plugins, func(x Entry) bool { return x.Spec == name }); i >= 0 {
+		return i
+	}
+	return slices.IndexFunc(l.Plugins, func(x Entry) bool { return Name(x.Spec) == name })
+}
+
 // Remove takes a plugin off the list (and out of plugins/).
 func Remove(ctx context.Context, name string) error {
 	listMu.Lock()
 	l := Load()
-	i := slices.IndexFunc(l.Plugins, func(x Entry) bool { return Name(x.Spec) == name || x.Spec == name })
+	i := indexOf(l, name)
 	if i < 0 {
 		listMu.Unlock()
 		return fmt.Errorf("no plugin %q", name)
 	}
 	e := l.Plugins[i]
 	l.Plugins = slices.Delete(l.Plugins, i, i+1)
+	maps.DeleteFunc(l.Prefer, func(_, s string) bool { return s == e.Spec })
 	err := save(l)
 	listMu.Unlock()
 	if err != nil {
@@ -456,11 +569,38 @@ func SetOff(name string, off bool) error {
 	listMu.Lock()
 	defer listMu.Unlock()
 	l := Load()
-	i := slices.IndexFunc(l.Plugins, func(x Entry) bool { return Name(x.Spec) == name || x.Spec == name })
+	i := indexOf(l, name)
 	if i < 0 {
 		return fmt.Errorf("no plugin %q", name)
 	}
 	l.Plugins[i].Off = off
+	if err := save(l); err != nil {
+		return err
+	}
+	Restart()
+	return nil
+}
+
+// Prefer has the plugin named serve provider id, which another plugin
+// signs in to as well (Clash): the host runs it for id from now on, the
+// other one keeping its other providers. A plugin removed takes its picks
+// with it; one switched off leaves the id to the others until it is on
+// again.
+func Prefer(name, id string) error {
+	listMu.Lock()
+	defer listMu.Unlock()
+	l := Load()
+	i := indexOf(l, name)
+	if i < 0 {
+		return fmt.Errorf("no plugin %q", name)
+	}
+	if id == "" {
+		return errors.New("no provider given")
+	}
+	if l.Prefer == nil {
+		l.Prefer = map[string]string{}
+	}
+	l.Prefer[id] = l.Plugins[i].Spec
 	if err := save(l); err != nil {
 		return err
 	}
@@ -474,7 +614,7 @@ func SetOptions(name string, opts map[string]any) error {
 	listMu.Lock()
 	defer listMu.Unlock()
 	l := Load()
-	i := slices.IndexFunc(l.Plugins, func(x Entry) bool { return Name(x.Spec) == name || x.Spec == name })
+	i := indexOf(l, name)
 	if i < 0 {
 		// a short name, as the community's READMEs write it: param-override
 		// for @magpie-community/middleware-param-override
@@ -496,9 +636,10 @@ func SetOptions(name string, opts map[string]any) error {
 
 // ShortName is a package's name without its scope and the words every
 // package of its kind has: model-map for @magpie-community/middleware-model-map,
-// zed for @magpie-community/opencode-zed-auth.
+// zed for @magpie-community/opencode-zed-auth. A plugin added from a folder
+// is named by its path, which on Windows ends after a backslash.
 func ShortName(pkg string) string {
-	if i := strings.LastIndex(pkg, "/"); i >= 0 {
+	if i := strings.LastIndexAny(pkg, `/\`); i >= 0 {
 		pkg = pkg[i+1:]
 	}
 	pkg = strings.TrimPrefix(strings.TrimPrefix(pkg, "middleware-"), "opencode-")
@@ -523,9 +664,92 @@ func install(ctx context.Context, spec string) error {
 	}
 	out, err := bunCommand(ctx, bun, Dir(), "add", "--ignore-scripts", spec).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("bun add %s: %v: %s", spec, err, lastLines(string(out), 6))
+		if hint := missingLibs(string(out)); hint != "" {
+			return fmt.Errorf("bun add %s: %s: %w", spec, hint, err)
+		}
+		return fmt.Errorf("bun add %s: %v: %s", spec, cantStart(bun, err), lastLines(string(out), 6))
 	}
 	return nil
+}
+
+// installAt installs the version of the npm package given, not a tag, and
+// checks it is the one installed. Asked for pkg@latest, bun resolves
+// "latest" by its own config: a minimumReleaseAge in the user's bunfig
+// holds back every version younger than it, and a registry of the user's
+// own (an .npmrc) may not have the newest yet. Either way bun installs an
+// older version and exits 0, so an update said it was done and nothing
+// changed (sweanng424 on Discord: Factory stayed at 0.1.18 with 0.1.21 out,
+// through restarts and the hourly updates). Asked for the version, bun
+// says why it can't install it.
+func installAt(ctx context.Context, pkg, version string) error {
+	if err := install(ctx, pkg+"@"+version); err != nil {
+		// what bun said comes first: the page's status line shows the
+		// start of a long message
+		if m := minAge.FindStringSubmatch(err.Error()); m != nil {
+			return fmt.Errorf("%s %s isn't installed yet: Bun's minimumReleaseAge (in a .bunfig.toml) holds back versions published less than %s ago, and magpie installs it once it is older (%w)", pkg, version, ageText(m[1]), err)
+		}
+		var said []string
+		for _, l := range strings.Split(err.Error(), "\n") {
+			if l = strings.TrimSpace(l); strings.HasPrefix(l, "error:") {
+				said = append(said, strings.TrimSpace(strings.TrimPrefix(l, "error:")))
+			}
+		}
+		if len(said) > 0 {
+			return fmt.Errorf("%s %s isn't installed: %s (%w)", pkg, version, strings.Join(said, "; "), err)
+		}
+		return err
+	}
+	if got := Installed(pkg); got == "" || update.Newer(version, got) {
+		if got == "" {
+			got = "nothing"
+		}
+		return fmt.Errorf("bun add %s@%s installed %s", pkg, version, got)
+	}
+	return nil
+}
+
+// minAge is bun's word for a version its minimumReleaseAge holds back.
+var minAge = regexp.MustCompile(`minimum-release-age: (\d+) seconds`)
+
+// ageText is a number of seconds as a reader says it: 2 days, 12 hours.
+func ageText(secs string) string {
+	n, err := strconv.Atoi(secs)
+	switch {
+	case err != nil:
+		return secs + " seconds"
+	case n >= 86400 && n%86400 == 0:
+		return plural(n/86400, "day")
+	case n >= 3600 && n%3600 == 0:
+		return plural(n/3600, "hour")
+	case n >= 60 && n%60 == 0:
+		return plural(n/60, "minute")
+	}
+	return plural(n, "second")
+}
+
+func plural(n int, unit string) string {
+	if n == 1 {
+		return "1 " + unit
+	}
+	return strconv.Itoa(n) + " " + unit + "s"
+}
+
+// newestOf is npm's newest version of the package, asked now, "" when npm
+// didn't say; what it says is kept, as Info keeps it (tests stub it).
+var newestOf = func(ctx context.Context, name string) string {
+	c, cancel := context.WithTimeout(ctx, checkEach)
+	info, err := npmAsk(c, name)
+	cancel()
+	if err == nil || errors.Is(err, errNotFound) {
+		npmMu.Lock()
+		npmCached()[name] = npmEntry{info, time.Now()}
+		saveNPM()
+		npmMu.Unlock()
+	}
+	if err != nil {
+		return ""
+	}
+	return info.Version
 }
 
 // piAgent is the package pi's extensions import pi from; the host loads
@@ -609,7 +833,10 @@ func reinstall(ctx context.Context, spec string) error {
 	}
 	out, err := bunCommand(ctx, bun, Dir(), "update", "--ignore-scripts", name).CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("bun update %s: %v: %s", name, err, lastLines(string(out), 6))
+		if hint := missingLibs(string(out)); hint != "" {
+			return fmt.Errorf("bun update %s: %s: %w", name, hint, err)
+		}
+		return fmt.Errorf("bun update %s: %v: %s", name, cantStart(bun, err), lastLines(string(out), 6))
 	}
 	return nil
 }

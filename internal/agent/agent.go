@@ -6,9 +6,9 @@ import (
 	"debug/buildinfo"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -40,6 +40,10 @@ type Option struct {
 	// Context is the tokens the model takes, when known; the picker marks
 	// the large ones
 	Context int `json:"context,omitempty"`
+	// Takes, on an effort field's default (Value ""), is the level the
+	// agent takes for the model with none set (Codex: the catalog entry's
+	// default_reasoning_level), shown beside "default"
+	Takes string `json:"takes,omitempty"`
 	// Direct names who the agent asks for this model itself, on its own
 	// sign-in or key, with magpie not in the way ("Anthropic"): its config
 	// then names no magpie endpoint, which is right, not a failed setup
@@ -62,6 +66,10 @@ type Option struct {
 	// whether it is now (provider.IsFastPick)
 	FastFor string `json:"fastFor,omitempty"`
 	Fast    bool   `json:"fast,omitempty"`
+	// OwnFast: its fast mode is a GPT model's on a provider the user added
+	// by its address (provider.OwnFast, #1615), asked for there as OpenAI's
+	// priority, which the provider may or may not serve
+	OwnFast bool `json:"ownFast,omitempty"`
 
 	// own: served on the agent's own sign-in (viaMagpie), for Same
 	own bool
@@ -97,19 +105,32 @@ type Agent struct {
 	Bin     string // executable name, used for detection
 	Dir     string // config directory, used for detection
 	Path    string // config file magpie edits
-	Fields  []Field
-	Native  *NativeConnection
+	// Plugin is the spec of the plugin that adds this agent (plugged.go),
+	// "" for magpie's own
+	Plugin string
+	Fields []Field
+	Native *NativeConnection
 	// Notice, if set, is advice worth showing after a change: agents that
 	// read their config once at start-up need a restart to see it.
 	Notice func() string
 	// UA is what the agent's User-Agent begins with, lower-case: how the
 	// gateway tells its requests from others'
 	UA []string
-	// ListsModels: the agent's own model menu is the gateway's /v1/models
-	// as asked with its key, so the models picked on the Agents page for it
-	// (settings.HiddenModels) are its menu, though no field of its picks
-	// among the catalog (Cursor Private Inference)
+	// ListsModels: the agent's own model menu is magpie's models as picked
+	// on the Agents page for it (settings.HiddenModels, PickedModels),
+	// though no field of its picks among the catalog: the gateway's
+	// /v1/models as asked with its key (Cursor Private Inference), or the
+	// list magpie writes into its files, magpieModels(id), where its only
+	// field puts magpie in its picker (ZCode, Pencil: #1508)
 	ListsModels bool
+	// NoNames: the agent's own list doesn't name magpie's models as
+	// Names in agents' lists says (provider.Labels): magpie hands it the
+	// models' ids alone, its format having no name for one (Goose, Hermes,
+	// jcode …), it lists no models of magpie's at all (Gemini CLI, Snow),
+	// or it reads the gateway's /v1/models itself, whose display_name is
+	// the name alone (Empryo, Cursor Private Inference). The setting says
+	// so for each one connected, rather than seeming to do nothing.
+	NoNames bool
 	// Sync, for an agent that reads magpie's models from a file of its own
 	// rather than asking the gateway, rewrites that list as the catalog is
 	// now — where magpie wrote one; nothing else changes (see SyncCatalog).
@@ -120,6 +141,10 @@ type Agent struct {
 	// kept: the endpoint, provider and model the user had. Disconnect runs
 	// it before the fields' defaults.
 	Unwire func() error
+	// Restore, for an agent whose files magpie copied aside before its
+	// first write (beforeMagpie), puts them back as they were where what
+	// Disconnect left says the same. Disconnect runs it last.
+	Restore func() error
 	// Join, for an agent that can have magpie's models in its own list
 	// while it stays on the model it was on (Codex signed in with ChatGPT),
 	// connects it so, its model left as its own last pick; false where it
@@ -144,6 +169,17 @@ type Agent struct {
 	// provider), so a model's name the gateway takes as a routing group
 	// is that group's (#750).
 	Routed func() bool
+	// FailingOver reports an agent that isn't connected whose requests
+	// still go through magpie's gateway, for account failover alone (Codex
+	// signed in to ChatGPT with more of its accounts on in magpie, #1385):
+	// the Agents page says so and what turns it off, and the gateway lists
+	// it only its own models.
+	FailingOver func() bool
+	// EndFailover takes out what account failover wrote, for magpie
+	// quitting: left there, the agent would be pointed at a gateway that
+	// no longer answers, and retry till magpie is open again (Leon920717
+	// on X). The next start's Sync writes it again.
+	EndFailover func() error
 	// Follow, for an agent whose own picker moves its main model where
 	// magpie keeps other settings following it (Claude Code's /model and
 	// its tiers), brings those along to the model picked there. Run as the
@@ -206,6 +242,11 @@ type Agent struct {
 	// has a provider of the same name (OpenHanako's own
 	// deepseek/deepseek-v4-pro read as magpie's deepseek, #835).
 	Spelled func(v string) bool
+	// ModelAliases are the names the agent's model takes besides ids
+	// (Claude Code's opus, best, opusplan). One that names a field as well
+	// is the model's on the command line: magpie claude opus sets the
+	// model, where another field's name alone shows that field.
+	ModelAliases []string
 	// detect, when set, says whether the agent is here in place of looking
 	// for its files and binary: a distro's, probed once.
 	detect func() bool
@@ -216,10 +257,19 @@ type Agent struct {
 	// move, when set, points the agent's config at to where it names the
 	// gateway at from: an address of WSL's that changed (#1013).
 	move func(from, to string) error
+	// viaProxy, when set, says whether the agent's requests for the
+	// gateway get there through the proxy it sends them by (ok), whether
+	// that is known yet, and the proxy and where it is set; ok with no
+	// proxy when it sends them straight there (see codex_proxy.go).
+	viaProxy func() (ok, known bool, proxy, from string)
 	// dirShared says Dir is a folder another agent keeps its files in too
 	// (omp's, when PI_CODING_AGENT_DIR points it at Pi's): that it is there
 	// says nothing of this agent.
 	dirShared bool
+	// pathOwn, when set, says whether the file at Path is this agent's,
+	// not one another tool wrote there first: a JetBrains plugin's
+	// settings.json in Qoder CN's folder (#1495).
+	pathOwn func() bool
 }
 
 // Running reports whether a process whose command line matches any pattern
@@ -229,8 +279,10 @@ type Agent struct {
 // "open a new dsh session"), and a Windows that answered no here dropped
 // that advice silently — a model picked in magpie looked like it had done
 // nothing at all. claudeRunning and Pencil's own check already say they
-// can't be told, and say yes for the same reason.
-func Running(patterns ...string) bool {
+// can't be told, and say yes for the same reason. A var so tests can say
+// what runs, as claudeRunning is: magpie's own CLI tests printed "restart
+// the Codex app" on a Mac with Codex open, and on every Windows.
+var Running = func(patterns ...string) bool {
 	if runtime.GOOS == "windows" {
 		return len(patterns) > 0
 	}
@@ -252,19 +304,68 @@ func (a *Agent) Detected() bool {
 	if a.Dir != "" && Taken(a.Dir) {
 		return false
 	}
-	if _, err := os.Stat(a.Path); err == nil {
+	if _, err := os.Stat(a.Path); err == nil && (a.pathOwn == nil || a.pathOwn()) {
 		return true
 	}
-	if a.Dir != "" && !a.dirShared && isDir(a.Dir) {
+	if a.Dir != "" && !a.dirShared && agentDir(a.Dir) {
 		return true
 	}
-	if a.Bin != "" {
-		if _, err := exec.LookPath(a.Bin); err == nil {
+	if a.Bin != "" && binAt(a.Bin) != "" {
+		return true
+	}
+	// one with no Bin, as its command's name is other tools' too, that
+	// Homebrew installed (Grok Build's grok-build cask) and hasn't run yet
+	if a.Bin == "" && a.WSL == "" && brewBin(cliSpecs[a.ID]) != "" {
+		return true
+	}
+	return false
+}
+
+// binAt is where the agent's command name is, as magpie runs it: on
+// magpie's own PATH, else, on Windows, where a terminal opened now finds it
+// or a user's tools are installed (proc.FindTool: the registry's PATH now,
+// ~/.local/bin, npm's, bun's, Volta's, pnpm's). Windows has no login shell
+// to lend magpie its PATH (proc.UserPath does nothing there), so a magpie
+// started before Claude Code's installer put claude.exe in ~/.local/bin
+// and added that to the user's PATH, or a self-update restarting with the
+// PATH it had then, never listed it, while the sign-in, which asked
+// FindTool, found it (#839, #1482). A mise wrapper script found there is
+// given as the program it runs (proc.LookPath). "" when it is in none.
+func binAt(name string) string {
+	if p, err := proc.LookPath(name); err == nil {
+		return p
+	}
+	if runtime.GOOS == "windows" {
+		return proc.FindTool(name)
+	}
+	return ""
+}
+
+// agentDir reports whether p is a folder an agent itself made. Skill
+// installers (npx skills and the like) make <folder>/skills for every agent
+// they know, installed or not; a folder holding nothing else is theirs.
+func agentDir(p string) bool {
+	es, err := os.ReadDir(p)
+	if err != nil {
+		return isDir(p)
+	}
+	if len(es) == 0 {
+		return true
+	}
+	for _, e := range es {
+		if n := e.Name(); n != "skills" && n != ".DS_Store" && !(e.IsDir() && leftover[strings.ToLower(n)]) {
 			return true
 		}
 	}
 	return false
 }
+
+// leftover are the folders an agent writes as it runs, not as it is set
+// up, and that stay behind when it is uninstalled: ~/.codebuddy holding
+// only logs/ and diagnostics/, ~/.qwen's debug/ (#1495, v5tech). A folder
+// holding only these (and skills) is no sign the agent is here. A file of
+// the same name, or anything else beside them, still is.
+var leftover = map[string]bool{"logs": true, "log": true, "debug": true, "diagnostics": true, "cache": true}
 
 // Taken reports whether something that isn't a folder is where the folder
 // p, or one it is in, would be: nothing can be written under it.
@@ -316,15 +417,16 @@ var goPrograms struct {
 	m map[goProgramKey]bool
 }
 
-// Field looks a field up by key.
+// Field looks a field up by key, in any case, as Find looks an agent up
+// (magpie codex Model was written as the model).
 func (a *Agent) Field(key string) *Field {
 	for i := range a.Fields {
-		if a.Fields[i].Key == key {
+		if strings.EqualFold(a.Fields[i].Key, key) {
 			return &a.Fields[i]
 		}
 	}
 	for i := range a.Fields {
-		if a.Fields[i].Label == key { // `magpie gemini auth …`: the label as shown
+		if strings.EqualFold(a.Fields[i].Label, key) { // `magpie gemini auth …`: the label as shown
 			return &a.Fields[i]
 		}
 	}
@@ -338,6 +440,35 @@ func (a *Agent) Values() map[string]string {
 		m[f.Key] = f.Get()
 	}
 	return m
+}
+
+// Picks are the options f's picker offers: all of them, unless the user
+// asked a's pickers to offer magpie's models alone (#1642, MizuIro-H). Then
+// a field that picks among magpie's catalog leaves out the models the agent
+// reaches on its own (DeepSeek Harness's DeepSeek ones), but for its
+// default and the one it is set to.
+func (a *Agent) Picks(f Field, cur map[string]string) []Option {
+	opts := f.Options(cur)
+	if !provider.OwnModelsHidden(a.ListsFor()) || !slices.ContainsFunc(opts, func(o Option) bool { return o.Ref != "" }) {
+		return opts
+	}
+	return slices.DeleteFunc(slices.Clone(opts), func(o Option) bool { return Own(o) && o.Value != cur[f.Key] })
+}
+
+// Own reports whether o is a model the agent reaches on its own, not one of
+// magpie's catalog: what Picks leaves out on the user's word.
+func Own(o Option) bool { return o.Ref == "" && o.Value != "" }
+
+// OwnModels reports whether one of a's pickers that picks among magpie's
+// catalog offers models of the agent's own too, which Picks can leave out.
+func (a *Agent) OwnModels(cur map[string]string) bool {
+	for _, f := range a.Fields {
+		opts := f.Options(cur)
+		if slices.ContainsFunc(opts, func(o Option) bool { return o.Ref != "" }) && slices.ContainsFunc(opts, Own) {
+			return true
+		}
+	}
+	return false
 }
 
 // Detected returns the agents present on this machine, in display order.

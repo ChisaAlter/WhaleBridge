@@ -197,3 +197,75 @@ func TestClaudeCompactYieldsToOwnSetting(t *testing.T) {
 	must(a.Sync())
 	expect("typed in magpie", "400000")
 }
+
+// A routing group made only of Claude models runs as a Claude model does,
+// to its own window: Claude Code isn't handed magpie's default 272000 for
+// it (#1741, yanjieee: a group of Claude [1m] models was, its id's last
+// part not starting with "claude"), a group in it of Claude models too.
+// A group with another vendor's model in it keeps the default, a
+// threshold the user set on a member's provider still comes first, and
+// the user's own env and autoCompactWindow are left as they are.
+func TestClaudeGroupCompactWindow(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(provider.Save(provider.Provider{ID: "v", Name: "V", Chat: "https://example.test/v1", Key: "k",
+		Models: []string{"big", "claude-opus-5-5"}}))
+	must(catalog.SaveLive("v", "https://example.test/v1", []catalog.Model{{ID: "big", Context: 1000000}, {ID: "claude-opus-5-5", Context: 1000000}}))
+	must(provider.Save(provider.Provider{ID: "w", Name: "W", Chat: "https://example.test/w/v1", Key: "k",
+		Models: []string{"claude-sonnet-5"}}))
+	must(catalog.SaveLive("w", "https://example.test/w/v1", []catalog.Model{{ID: "claude-sonnet-5", Context: 1000000}}))
+	must(provider.SaveGroup(provider.Group{ID: "auto-opus", Name: "Auto", Members: []string{"v/claude-opus-5-5", "w/claude-sonnet-5"}}))
+	must(provider.SaveGroup(provider.Group{ID: "outer", Name: "Outer", Members: []string{"group/auto-opus"}}))
+	must(provider.SaveGroup(provider.Group{ID: "mix", Name: "Mix", Members: []string{"v/claude-opus-5-5", "v/big"}}))
+
+	path := filepath.Join(home, ".claude", "settings.json")
+	writeFile(t, path, `{}`)
+	a := claude(home)
+	compact := func() string { v, _ := edit.GetJSON(path, "env."+claudeCompactEnv); return v }
+	expect := func(what, want string) {
+		t.Helper()
+		if got := compact(); got != want {
+			t.Fatalf("%s: %q; want %q", what, got, want)
+		}
+	}
+
+	must(a.Field("model").Set("group/mix[1m]"))
+	expect("a group with another vendor's model", "272000")
+	must(a.Field("model").Set("group/auto-opus[1m]"))
+	expect("a group of Claude models", "")
+	must(a.Sync())
+	expect("a group of Claude models, synced", "")
+	must(a.Field("model").Set("group/outer"))
+	expect("a group of a group of Claude models", "")
+	must(a.Field("model").Set("group/mix"))
+	expect("back on the mixed group", "272000")
+
+	// a threshold set on a member's provider comes first, as it does for
+	// a Claude model
+	must(provider.SetModelCompacts("w", map[string]int{"*": 600000}))
+	must(a.Field("model").Set("group/auto-opus[1m]"))
+	expect("a member's provider's", "600000")
+	must(provider.SetModelCompacts("w", nil))
+	must(a.Sync())
+	expect("none set again", "")
+
+	// the user's own env and autoCompactWindow are theirs
+	must(edit.SetJSON(path, edit.KV{Path: "env." + claudeCompactEnv, Value: "500000"}))
+	must(edit.SetJSON(path, edit.KV{Path: "autoCompactWindow", Value: 900000}))
+	must(a.Field("model").Set("group/mix"))
+	must(a.Field("model").Set("group/auto-opus[1m]"))
+	must(a.Sync())
+	expect("the user's own", "500000")
+	if v, _ := edit.GetJSON(path, "autoCompactWindow"); v != "900000" {
+		t.Fatalf("autoCompactWindow changed: %q", v)
+	}
+}

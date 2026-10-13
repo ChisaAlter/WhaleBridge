@@ -228,6 +228,14 @@ func ocCall(st *callFile, m ocMessage, dir string) (Call, bool) {
 	}
 	if t := m.Tokens; t != nil {
 		c.Tokens = Tokens{Input: t.Input, Output: t.Output + t.Reasoning, CacheRead: t.Cache.Read, CacheWrite: t.Cache.Write}
+		if st.Agent == "zcode" {
+			// the AI SDK's counts, as the session's summary reads them
+			// (ocFile): input with the cache in it, output with the
+			// reasoning. Taken as they were, the cache was counted twice,
+			// and the Requests page's hit rate read half of what it was
+			// (#1947, XcodeFish: 50.8% for 96.9%)
+			c.Tokens.Input, c.Tokens.Output = max(0, t.Input-t.Cache.Read-t.Cache.Write), t.Output
+		}
 		c.Reasoning = t.Reasoning
 	}
 	if !c.Tokens.zero() {

@@ -16,3 +16,6 @@ func hardLinked(path string) bool {
 	var fi windows.ByHandleFileInformation
 	return windows.GetFileInformationByHandle(windows.Handle(f.Fd()), &fi) == nil && fi.NumberOfLinks > 1
 }
+
+// keepGroup: Windows files have no Unix group to keep.
+func keepGroup(*os.File, os.FileInfo) {}

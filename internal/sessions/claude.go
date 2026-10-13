@@ -22,6 +22,7 @@ type ccLine struct {
 	SessionID   string `json:"sessionId"`
 	RequestID   ccStr  `json:"requestId"`
 	AITitle     string `json:"aiTitle"`
+	CustomTitle string `json:"customTitle"`
 	Summary     string `json:"summary"`
 	Message     struct {
 		ID      string          `json:"id"`
@@ -41,6 +42,7 @@ var (
 	ccAssistant = []byte(`"type":"assistant"`)
 	ccUser      = []byte(`"type":"user"`)
 	ccTitle     = []byte(`"type":"ai-title"`)
+	ccCustom    = []byte(`"type":"custom-title"`)
 	ccSummary   = []byte(`"type":"summary"`)
 	ccCwd       = []byte(`"cwd":"`)
 )
@@ -66,7 +68,7 @@ func claudeLine(s *state, b []byte, main bool) {
 		switch typeAfter(h, ccTop) {
 		case "user", "assistant":
 			// a message laid out type first
-		case "ai-title", "summary":
+		case "ai-title", "custom-title", "summary":
 			claudeFull(s, b, main)
 			return
 		default:
@@ -223,7 +225,7 @@ func claudeFull(s *state, b []byte, main bool) {
 	s.saw(at, main)
 	want := bytes.Contains(b, ccAssistant) ||
 		main && bytes.Contains(b, ccUser) ||
-		main && (bytes.Contains(b, ccTitle) || bytes.Contains(b, ccSummary)) ||
+		main && (bytes.Contains(b, ccTitle) || bytes.Contains(b, ccCustom) || bytes.Contains(b, ccSummary)) ||
 		s.Cwd == "" && bytes.Contains(b, ccCwd)
 	if !want {
 		return
@@ -242,6 +244,11 @@ func claudeFull(s *state, b []byte, main bool) {
 	case "ai-title":
 		if l.AITitle != "" {
 			s.Named = title(l.AITitle)
+		}
+	case "custom-title":
+		// named by the user (/rename): before the one Claude Code made
+		if main && l.CustomTitle != "" {
+			s.Custom = title(l.CustomTitle)
 		}
 	case "summary":
 		if l.Summary != "" && s.Named == "" {

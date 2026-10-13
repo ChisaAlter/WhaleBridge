@@ -38,15 +38,19 @@ func WorkBuddyDir() string {
 
 // workbuddyFiles are the sessions under WorkBuddy's projects/, however deep:
 // a session's own <id>.jsonl, and a subagent's under <id>/subagents/.
-func workbuddyFiles() []file {
+func workbuddyFiles() []file { return buddyFiles("workbuddy", WorkBuddyDir()) }
+
+// buddyFiles are the sessions under projects/ in dir, as agent's: WorkBuddy's,
+// or CodeBuddy Code's, which keeps them the same way.
+func buddyFiles(agent, dir string) []file {
 	var out []file
-	filepath.WalkDir(filepath.Join(WorkBuddyDir(), "projects"), func(p string, d os.DirEntry, err error) error {
+	filepath.WalkDir(filepath.Join(dir, "projects"), func(p string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
 			return nil
 		}
-		f := file{agent: "workbuddy", key: "workbuddy:" + strings.TrimSuffix(d.Name(), ".jsonl"), path: p, main: true}
+		f := file{agent: agent, key: agent + ":" + strings.TrimSuffix(d.Name(), ".jsonl"), path: p, main: true}
 		if dir := filepath.Dir(p); filepath.Base(dir) == "subagents" {
-			f.key, f.main = "workbuddy:"+filepath.Base(filepath.Dir(dir)), false
+			f.key, f.main = agent+":"+filepath.Base(filepath.Dir(dir)), false
 		}
 		if stat(&f) {
 			out = append(out, f)
@@ -142,7 +146,7 @@ func workbuddyLine(s *state, b []byte, main bool) {
 	case "custom-title":
 		// named by the user: before the one WorkBuddy made
 		if main && l.CustomTitle != "" {
-			s.Title = title(l.CustomTitle)
+			s.Custom = title(l.CustomTitle)
 		}
 	case "ai-title":
 		if main && l.AITitle != "" {

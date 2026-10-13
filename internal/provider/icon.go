@@ -17,6 +17,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/iconproxy"
 )
 
 // A provider's own picture lives in the icons folder beside providers.json,
@@ -70,14 +72,18 @@ func StoreIcon(data []byte) (string, error) {
 // user confirms the import, never at parse time; the URL is re-checked here
 // so a crafted request can't point magpie at anything but a public https
 // picture, and the read stops one byte past MaxIcon so a huge body is
-// refused rather than buffered.
+// refused rather than buffered. The picture is asked for through
+// usemagpie.ai's icon proxy, so its host never sees the user's IP.
 func FetchIcon(ctx context.Context, rawURL string) (string, error) {
 	u, err := iconURL(rawURL)
 	if err != nil {
 		return "", err
 	}
-	return fetchIcon(ctx, guardClient(), u)
+	return fetchIcon(ctx, iconClient(), iconproxy.URL(u))
 }
+
+// iconClient is the client FetchIcon uses; tests point it at a local proxy.
+var iconClient = guardClient
 
 // guardClient is the http.Client icon fetches use: the default transport —
 // so the proxy settings still apply — but with dialing wrapped in publicDial.

@@ -32,7 +32,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -43,6 +42,7 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"github.com/ChisaAlter/WhaleBridge/internal/proc"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 	"github.com/ChisaAlter/WhaleBridge/internal/steady"
 )
 
@@ -50,12 +50,12 @@ import (
 // tests can fake it. The installer puts it in ~/.local/bin, and on macOS
 // inside Kiro CLI.app as well.
 var KiroExecutable = func() string {
-	if p, err := exec.LookPath("kiro-cli"); err == nil {
+	if p, err := proc.LookPath("kiro-cli"); err == nil {
 		return p
 	}
 	home, _ := os.UserHomeDir()
-	for _, p := range []string{filepath.Join(home, ".local", "bin", "kiro-cli"),
-		"/Applications/Kiro CLI.app/Contents/MacOS/kiro-cli", "/usr/local/bin/kiro-cli", "/opt/homebrew/bin/kiro-cli"} {
+	for _, p := range append([]string{filepath.Join(home, ".local", "bin", "kiro-cli")}, proc.SystemDirs(
+		"/Applications/Kiro CLI.app/Contents/MacOS/kiro-cli", "/usr/local/bin/kiro-cli", "/opt/homebrew/bin/kiro-cli")...) {
 		if st, err := os.Stat(p); err == nil && !st.IsDir() {
 			return p
 		}
@@ -121,6 +121,9 @@ func (c kiroCred) fresh() bool {
 // (Builder ID, IAM Identity Center), or with a company's own identity
 // provider.
 func readKiroCLI() (kiroCred, bool) {
+	if settings.AccountDiscoveryOff() {
+		return kiroCred{}, false
+	}
 	path := kiroCLIDB()
 	if !fileExists(path) {
 		return kiroCred{}, false
@@ -178,6 +181,9 @@ func readKiroCLI() (kiroCred, bool) {
 
 // readKiroIDE reads the Kiro IDE's sign-in.
 func readKiroIDE() (kiroCred, bool) {
+	if settings.AccountDiscoveryOff() {
+		return kiroCred{}, false
+	}
 	path := filepath.Join(kiroIDEDir(), "kiro-auth-token.json")
 	b, err := os.ReadFile(path)
 	if err != nil {
@@ -236,6 +242,9 @@ func readKiro(key string) (kiroCred, bool) {
 func readKiroAt(key, home string) (kiroCred, bool) {
 	if key != "" {
 		return kiroCred{access: key, method: "apikey", region: "us-east-1"}, true
+	}
+	if settings.AccountDiscoveryOff() {
+		return kiroCred{}, false
 	}
 	if home != "" {
 		return readKiroFile(filepath.Join(home, kiroTokenFile))
@@ -476,11 +485,7 @@ func writeFileAtomic(path string, b []byte) error {
 	if err != nil {
 		return err
 	}
-	tmp := path + ".magpie-tmp"
-	if err := os.WriteFile(tmp, b, 0o600); err != nil {
-		return err
-	}
-	return steady.Rename(tmp, path)
+	return steady.WriteFile(path, b, 0o600) // on the disk before it is renamed in (#1505)
 }
 
 // kiroPost posts to a sign-in endpoint.
@@ -789,6 +794,10 @@ func (l kiroLimits) windows() []QuotaWindow {
 // magpie signed in in home, or Kiro's own sign-in's.
 func kiroQuotaAt(ctx context.Context, key, home string) SubscriptionQuota {
 	q := SubscriptionQuota{Provider: "kiro", Name: "Kiro", Icon: "kiro-color", Windows: []QuotaWindow{}}
+	if holding(ctx) {
+		q.Error = errNotAsked.Error()
+		return q
+	}
 	a, err := KiroAuthOf(ctx, key, home, false)
 	if err != nil {
 		q.Error = err.Error()
@@ -832,8 +841,9 @@ func kiroIdentity(key, home string) (user, plan string) {
 	}
 	if time.Since(s.at) > 5*time.Minute && !s.refreshing {
 		s.refreshing = true
+		ask := askKiroIdentity
 		go func() {
-			u, p := askKiroIdentity(key, home)
+			u, p := ask(key, home)
 			kiroStatus.Lock()
 			if u != "" || p != "" {
 				s.user, s.plan = u, p

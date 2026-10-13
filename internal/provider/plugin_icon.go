@@ -24,6 +24,11 @@ func PluginIcon(pp plugin.Provider) string {
 	return plugin.Icon(pp.Spec, pp.ID)
 }
 
+// PluginOwnIcon is the Icon value of a picture a plugin gave (a data:image
+// URI or an https URL), "" while there is none to show: an agent a
+// plugin adds shows it as a provider's does.
+func PluginOwnIcon(said string) string { return pluginOwnIcon(said) }
+
 // plugIcons are the pictures plugins gave, by their hash: the Icon value
 // each is kept as, and when one was last tried (a URL being fetched or
 // that failed, a data URI that isn't a picture).
@@ -32,6 +37,8 @@ var plugIcons struct {
 	from  string // the file they were read from
 	kept  map[string]string
 	tried map[string]time.Time
+	// the URLs being fetched now, each closed once its fetch is over
+	busy map[string]chan struct{}
 }
 
 // fetchPluginIcon fetches an https picture as an import link's is: a
@@ -98,18 +105,71 @@ func pluginOwnIcon(said string) string {
 	if err != nil {
 		return ""
 	}
+	if plugIcons.busy == nil {
+		plugIcons.busy = map[string]chan struct{}{}
+	}
+	done := make(chan struct{})
+	plugIcons.busy[k] = done
+	fetch := fetchPluginIcon
 	go func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		ic, err := fetchPluginIcon(ctx, u)
-		if err != nil {
-			return
-		}
+		ic, err := fetch(ctx, u)
 		plugIcons.Lock()
-		keepPlugIcon(k, ic)
+		if err == nil {
+			keepPlugIcon(k, ic)
+		}
+		delete(plugIcons.busy, k)
 		plugIcons.Unlock()
+		close(done)
 	}()
 	return ""
+}
+
+// RepoIcons are the Icon values of the pictures plugins not installed yet
+// give in their package.json (repositories tagged magpie-plugin), checked
+// and kept as an installed plugin's are: "" where there is none to show.
+// An https picture not fetched before is waited for up to wait, so the
+// list's first answer has it (yetone: 非官方插件显示不出来 logo); one
+// slower than that shows the next time the list is asked.
+func RepoIcons(said []string, wait time.Duration) []string {
+	out := make([]string, len(said))
+	var busy []chan struct{}
+	for i, s := range said {
+		out[i] = pluginOwnIcon(s)
+		if out[i] == "" && s != "" {
+			sum := sha256.Sum256([]byte(s))
+			plugIcons.Lock()
+			if ch := plugIcons.busy[hex.EncodeToString(sum[:16])]; ch != nil {
+				busy = append(busy, ch)
+			}
+			plugIcons.Unlock()
+		}
+	}
+	if len(busy) == 0 {
+		return out
+	}
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	for _, ch := range busy {
+		select {
+		case <-ch:
+		case <-t.C:
+			return refill(out, said)
+		}
+	}
+	return refill(out, said)
+}
+
+// refill asks again for the pictures not in yet, which those fetched since
+// now have
+func refill(out, said []string) []string {
+	for i, s := range said {
+		if out[i] == "" && s != "" {
+			out[i] = pluginOwnIcon(s)
+		}
+	}
+	return out
 }
 
 // keptPluginIcons are the names of the stored pictures plugins gave, which

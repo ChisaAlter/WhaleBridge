@@ -3,7 +3,10 @@ package provider
 import "net/url"
 
 func (p Provider) SkipsRedaction() bool {
-	return p.Unredacted && p.Account == nil && !p.IsRemoteMagpie() && LocalAddresses(p.Chat, p.Responses, p.Anthropic, p.Decide)
+	if !p.Unredacted || p.Account != nil || p.IsRemoteMagpie() {
+		return false
+	}
+	return LocalAddresses(p.Chat, p.Responses, p.Anthropic, p.Gemini, p.Decide)
 }
 
 func LocalAddresses(bases ...string) bool {

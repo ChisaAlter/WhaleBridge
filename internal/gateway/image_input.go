@@ -68,7 +68,7 @@ func (im imageAt) Current() bool { return im.Last && !im.Tool }
 // ends the walk. The body is returned as it was when nothing was swapped.
 func walkImages(proto provider.Protocol, body []byte, swap func(imageAt) (json.RawMessage, error)) ([]byte, error) {
 	var request map[string]json.RawMessage
-	if json.Unmarshal(body, &request) != nil {
+	if decodeJSON(body, &request) != nil {
 		return body, nil
 	}
 	turnsKey, contentKey := "messages", "content"
@@ -79,26 +79,26 @@ func walkImages(proto provider.Protocol, body []byte, swap func(imageAt) (json.R
 		turnsKey, contentKey = "contents", "parts"
 	}
 	var turns []json.RawMessage
-	if json.Unmarshal(request[turnsKey], &turns) != nil {
+	if decodeJSON(request[turnsKey], &turns) != nil {
 		return body, nil
 	}
 	changed := false
 	for i, raw := range turns {
 		var turn map[string]json.RawMessage
-		if json.Unmarshal(raw, &turn) != nil {
+		if decodeJSON(raw, &turn) != nil {
 			continue
 		}
 		key := contentKey
 		tool := false
 		var kind string
 		if proto == provider.Responses {
-			json.Unmarshal(turn["type"], &kind)
+			decodeJSON(turn["type"], &kind)
 			if kind == "function_call_output" {
 				key, tool = "output", true
 			}
 		}
 		if proto == provider.Chat {
-			json.Unmarshal(turn["role"], &kind)
+			decodeJSON(turn["role"], &kind)
 			tool = kind == "tool"
 		}
 		content, swapped, err := swapImageBlocks(proto, turn[key], i == len(turns)-1, tool, swap)
@@ -123,17 +123,17 @@ func walkImages(proto provider.Protocol, body []byte, swap func(imageAt) (json.R
 // Anthropic tool_result's, which are a tool's.
 func swapImageBlocks(proto provider.Protocol, raw json.RawMessage, last, tool bool, swap func(imageAt) (json.RawMessage, error)) (json.RawMessage, bool, error) {
 	var blocks []json.RawMessage
-	if json.Unmarshal(raw, &blocks) != nil {
+	if decodeJSON(raw, &blocks) != nil {
 		return raw, false, nil
 	}
 	swapped := false
 	for i, rawBlock := range blocks {
 		var block map[string]json.RawMessage
-		if json.Unmarshal(rawBlock, &block) != nil {
+		if decodeJSON(rawBlock, &block) != nil {
 			continue
 		}
 		var kind string
-		json.Unmarshal(block["type"], &kind)
+		decodeJSON(block["type"], &kind)
 		src, isImage := imageSrc(proto, kind, block)
 		if isImage {
 			out, err := swap(imageAt{Src: src, Last: last, Tool: tool})
@@ -149,7 +149,7 @@ func swapImageBlocks(proto provider.Protocol, raw json.RawMessage, last, tool bo
 		// Gemini's function response holds a tool's images in its own parts
 		if proto == provider.Gemini && len(block["functionResponse"]) > 0 {
 			var fr map[string]json.RawMessage
-			if json.Unmarshal(block["functionResponse"], &fr) == nil && len(fr["parts"]) > 0 {
+			if decodeJSON(block["functionResponse"], &fr) == nil && len(fr["parts"]) > 0 {
 				content, nested, err := swapImageBlocks(proto, fr["parts"], last, true, swap)
 				if err != nil {
 					return raw, false, err
@@ -190,11 +190,11 @@ func imageSrc(proto provider.Protocol, kind string, block map[string]json.RawMes
 			return "", false
 		}
 		var url string
-		if json.Unmarshal(block["image_url"], &url) != nil {
+		if decodeJSON(block["image_url"], &url) != nil {
 			var obj struct {
 				URL string `json:"url"`
 			}
-			json.Unmarshal(block["image_url"], &obj)
+			decodeJSON(block["image_url"], &obj)
 			url = obj.URL
 		}
 		return url, true
@@ -203,7 +203,7 @@ func imageSrc(proto provider.Protocol, kind string, block map[string]json.RawMes
 			return "", false
 		}
 		var url string
-		json.Unmarshal(block["image_url"], &url)
+		decodeJSON(block["image_url"], &url)
 		return url, true
 	case provider.Anthropic:
 		if kind != "image" {
@@ -215,7 +215,7 @@ func imageSrc(proto provider.Protocol, kind string, block map[string]json.RawMes
 			Data      string `json:"data"`
 			URL       string `json:"url"`
 		}
-		json.Unmarshal(block["source"], &src)
+		decodeJSON(block["source"], &src)
 		switch {
 		case src.Type == "base64" && src.Data != "":
 			return "data:" + src.MediaType + ";base64," + src.Data, true
@@ -228,7 +228,7 @@ func imageSrc(proto provider.Protocol, kind string, block map[string]json.RawMes
 			MimeType string `json:"mimeType"`
 			Data     string `json:"data"`
 		}
-		json.Unmarshal(block["inlineData"], &data)
+		decodeJSON(block["inlineData"], &data)
 		if strings.HasPrefix(data.MimeType, "image/") {
 			return "data:" + data.MimeType + ";base64," + data.Data, true
 		}
@@ -236,7 +236,7 @@ func imageSrc(proto provider.Protocol, kind string, block map[string]json.RawMes
 			var file struct {
 				MimeType string `json:"mimeType"`
 			}
-			if json.Unmarshal(block["fileData"], &file) != nil || file.MimeType == "" || strings.HasPrefix(file.MimeType, "image/") {
+			if decodeJSON(block["fileData"], &file) != nil || file.MimeType == "" || strings.HasPrefix(file.MimeType, "image/") {
 				return "", true // unknown file types may be images; fail closed
 			}
 		}

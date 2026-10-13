@@ -7,6 +7,17 @@ import "strings"
 // rule may send that request to a cheaper, faster model (provider.Rule's
 // Compact). The prompts are the agents' own, read from each one's release.
 
+// compactLead is how far into the system prompt, or into a text part of the
+// last user message, an agent's compaction prompt may begin. Each agent puts
+// its prompt first or behind a short lead of its own (Claude Code's billing
+// header and identity line; its "CRITICAL: Respond with TEXT ONLY" preamble,
+// about 420 bytes, before the ask). Further in, it is something quoting the
+// prompt: a memory or a note an agent puts in the system prompt behind its
+// own, every turn (#1635, jueda12: a Minis memory holding Minis's compaction
+// line sent every request of that conversation to the compaction rule's
+// model), or a user writing about it.
+const compactLead = 2048
+
 // compactSystems open (or are) the system prompt of a compaction request.
 var compactSystems = []string{
 	// Claude Code 2.1, and OpenCode's before its own agent
@@ -19,16 +30,36 @@ var compactSystems = []string{
 	"You are a specialized system component responsible for distilling chat history into a structured XML <state_snapshot>",
 	// Qwen Code
 	"You are the component that summarizes a conversation when its context window is about to overflow.",
+	// Minis (OpenMinis), iOS and Android alike (compactSummarySystemPrompt)
+	"You are a context compaction engine. Your summary will REPLACE the original messages in the conversation context window.",
+	// Kimi Code (kimi_cli/soul/compaction.py's COMPACTION_SYSTEM_PROMPT)
+	"You are a helpful assistant that compacts conversation context.",
+}
+
+// compactAsk is said in a text part of the last user message of a
+// compaction request: within compactLead of the part's start, or, for an
+// agent that sends the conversation ahead of it in the same part, anywhere
+// in a part that opens with that agent's own first line (opens).
+type compactAsk struct {
+	ask, opens string
 }
 
 // compactAsks are in the last user message of a compaction request.
-var compactAsks = []string{
+var compactAsks = []compactAsk{
 	// Claude Code's /compact and auto-compact
-	"Your task is to create a detailed summary of the conversation so far",
+	{ask: "Your task is to create a detailed summary of the conversation so far"},
 	// Codex (and magpie's own for a Codex compaction_trigger)
-	"You are performing a CONTEXT CHECKPOINT COMPACTION.",
-	// Kimi Code (prompts/compact.md)
-	"You are now given a task to compact this conversation context",
+	{ask: "You are performing a CONTEXT CHECKPOINT COMPACTION."},
+	// Kimi Code (prompts/compact.md, a part of its own after the conversation)
+	{ask: "You are now given a task to compact this conversation context"},
+	// Minis, around the conversation it sends as one user message
+	{ask: "END OF CONVERSATION TO COMPACT.", opens: "Compact this conversation into a context summary:"},
+}
+
+// leads reports whether p begins within compactLead bytes of text's start.
+func leads(text, p string) bool {
+	i := strings.Index(text, p)
+	return i >= 0 && i <= compactLead
 }
 
 // compacting reports whether req is an agent compacting its conversation.
@@ -37,7 +68,7 @@ func compacting(req *Request) bool {
 		return false
 	}
 	for _, p := range compactSystems {
-		if strings.Contains(req.System, p) {
+		if leads(req.System, p) {
 			return true
 		}
 	}
@@ -51,7 +82,8 @@ func compacting(req *Request) bool {
 				continue
 			}
 			for _, a := range compactAsks {
-				if strings.Contains(p.Text, a) {
+				if a.opens == "" && leads(p.Text, a.ask) ||
+					a.opens != "" && strings.HasPrefix(strings.TrimSpace(p.Text), a.opens) && strings.Contains(p.Text, a.ask) {
 					return true
 				}
 			}

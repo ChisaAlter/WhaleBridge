@@ -37,7 +37,7 @@ func redactedPrompt(w http.ResponseWriter, prompt string) (http.ResponseWriter, 
 
 func redactionOptions() redact.Options {
 	st := settings.Load()
-	return redact.Options{Secrets: st.Redact, Personal: st.RedactPersonal, Words: st.RedactWords, Rules: st.RedactRules}
+	return redact.Options{Secrets: st.Redact, Personal: st.RedactPersonal, Kinds: st.RedactKinds, Words: st.RedactWords, Rules: st.RedactRules}
 }
 
 // unredactedRoute says a request resolved to p, or to the group whose

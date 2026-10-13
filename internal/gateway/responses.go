@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"fmt"
 	"slices"
@@ -47,7 +48,7 @@ type rArgs string
 
 func (a *rArgs) UnmarshalJSON(b []byte) error {
 	var s string
-	if json.Unmarshal(b, &s) == nil {
+	if decodeJSON(b, &s) == nil {
 		*a = rArgs(s)
 	} else if string(b) != "null" {
 		*a = rArgs(b)
@@ -114,11 +115,11 @@ func customInput(args string) string {
 	var a struct {
 		Input *string `json:"input"`
 	}
-	if json.Unmarshal([]byte(args), &a) == nil && a.Input != nil {
+	if decodeJSON([]byte(args), &a) == nil && a.Input != nil {
 		return *a.Input
 	}
 	var str string
-	if json.Unmarshal([]byte(args), &str) == nil {
+	if decodeJSON([]byte(args), &str) == nil {
 		return str
 	}
 	return args
@@ -166,7 +167,7 @@ func unsealed(schema json.RawMessage) json.RawMessage {
 		return schema
 	}
 	var v any
-	if json.Unmarshal(schema, &v) != nil {
+	if decodeJSON(schema, &v) != nil {
 		return schema
 	}
 	var strip func(any)
@@ -219,6 +220,26 @@ type rRequest struct {
 	} `json:"reasoning,omitempty"`
 }
 
+// textFormat splits a Responses client's text into the rest of it and
+// the format it asks the answer in (text.format), which is asked for again
+// in each upstream's own words. A format of plain text stays where it was.
+func textFormat(text json.RawMessage) (json.RawMessage, *Format) {
+	var fields map[string]json.RawMessage
+	if decodeJSON(text, &fields) != nil {
+		return text, nil
+	}
+	f := openAIFormat(fields["format"])
+	if f == nil {
+		return text, nil
+	}
+	delete(fields, "format")
+	if len(fields) == 0 {
+		return nil, f
+	}
+	rest, _ := json.Marshal(fields)
+	return rest, f
+}
+
 // sentRaw is a raw field the client sent, unless it sent null.
 func sentRaw(v json.RawMessage) json.RawMessage {
 	if t := strings.TrimSpace(string(v)); t == "" || t == "null" {
@@ -231,12 +252,13 @@ func parseResponses(body []byte) (*Request, error) {
 	// Responses Lite's tools, sent as the first input item (#350)
 	body = liftAdditionalTools(body)
 	var q rRequest
-	if err := json.Unmarshal(body, &q); err != nil {
+	if err := decodeJSON(body, &q); err != nil {
 		return nil, fmt.Errorf("invalid request: %v", err)
 	}
 	r := &Request{Model: q.Model, System: q.Instructions, MaxTokens: q.MaxOutputTokens, Temp: q.Temperature,
-		TopP: q.TopP, Stream: q.Stream, Parallel: q.ParallelToolCalls, Fast: q.ServiceTier == "priority", CacheKey: q.PromptCacheKey, Include: q.Include,
-		ClientMetadata: sentRaw(q.ClientMetadata), Text: sentRaw(q.Text)}
+		TopP: q.TopP, Stream: q.Stream, Parallel: q.ParallelToolCalls, Fast: q.ServiceTier == "priority" || q.ServiceTier == "ultrafast", Ultrafast: q.ServiceTier == "ultrafast", Tier: q.ServiceTier, CacheKey: q.PromptCacheKey, Include: q.Include,
+		ClientMetadata: sentRaw(q.ClientMetadata)}
+	r.Text, r.Format = textFormat(sentRaw(q.Text))
 	if q.Reasoning != nil {
 		r.Effort = effortOf(q.Reasoning.Effort)
 		r.Thinking = true
@@ -244,11 +266,11 @@ func parseResponses(body []byte) (*Request, error) {
 	}
 	var found []rTool // what Codex's tool searches found
 	var s string
-	if json.Unmarshal(q.Input, &s) == nil {
+	if decodeJSON(q.Input, &s) == nil {
 		r.Messages = append(r.Messages, Message{Role: "user", Parts: []Part{{Kind: Text, Text: s}}})
 	} else {
 		var items []rItem
-		if err := json.Unmarshal(q.Input, &items); err != nil {
+		if err := decodeJSON(q.Input, &items); err != nil {
 			return nil, fmt.Errorf("invalid input: %v", err)
 		}
 		// replied: the conversation has had a turn answered. Codex adds a
@@ -258,7 +280,7 @@ func parseResponses(body []byte) (*Request, error) {
 		// written to the vendor's cache again (Anthropic's system comes
 		// first; a Claude subscription's waiting run is found by it) (#502)
 		replied := false
-		var rawItems []json.RawMessage // decoded only for native standalone outputs
+		var rawItems []json.RawMessage // decoded only for native standalone outputs and sealed reasoning
 		for i, it := range items {
 			if it.Role == "assistant" || strings.HasPrefix(it.Type, "function_call") || strings.HasPrefix(it.Type, "custom_tool_call") || strings.HasPrefix(it.Type, "tool_search") || it.Type == "reasoning" {
 				replied = true
@@ -320,9 +342,9 @@ func parseResponses(body []byte) (*Request, error) {
 					// collect a streamed response for a non-streaming client.
 					// Retain the original notification, including absent IDs.
 					if rawItems == nil {
-						_ = json.Unmarshal(q.Input, &rawItems)
+						_ = decodeJSON(q.Input, &rawItems)
 					}
-					_ = json.Unmarshal(rawItems[i], &part.Standalone)
+					_ = decodeJSON(rawItems[i], &part.Standalone)
 				}
 				r.Messages = append(r.Messages, Message{Role: "user", Parts: []Part{part}})
 			case it.Type == "reasoning":
@@ -330,7 +352,7 @@ func parseResponses(body []byte) (*Request, error) {
 				// summary (all magpie gives a client of a translated reply)
 				var b strings.Builder
 				var content []rText
-				_ = json.Unmarshal(it.Content, &content)
+				_ = decodeJSON(it.Content, &content)
 				for _, c := range content {
 					if c.Type == "reasoning_text" {
 						b.WriteString(c.Text)
@@ -341,8 +363,19 @@ func parseResponses(body []byte) (*Request, error) {
 						b.WriteString(s.Text)
 					}
 				}
-				if b.Len() > 0 {
-					r.Messages = append(r.Messages, Message{Role: "assistant", Parts: []Part{{Kind: Thinking, Text: b.String()}}})
+				part := Part{Kind: Thinking, Text: b.String()}
+				if it.EncryptedContent != "" {
+					// sealed: the item goes back to a Responses API as it
+					// came, id, summary and all (#1445)
+					if rawItems == nil {
+						_ = decodeJSON(q.Input, &rawItems)
+					}
+					if i < len(rawItems) {
+						part.Sealed, part.SealedBy = rawItems[i], sealResponses
+					}
+				}
+				if b.Len() > 0 || part.Sealed != nil {
+					r.Messages = append(r.Messages, Message{Role: "assistant", Parts: []Part{part}})
 				}
 			}
 		}
@@ -392,7 +425,7 @@ func parseResponses(body []byte) (*Request, error) {
 		}
 	}
 	var tc string
-	if json.Unmarshal(q.ToolChoice, &tc) == nil {
+	if decodeJSON(q.ToolChoice, &tc) == nil {
 		r.ToolChoice = tc
 	} else {
 		var o struct {
@@ -405,7 +438,7 @@ func parseResponses(body []byte) (*Request, error) {
 				Namespace string `json:"namespace"`
 			} `json:"tools"`
 		}
-		if json.Unmarshal(q.ToolChoice, &o) == nil {
+		if decodeJSON(q.ToolChoice, &o) == nil {
 			switch o.Type {
 			case "allowed_tools":
 				if o.Mode != "auto" && o.Mode != "required" {
@@ -449,16 +482,137 @@ func parseResponses(body []byte) (*Request, error) {
 	return r, nil
 }
 
+// toolCallItem is a Responses input item that makes a tool call, and
+// toolResultItem one that answers a call.
+func toolCallItem(t string) bool {
+	switch t {
+	case "function_call", "custom_tool_call", "tool_search_call":
+		return true
+	}
+	return false
+}
+
+func toolResultItem(t string) bool {
+	switch t {
+	case "function_call_output", "custom_tool_call_output", "tool_search_output":
+		return true
+	}
+	return false
+}
+
+// joinToolRuns moves an item that sits inside a run of tool calls and
+// results — after a result of the run and before the last result that
+// answers one of its calls — to the end of that run. An upstream that
+// checks the exchange, on the chat form it turns a relayed request into or
+// on the Responses input itself, reads the run as ended there and refuses
+// it: Volcengine's coding plan answers 400 "An assistant message with
+// 'tool_calls' must be followed by tool messages responding to each
+// 'tool_call_id'", the same refusal pairToolItems mends a missing result
+// for (#1341), and OpenCode Zen/Go answers "No tool output found for tool
+// call <id>". An agent writes an item between one batch's results itself:
+// Codex writes its <image_resize_notice> right after each result that held
+// an image it resized (image_preparation.rs, prepare_response_items), so a
+// batch of two calls has it between their results (#1752, #1822).
+//
+// An item that carries a call_id is part of an exchange and never moves,
+// whatever its type. Before the run's first result, what the model wrote
+// between its own calls (reasoning, its text, a hosted tool's call) is its
+// step and stays; anything else there (a subagent's agent_message, a note)
+// moves as it would between the results. A call opens the run only when a
+// result after it answers it: a call nothing answers is pairToolItems'
+// (#1341), and one answered before it is not waited on. An item between two
+// whole exchanges stays where it is, and a request with nothing inside a
+// run comes back byte for byte.
+func joinToolRuns(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`_call"`)) {
+		return body
+	}
+	var q map[string]json.RawMessage
+	if decodeJSON(body, &q) != nil {
+		return body
+	}
+	var input []json.RawMessage
+	if decodeJSON(q["input"], &input) != nil {
+		return body
+	}
+	type item struct {
+		Type   string `json:"type"`
+		Role   string `json:"role"`
+		CallID string `json:"call_id"`
+	}
+	items := make([]item, len(input))
+	for i, raw := range input {
+		if decodeJSON(raw, &items[i]) != nil {
+			items[i] = item{}
+		}
+	}
+	result := func(it item) bool { return it.CallID != "" && strings.HasSuffix(it.Type, "_output") }
+	// answeredLater[i]: the call at i has a result after it
+	answeredLater := make([]bool, len(input))
+	ahead := map[string]bool{}
+	for i := len(items) - 1; i >= 0; i-- {
+		switch it := items[i]; {
+		case result(it):
+			ahead[it.CallID] = true
+		case it.CallID != "":
+			answeredLater[i] = ahead[it.CallID]
+		}
+	}
+	modelsOwn := func(it item) bool {
+		return it.Type == "reasoning" || it.Type == "message" && it.Role == "assistant" ||
+			strings.HasSuffix(it.Type, "_call")
+	}
+	out := make([]json.RawMessage, 0, len(input))
+	var held []json.RawMessage
+	moved := false
+	// open: calls of the run in progress whose result is still ahead;
+	// answering: a result of the run has come
+	open := map[string]bool{}
+	answering := false
+	for i, raw := range input {
+		it := items[i]
+		switch {
+		case result(it):
+			if open[it.CallID] {
+				delete(open, it.CallID)
+				answering = true
+			}
+		case it.CallID != "":
+			if answeredLater[i] {
+				open[it.CallID] = true
+			}
+		case len(open) > 0 && (answering || !modelsOwn(it)):
+			held, moved = append(held, raw), true
+			continue
+		}
+		out = append(out, raw)
+		if len(open) == 0 {
+			out = append(out, held...)
+			held, answering = nil, false
+		}
+	}
+	out = append(out, held...)
+	if !moved {
+		return body
+	}
+	q["input"], _ = marshalPlain(out)
+	encoded, err := marshalPlain(q)
+	if err != nil {
+		return body
+	}
+	return encoded
+}
+
 // orphanedToolOutputs turns a tool result with no call ID into a user message.
 // Codex uses standalone outputs for cross-thread notifications. Backends
 // requiring paired outputs still need the delivered text, without a fake call ID.
 func orphanedToolOutputs(body []byte) []byte {
 	var q map[string]json.RawMessage
-	if json.Unmarshal(body, &q) != nil {
+	if decodeJSON(body, &q) != nil {
 		return body
 	}
 	var input []json.RawMessage
-	if json.Unmarshal(q["input"], &input) != nil {
+	if decodeJSON(q["input"], &input) != nil {
 		return body
 	}
 	changed := false
@@ -475,7 +629,7 @@ func orphanedToolOutputs(body []byte) []byte {
 			CallID string          `json:"call_id"`
 			Output json.RawMessage `json:"output"`
 		}
-		if json.Unmarshal(raw, &item) != nil {
+		if decodeJSON(raw, &item) != nil {
 			flush()
 			inCalls = false
 			out = append(out, raw)
@@ -505,7 +659,7 @@ func orphanedToolOutputs(body []byte) []byte {
 			content = append(content, map[string]any{"type": "input_text", "text": text})
 		}
 		for _, image := range images {
-			content = append(content, map[string]any{"type": "input_image", "image_url": dataURL(image)})
+			content = append(content, map[string]any{"type": "input_image", "detail": "auto", "image_url": dataURL(image)})
 		}
 		if len(content) == 0 {
 			content = append(content, map[string]any{"type": "input_text", "text": "Tool result received."})
@@ -532,6 +686,77 @@ func orphanedToolOutputs(body []byte) []byte {
 	return encoded
 }
 
+// pairToolItems gives a Responses request's tool call that no result in
+// the request answers a synthetic one, as pairToolMessages does for a Chat
+// request: an upstream that checks the exchange on the chat form it turns
+// the request into refuses a lone call — Volcengine's coding plan answers
+// 400 "An assistant message with 'tool_calls' must be followed by tool
+// messages responding to each 'tool_call_id'" (#1341), and OpenAI's own
+// Responses API "No tool output found for function call". The result goes
+// at the end of the run of calls and results the call is in, where a chat
+// form has its tool messages. A result with no call is left to
+// orphanedToolOutputs, and one naming a call another request carried
+// (previous_response_id) stays as it is.
+func pairToolItems(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`_call"`)) {
+		return body
+	}
+	var q map[string]json.RawMessage
+	if decodeJSON(body, &q) != nil {
+		return body
+	}
+	var input []json.RawMessage
+	if decodeJSON(q["input"], &input) != nil {
+		return body
+	}
+	type item struct {
+		Type   string `json:"type"`
+		CallID string `json:"call_id"`
+	}
+	items := make([]item, len(input))
+	answered := map[string]bool{}
+	for i, raw := range input {
+		if decodeJSON(raw, &items[i]) != nil {
+			items[i] = item{}
+		}
+		if t := items[i].Type; (t == "function_call_output" || t == "custom_tool_call_output") && items[i].CallID != "" {
+			answered[items[i].CallID] = true
+		}
+	}
+	exchange := func(t string) bool {
+		return toolCallItem(t) || toolResultItem(t)
+	}
+	out := make([]json.RawMessage, 0, len(input)+1)
+	var synthetic []json.RawMessage // results owed by the run in progress
+	for i, raw := range input {
+		out = append(out, raw)
+		it := items[i]
+		if (it.Type == "function_call" || it.Type == "custom_tool_call") && it.CallID != "" && !answered[it.CallID] {
+			kind := "function_call_output"
+			if it.Type == "custom_tool_call" {
+				kind = "custom_tool_call_output"
+			}
+			result, _ := marshalPlain(map[string]any{"type": kind, "call_id": it.CallID,
+				"output": "[The result of this tool call is unavailable: the turn was interrupted.]"})
+			synthetic = append(synthetic, result)
+			answered[it.CallID] = true
+		}
+		if len(synthetic) > 0 && exchange(it.Type) && (i+1 == len(input) || !exchange(items[i+1].Type)) {
+			out = append(out, synthetic...)
+			synthetic = nil
+		}
+	}
+	if len(out) == len(input) {
+		return body
+	}
+	q["input"], _ = marshalPlain(out)
+	encoded, err := marshalPlain(q)
+	if err != nil {
+		return body
+	}
+	return encoded
+}
+
 // mergeTurns joins consecutive messages of the same role, since the
 // Responses API splits an assistant turn into one item per part.
 func mergeTurns(msgs []Message) []Message {
@@ -548,7 +773,7 @@ func mergeTurns(msgs []Message) []Message {
 
 func responsesParts(raw json.RawMessage) []Part {
 	var s string
-	if json.Unmarshal(raw, &s) == nil {
+	if decodeJSON(raw, &s) == nil {
 		if s == "" {
 			return nil
 		}
@@ -559,7 +784,7 @@ func responsesParts(raw json.RawMessage) []Part {
 		Text     string `json:"text"`
 		ImageURL string `json:"image_url"`
 	}
-	json.Unmarshal(raw, &items)
+	decodeJSON(raw, &items)
 	var out []Part
 	for _, it := range items {
 		switch it.Type {
@@ -574,6 +799,204 @@ func responsesParts(raw json.RawMessage) []Part {
 	return out
 }
 
+// replaysReasoning is whether model, served by host's Responses API, wants
+// a turn's reasoning text back between tool calls (DeepSeek: "The
+// reasoning_text in the thinking mode must be passed back", #388). OpenAI's,
+// xAI's, Copilot's and Azure's read only their own sealed reasoning.
+func replaysReasoning(model, host string) bool {
+	return strings.Contains(strings.ToLower(model), "deepseek") &&
+		!slices.Contains([]string{"chatgpt.com", "api.openai.com", "api.x.ai", "api.githubcopilot.com"}, host) &&
+		!strings.HasSuffix(host, ".openai.azure.com")
+}
+
+// withReasoningText gives each reasoning item in a Responses request that
+// carries no reasoning_text its summary as one, else noReasoning, and has
+// each step that needs one lead with a reasoning item (reasonFirst), for an
+// upstream that wants the reasoning back (replaysReasoning). Codex sends an
+// item back as it got it: one from a turn magpie translated has only a
+// summary, one the ChatGPT backend sealed has only encrypted_content, and a
+// turn another model in a mixed group served may have no reasoning item at
+// all. DeepSeek refuses the whole request over any of them, and over an
+// empty reasoning_text, with "The `reasoning_text` in the thinking mode must
+// be passed back to the API" (#1104, #1592, #1822). A body with nothing to
+// give comes back byte for byte.
+func withReasoningText(body []byte) []byte {
+	if !bytes.Contains(body, []byte(`"reasoning"`)) && !bytes.Contains(body, []byte(`_call"`)) &&
+		!bytes.Contains(body, []byte(`_output"`)) {
+		return body
+	}
+	var q map[string]json.RawMessage
+	if decodeJSON(body, &q) != nil {
+		return body
+	}
+	var items []json.RawMessage
+	if decodeJSON(q["input"], &items) != nil {
+		return body
+	}
+	changed := false
+	kinds := make([]stepKind, len(items))
+	for i, raw := range items {
+		var it struct {
+			Type    string  `json:"type"`
+			Role    string  `json:"role"`
+			Summary []rText `json:"summary"`
+			Content []rText `json:"content"`
+		}
+		if decodeJSON(raw, &it) != nil {
+			continue
+		}
+		kinds[i] = stepKindOf(it.Type, it.Role)
+		if it.Type != "reasoning" ||
+			slices.ContainsFunc(it.Content, func(c rText) bool { return c.Type == "reasoning_text" && c.Text != "" }) {
+			continue
+		}
+		var b strings.Builder
+		for _, s := range it.Summary {
+			b.WriteString(s.Text)
+		}
+		if b.Len() == 0 {
+			b.WriteString(noReasoning)
+		}
+		var m map[string]json.RawMessage
+		if decodeJSON(raw, &m) != nil {
+			continue
+		}
+		m["content"], _ = json.Marshal([]map[string]string{{"type": "reasoning_text", "text": b.String()}})
+		if nb, err := json.Marshal(m); err == nil {
+			items[i], changed = nb, true
+		}
+	}
+	none, _ := json.Marshal(noReasoningItem())
+	if led, ok := reasonFirst(items, kinds, json.RawMessage(none)); ok {
+		items, changed = led, true
+	}
+	if !changed {
+		return body
+	}
+	q["input"], _ = json.Marshal(items)
+	nb, err := json.Marshal(q)
+	if err != nil {
+		return body
+	}
+	return nb
+}
+
+// stepKind is what a Responses input item is to a step of the model's: its
+// reasoning, something it said or a call it made, what answered a call, or
+// a message of the user's (or the system's) that starts a turn.
+type stepKind int
+
+const (
+	stepOther stepKind = iota
+	stepReasoning
+	stepSaid
+	stepCall
+	stepOutput
+	stepTurn
+)
+
+func stepKindOf(typ, role string) stepKind {
+	switch {
+	case typ == "reasoning":
+		return stepReasoning
+	case strings.HasSuffix(typ, "_output"):
+		return stepOutput
+	case strings.HasSuffix(typ, "_call"):
+		return stepCall
+	case (typ == "message" || typ == "") && role == "assistant":
+		return stepSaid
+	case typ == "message" || typ == "" && role != "":
+		return stepTurn
+	}
+	return stepOther
+}
+
+// noReasoningItem is the reasoning item a step leads with when it has none
+// of its own (reasonFirst).
+func noReasoningItem() map[string]any {
+	return map[string]any{"type": "reasoning", "summary": []any{},
+		"content": []map[string]any{{"type": "reasoning_text", "text": noReasoning}}}
+}
+
+// reasonFirst has each step of the model's (a run of its reasoning, what it
+// said and the calls it made, between a user message or a tool output and
+// the next) that makes a call, or that follows a tool output, lead with a
+// reasoning item: the step's first one moved ahead of the rest, else none.
+// DeepSeek's /v1/responses reads a step as one assistant message whose
+// thinking is the reasoning item it starts with, and turns the whole
+// request away ("The `reasoning_text` in the thinking mode must be passed
+// back to the API") when a step of the turn being continued starts with
+// anything else: a call (#1592), or what the model said, as Codex sends a
+// step that said something before its call with its reasoning between them,
+// or with none, which magpie put between them (#1822). Checked against
+// api.deepseek.com on 2026-10-12: [text, reasoning, call] and [output,
+// text] are refused, [reasoning, text, call] and [output, reasoning, text]
+// are taken. ok is false, and items comes back as it is, when every such
+// step leads with one already.
+func reasonFirst[T any](items []T, kinds []stepKind, none T) (led []T, ok bool) {
+	step := func(k stepKind) bool { return k == stepReasoning || k == stepSaid || k == stepCall }
+	afterOutput := false
+	for i := 0; i < len(items); {
+		if !step(kinds[i]) {
+			switch kinds[i] {
+			case stepOutput:
+				afterOutput = true
+			case stepTurn:
+				afterOutput = false
+			}
+			if ok {
+				led = append(led, items[i])
+			}
+			i++
+			continue
+		}
+		j, calls, first := i, false, -1
+		for ; j < len(items) && step(kinds[j]); j++ {
+			calls = calls || kinds[j] == stepCall
+			if kinds[j] == stepReasoning && first < 0 {
+				first = j
+			}
+		}
+		if (calls || afterOutput) && first != i {
+			if !ok {
+				led, ok = append(make([]T, 0, len(items)+1), items[:i]...), true
+			}
+			if first < 0 {
+				led = append(led, none)
+			} else {
+				led = append(led, items[first])
+			}
+			for x := i; x < j; x++ {
+				if x != first {
+					led = append(led, items[x])
+				}
+			}
+		} else if ok {
+			led = append(led, items[i:j]...)
+		}
+		i = j
+	}
+	if !ok {
+		return items, false
+	}
+	return led, true
+}
+
+// sealedReasoning is a reasoning item a Responses API sealed, fit to go
+// back to one as it came: encrypted_content in it, and no reasoning text
+// (which OpenAI and the ChatGPT backend refuse in input, #1411; one with
+// text goes as before).
+func sealedReasoning(p Part) bool {
+	if !p.sealedBy(sealResponses) {
+		return false
+	}
+	var it struct {
+		Enc     string            `json:"encrypted_content"`
+		Content []json.RawMessage `json:"content"`
+	}
+	return decodeJSON(p.Sealed, &it) == nil && it.Enc != "" && len(it.Content) == 0
+}
+
 // buildResponses renders a request for a Responses upstream.
 func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 	// A turn's reasoning goes back as a reasoning item, as a model that
@@ -581,10 +1004,8 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 	// the thinking mode must be passed back", #388). Only a DeepSeek model
 	// gets it: OpenAI's and those in front of it read only their own
 	// sealed reasoning, and may refuse an item without it.
-	replay := strings.Contains(strings.ToLower(model), "deepseek") &&
-		!slices.Contains([]string{"chatgpt.com", "api.openai.com", "api.x.ai", "api.githubcopilot.com"}, host) &&
-		!strings.HasSuffix(host, ".openai.azure.com")
-	var input []map[string]any
+	replay := replaysReasoning(model, host)
+	var input []any
 	for _, m := range r.Messages {
 		var content []map[string]any
 		flushMsg := func() {
@@ -597,6 +1018,9 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 		for _, p := range m.Parts {
 			switch p.Kind {
 			case Text:
+				if p.Text == "" && p.Signature != "" {
+					continue // only Gemini's signature, which is Gemini's
+				}
 				t := "input_text"
 				if m.Role == "assistant" {
 					t = "output_text"
@@ -610,10 +1034,15 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 				content = append(content, map[string]any{"type": t, "text": attachmentText(p)})
 			case Image:
 				if m.Role != "assistant" {
-					content = append(content, map[string]any{"type": "input_image", "image_url": dataURL(p)})
+					content = append(content, map[string]any{"type": "input_image", "detail": "auto", "image_url": dataURL(p)})
 				}
 			case Thinking:
-				if replay && p.Text != "" {
+				if !replay && sealedReasoning(p) {
+					// a Responses API's own sealed reasoning goes back as
+					// it came: id, summary and encrypted_content (#1445)
+					flushMsg()
+					input = append(input, p.Sealed)
+				} else if replay && p.Text != "" {
 					flushMsg()
 					input = append(input, map[string]any{"type": "reasoning", "summary": []any{},
 						"content": []map[string]any{{"type": "reasoning_text", "text": p.Text}}})
@@ -639,7 +1068,7 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 						items = append(items, map[string]any{"type": "input_text", "text": p.Text})
 					}
 					for _, im := range p.Images {
-						items = append(items, map[string]any{"type": "input_image", "image_url": dataURL(im)})
+						items = append(items, map[string]any{"type": "input_image", "detail": "auto", "image_url": dataURL(im)})
 					}
 					output = items
 				}
@@ -648,15 +1077,40 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 		}
 		flushMsg()
 	}
+	if replay {
+		// each step that makes a call, or follows a tool output, leads with
+		// its reasoning, or with a space's (#1592, #1822)
+		kinds := make([]stepKind, len(input))
+		for i, it := range input {
+			var k struct {
+				Type string `json:"type"`
+				Role string `json:"role"`
+			}
+			switch v := it.(type) {
+			case map[string]any:
+				k.Type, _ = v["type"].(string)
+				k.Role, _ = v["role"].(string)
+			case json.RawMessage:
+				decodeJSON(v, &k)
+			}
+			kinds[i] = stepKindOf(k.Type, k.Role)
+		}
+		input, _ = reasonFirst(input, kinds, any(noReasoningItem()))
+	}
 	if input == nil {
-		input = []map[string]any{}
+		input = []any{}
 	}
 	out := map[string]any{"model": model, "input": input, "stream": r.Stream, "store": false}
 	if len(r.ClientMetadata) > 0 {
 		out["client_metadata"] = r.ClientMetadata
 	}
-	if len(r.Text) > 0 {
-		out["text"] = r.Text
+	if len(r.Text) > 0 || r.Format != nil {
+		text := map[string]any{}
+		decodeJSON(r.Text, &text)
+		if r.Format != nil {
+			text["format"] = r.Format.responses()
+		}
+		out["text"] = text
 	}
 	if r.CacheKey != "" {
 		out["prompt_cache_key"] = r.CacheKey
@@ -679,6 +1133,13 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 	if r.Fast && (host == "chatgpt.com" || host == "api.openai.com") {
 		out["service_tier"] = "priority"
 	}
+	// Ultrafast only the ChatGPT backend offers
+	if r.Ultrafast && host == "chatgpt.com" {
+		out["service_tier"] = "ultrafast"
+	}
+	if r.OwnTier && r.Tier != "" {
+		out["service_tier"] = r.Tier
+	}
 	if r.Effort != "" {
 		out["reasoning"] = map[string]any{"effort": r.Effort, "summary": "auto"}
 	} else if r.Thinking {
@@ -687,9 +1148,10 @@ func buildResponses(r *Request, model, host string, rejectTemp bool) []byte {
 	// the client's include goes on as the request would have without
 	// magpie. Sealed reasoning is asked for only with reasoning, as Codex
 	// asks for it: OpenAI refuses it of a model that doesn't reason. What
-	// comes back sealed goes no further than magpie, and the input's sealed
-	// reasoning isn't sent on this way, so no account or vendor is handed
-	// another's to refuse (withoutRefused, sealedKinds, on a relay).
+	// comes back sealed goes to a Responses client as it came, and the
+	// input's goes back to a Responses upstream, as it would without magpie
+	// (#1445); an account or vendor that can't read another's turns it away,
+	// and is asked again without it (foreignReasoning, withoutRefused).
 	var include []string
 	for _, v := range r.Include {
 		if v == "" || slices.Contains(include, v) || (v == "reasoning.encrypted_content" && out["reasoning"] == nil) {
@@ -833,7 +1295,12 @@ func (d *responsesDecoder) decode(data string, emit func(Event)) error {
 		} `json:"error"`
 		Message string `json:"message"`
 	}
-	if err := json.Unmarshal([]byte(data), &ev); err != nil {
+	if err := decodeJSON([]byte(data), &ev); err != nil {
+		// an error in a shape of its own is still the reply's end (#1933)
+		if e, ok := carriedError(data); ok {
+			d.endCall(emit)
+			emit(e)
+		}
 		return nil
 	}
 	switch ev.Type {
@@ -847,6 +1314,10 @@ func (d *responsesDecoder) decode(data string, emit func(Event)) error {
 		if ev.Item.Type == "function_call" {
 			d.called, d.calling = true, true
 			emit(Event{Kind: KToolStart, ID: ev.Item.CallID, Name: ev.Item.Name})
+		}
+		if ev.Item.Type == "reasoning" {
+			// an item of its own, by the id the upstream gave it (#1445)
+			emit(Event{Kind: KThinkStart, ID: ev.Item.ID})
 		}
 	case "response.output_text.delta":
 		d.endCall(emit)
@@ -871,6 +1342,16 @@ func (d *responsesDecoder) decode(data string, emit func(Event)) error {
 			}
 			d.endCall(emit)
 		}
+		if ev.Item.Type == "reasoning" && ev.Item.EncryptedContent != "" {
+			// sealed: the item as the upstream wrote it, for a Responses
+			// client and for its next request (#1445)
+			var whole struct {
+				Item json.RawMessage `json:"item"`
+			}
+			if decodeJSON([]byte(data), &whole) == nil && len(whole.Item) > 0 {
+				emit(Event{Kind: KSealed, Name: sealResponses, ID: ev.Item.ID, Text: string(whole.Item)})
+			}
+		}
 		if a := ev.Item.Action; ev.Item.Type == "web_search_call" && a != nil && a.Query != "" {
 			var hits []Hit
 			for _, src := range a.Sources {
@@ -882,8 +1363,14 @@ func (d *responsesDecoder) decode(data string, emit func(Event)) error {
 		}
 	case "response.completed", "response.incomplete", "response.failed":
 		d.endCall(emit)
-		if ev.Response.Error != nil {
-			emit(Event{Kind: KError, Text: ev.Response.Error.Message, Code: refusedCode(data)})
+		if ev.Response.Error != nil || ev.Type == "response.failed" || ev.Response.Status == "failed" {
+			// a failed response is an error with or without the words
+			// for it, never a whole reply (#1933)
+			msg := ""
+			if ev.Response.Error != nil {
+				msg = ev.Response.Error.Message
+			}
+			emit(Event{Kind: KError, Text: cmp.Or(msg, streamErrorText(data)), Code: refusedCode(data)})
 			return nil
 		}
 		stop := "stop"
@@ -908,9 +1395,9 @@ func (d *responsesDecoder) decode(data string, emit func(Event)) error {
 		d.endCall(emit)
 		msg := ev.Message
 		if ev.Error != nil {
-			msg = ev.Error.Message
+			msg = cmp.Or(ev.Error.Message, msg)
 		}
-		emit(Event{Kind: KError, Text: msg, Code: refusedCode(data)})
+		emit(Event{Kind: KError, Text: cmp.Or(msg, streamErrorText(data)), Code: refusedCode(data)})
 	}
 	return nil
 }
@@ -928,9 +1415,17 @@ type responsesEncoder struct {
 	open    Kind            // kind of the open item
 	itemID  string          // id of the open item
 	text    strings.Builder // text of the open message / reasoning
-	output  []map[string]any
-	col     collector
-	named   map[string]nsTool // the request's namespaced tools
+	// a reasoning item began upstream (KThinkStart): the next thinking
+	// opens an item of its own, by thinkID when the upstream named it
+	thinkNew bool
+	thinkID  string
+	output   []any
+	col      collector
+	named    map[string]nsTool // the request's namespaced tools
+	// call is the open function_call item's id and name, kept here: the
+	// collector's last part isn't it once a hidden thinking block (signed
+	// with no text, or redacted) has come after the call (#1786)
+	call Part
 }
 
 // callTo names the tool a function_call item is to as the client knows it:
@@ -989,7 +1484,7 @@ func (e *responsesEncoder) response(status string, extra map[string]any) map[str
 	// response.created has output null (its nil slice in an any isn't nil)
 	output := e.output
 	if output == nil {
-		output = []map[string]any{}
+		output = []any{}
 	}
 	out := map[string]any{"id": e.id, "object": "response", "created_at": e.created, "status": status,
 		"model": e.model, "output": output, "parallel_tool_calls": true, "tool_choice": "auto", "tools": []any{}}
@@ -1019,10 +1514,16 @@ func (e *responsesEncoder) start(ev Event) {
 }
 
 func (e *responsesEncoder) closeItem() {
+	e.closeAs(nil)
+}
+
+// closeAs closes the open item, as sealed when the upstream wrote it
+// whole (a reasoning item it sealed).
+func (e *responsesEncoder) closeAs(sealed json.RawMessage) {
 	if e.open == "" {
 		return
 	}
-	var item map[string]any
+	var item any
 	switch e.open {
 	case Text:
 		t := e.text.String()
@@ -1036,12 +1537,15 @@ func (e *responsesEncoder) closeItem() {
 		part := map[string]any{"type": "summary_text", "text": t}
 		e.send("response.reasoning_summary_part.done", map[string]any{"item_id": e.itemID, "output_index": e.item, "summary_index": 0, "part": part})
 		item = map[string]any{"id": e.itemID, "type": "reasoning", "status": "completed", "summary": []map[string]any{part}}
+		if sealed != nil {
+			item = sealed
+		}
 	case ToolCall:
 		args := strings.TrimSpace(e.text.String())
 		if args == "" {
 			args = "{}"
 		}
-		p := e.col.last(ToolCall)
+		p := e.call
 		if q := e.named[p.Name]; !q.Search && !q.Custom {
 			e.send("response.function_call_arguments.done", callTo(map[string]any{"item_id": e.itemID, "output_index": e.item, "call_id": p.ID, "arguments": args}, p.Name, e.named))
 		}
@@ -1056,6 +1560,10 @@ func (e *responsesEncoder) openItem(k Kind, prefix string, item map[string]any) 
 	e.closeItem()
 	e.item++
 	e.open, e.itemID = k, prefix+newID()
+	if k == Thinking && e.thinkID != "" {
+		e.itemID = e.thinkID
+	}
+	e.thinkNew, e.thinkID = false, ""
 	item["id"] = e.itemID
 	item["status"] = "in_progress"
 	e.send("response.output_item.added", map[string]any{"output_index": e.item, "item": item})
@@ -1083,21 +1591,44 @@ func (e *responsesEncoder) event(ev Event) {
 		if ev.Text == "" {
 			return
 		}
-		if e.open != Thinking {
+		if e.open != Thinking || e.thinkNew {
 			e.openItem(Thinking, "rs_", map[string]any{"type": "reasoning", "summary": []any{}})
 			e.send("response.reasoning_summary_part.added", map[string]any{"item_id": e.itemID, "output_index": e.item, "summary_index": 0,
 				"part": map[string]any{"type": "summary_text", "text": ""}})
 		}
 		e.text.WriteString(ev.Text)
 		e.send("response.reasoning_summary_text.delta", map[string]any{"item_id": e.itemID, "output_index": e.item, "summary_index": 0, "delta": ev.Text})
+	case KThinkStart:
+		e.thinkNew, e.thinkID = true, ""
+		if strings.HasPrefix(ev.ID, "rs_") {
+			e.thinkID = ev.ID
+		}
+	case KSealed:
+		if ev.Name != sealResponses {
+			break // another API's, which a Responses client can't read
+		}
+		raw := json.RawMessage(ev.Text)
+		if e.open == Thinking && !e.thinkNew && (ev.ID == "" || ev.ID == e.itemID) {
+			// the item streamed so far, done as the upstream wrote it
+			e.closeAs(raw)
+			break
+		}
+		// none of it streamed (no summary): added and done whole
+		e.closeItem()
+		e.item++
+		e.thinkNew, e.thinkID = false, ""
+		e.send("response.output_item.added", map[string]any{"output_index": e.item, "item": raw})
+		e.send("response.output_item.done", map[string]any{"output_index": e.item, "item": raw})
+		e.output = append(e.output, raw)
 	case KToolStart:
 		if ev.ID == "" {
 			ev.ID = "call_" + newID()
 		}
 		// Open (and so close the previous item) before recording this call:
-		// closeItem reads the call ID from e.col.last(ToolCall).
+		// closeItem reads the previous call's id and name from e.call.
 		item := callTo(map[string]any{"type": "function_call", "call_id": ev.ID, "arguments": ""}, ev.Name, e.named)
 		e.openItem(ToolCall, itemPrefix(item), item)
+		e.call = Part{Kind: ToolCall, ID: ev.ID, Name: ev.Name}
 		e.col.add(ev)
 		return
 	case KToolArgs:
@@ -1105,7 +1636,7 @@ func (e *responsesEncoder) event(ev Event) {
 			e.text.WriteString(ev.Text)
 			// a custom tool's input is whole only once its arguments are:
 			// it goes in the item when that is done
-			if !e.named[e.col.last(ToolCall).Name].Custom {
+			if !e.named[e.call.Name].Custom {
 				e.send("response.function_call_arguments.delta", map[string]any{"item_id": e.itemID, "output_index": e.item, "delta": ev.Text})
 			}
 		}
@@ -1151,13 +1682,24 @@ func (e *responsesEncoder) finish() {
 
 // renderResponses is the non-streaming reply.
 func renderResponses(res Result, model string, named map[string]nsTool) []byte {
-	output := []map[string]any{}
+	output := []any{}
 	for _, p := range res.Parts {
 		switch p.Kind {
 		case Text:
+			if p.Text == "" && p.Signature != "" {
+				continue // only Gemini's signature, which is Gemini's
+			}
 			output = append(output, map[string]any{"id": "msg_" + newID(), "type": "message", "role": "assistant", "status": "completed",
 				"content": []map[string]any{{"type": "output_text", "text": p.Text, "annotations": []any{}}}})
 		case Thinking:
+			if p.sealedBy(sealResponses) {
+				// as the upstream wrote it: id, summary, encrypted_content
+				output = append(output, p.Sealed)
+				continue
+			}
+			if p.Text == "" {
+				continue // another API's sealed thinking, or only its signature
+			}
 			output = append(output, map[string]any{"id": "rs_" + newID(), "type": "reasoning", "status": "completed",
 				"summary": []map[string]any{{"type": "summary_text", "text": p.Text}}})
 		case ToolCall:

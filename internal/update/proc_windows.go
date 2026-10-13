@@ -13,6 +13,8 @@ const (
 	waitTimeout  = 0x00000102
 	detachedProc = 0x00000008
 	newProcGroup = 0x00000200
+	suspended    = 0x00000004
+	noWindow     = 0x08000000
 )
 
 // alive reports whether pid is still running.
@@ -47,4 +49,22 @@ func Reexec(exe string, args, env []string) error {
 		return err
 	}
 	return cmd.Process.Release()
+}
+
+// trialStart starts path suspended and ends it at once: Windows checks a
+// program when it creates its process, so one Smart App Control or
+// another application control policy won't run fails here, and none of
+// one it will run runs.
+func trialStart(path string) error {
+	cmd := proc.Command(path)
+	if cmd.SysProcAttr == nil {
+		cmd.SysProcAttr = &syscall.SysProcAttr{}
+	}
+	cmd.SysProcAttr.CreationFlags |= suspended | noWindow
+	if err := cmd.Start(); err != nil {
+		return err
+	}
+	cmd.Process.Kill()
+	cmd.Wait()
+	return nil
 }

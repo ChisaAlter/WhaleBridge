@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Concurrency is how many requests the gateway lets be out at the vendor
@@ -47,9 +48,9 @@ const (
 
 // LaneLimit is how many requests may be out at once on p's key or
 // account, 0 for no limit: its own (AccountConcurrency), else the
-// provider's (Concurrency). An account made afresh beside the agent's own
-// (AlsoOn) carries none of the provider's settings: they are read from
-// providers.json then.
+// provider's (Concurrency). An account not had from All or AlsoOn (made
+// afresh by its sign-in) carries none of the provider's settings: they are
+// read from providers.json then.
 func (p Provider) LaneLimit() int {
 	ref := ""
 	switch {
@@ -178,4 +179,68 @@ func normalAccountConcurrency(m map[string]int) map[string]int {
 		out[u] = min(max(n, 0), MaxLimit)
 	}
 	return out
+}
+
+// MaxRPMLimit bounds a limit on requests a minute.
+const MaxRPMLimit = 10000
+
+// RPMLimit is how many requests a minute each of p's keys or accounts may
+// send the vendor, 0 for no limit: the provider's MaxRPM. An account not
+// had from All or AlsoOn (made afresh by its sign-in) carries none of the
+// provider's settings: it is read from providers.json then.
+func (p Provider) RPMLimit() int {
+	n := p.MaxRPM
+	if n == 0 && p.Account != nil {
+		if s, ok := storedPicks(p.ID); ok {
+			n = s.MaxRPM
+		}
+	}
+	return min(max(n, 0), MaxRPMLimit)
+}
+
+// CheckRPM says what is wrong with a limit on requests a minute, nil when
+// nothing is.
+func CheckRPM(n int) error {
+	if n < 0 || n > MaxRPMLimit {
+		return fmt.Errorf("a limit on requests a minute is from 0 (none) to %d, not %d", MaxRPMLimit, n)
+	}
+	return nil
+}
+
+// MaxQuotaRest bounds QuotaRest, in minutes: eight days, a week's window
+// and a day over, the longest the gateway rests anyone out of quota.
+const MaxQuotaRest = 8 * 24 * 60
+
+// QuotaRestFor is how long one of p's keys sits out of quota when the
+// vendor doesn't say when it is back, 0 for the gateway's own.
+func (p Provider) QuotaRestFor() time.Duration {
+	return time.Duration(min(max(p.QuotaRest, 0), MaxQuotaRest)) * time.Minute
+}
+
+// SetQuotaRest sets how many minutes the provider's keys sit out of quota
+// when the vendor doesn't say when they are back, 0 for the gateway's own.
+func SetQuotaRest(id string, minutes int) error {
+	if minutes < 0 || minutes > MaxQuotaRest {
+		return fmt.Errorf("a rest out of quota is from 0 (magpie's own) to %d minutes (8 days), not %d", MaxQuotaRest, minutes)
+	}
+	p, err := Find(id)
+	if err != nil {
+		return err
+	}
+	p.QuotaRest = minutes
+	return Save(*p)
+}
+
+// SetRPM sets how many requests a minute each of the provider's keys or
+// accounts may send, 0 for no limit.
+func SetRPM(id string, n int) error {
+	if err := CheckRPM(n); err != nil {
+		return err
+	}
+	p, err := Find(id)
+	if err != nil {
+		return err
+	}
+	p.MaxRPM = n
+	return Save(*p)
 }

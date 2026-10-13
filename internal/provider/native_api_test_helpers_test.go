@@ -42,6 +42,7 @@ func TestMain(m *testing.M) {
 func isolate(t *testing.T) {
 	t.Helper()
 	home := parityHome(t)
+	t.Setenv("MAGPIE_NO_ACCOUNTS", "0") // only fake accounts in this test's isolated home
 	t.Setenv("LAUNCHER_COMPONENT_DATA_DIR", filepath.Join(home, "component"))
 	for _, name := range agentenv.Vars {
 		t.Setenv(name, "")
@@ -49,6 +50,9 @@ func isolate(t *testing.T) {
 	oldKeychain, oldCursor := claudeKeychain, cursorKeychain
 	claudeKeychain, cursorKeychain = false, false
 	forgetDevinStatus()
+	loginUsageCache.Lock()
+	loginUsageCache.m, loginUsageCache.pending = nil, nil
+	loginUsageCache.Unlock()
 	copilotMu.Lock()
 	copilotSessions = map[string]copilotSession{}
 	copilotMu.Unlock()

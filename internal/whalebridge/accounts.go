@@ -5,8 +5,48 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"net/http"
+	"strings"
 	"time"
 )
+
+type accountInfo struct {
+	provider.Login
+	Alias      string `json:"alias,omitempty"`
+	CheckinKey string `json:"checkinKey,omitempty"`
+	CheckinOff bool   `json:"checkinOff,omitempty"`
+}
+
+func checkinKeyForQuota(q provider.SubscriptionQuota, accounts []provider.CheckinAccount) string {
+	if !q.Checkins {
+		return ""
+	}
+	for _, a := range accounts {
+		if a.By == q.CheckinBy && strings.EqualFold(a.User, q.User) {
+			return a.Key
+		}
+	}
+	return ""
+}
+
+func accountCheckinKey(id, user string, accounts []provider.CheckinAccount) string {
+	qs := provider.WithCheckins([]provider.SubscriptionQuota{{Provider: id, User: user}})
+	return checkinKeyForQuota(qs[0], accounts)
+}
+
+func accountInfos(id string) []accountInfo {
+	logins := provider.WhaleBridgeLogins(id)
+	accounts := provider.CheckinAccounts()
+	cards := make([]provider.SubscriptionQuota, len(logins))
+	for i, l := range logins {
+		cards[i] = provider.SubscriptionQuota{Provider: id, User: l.User}
+	}
+	cards = provider.WithCheckins(cards)
+	out := make([]accountInfo, 0, len(logins))
+	for i, l := range logins {
+		out = append(out, accountInfo{Login: l, Alias: provider.AccountNameOf(id, l.User), CheckinKey: checkinKeyForQuota(cards[i], accounts), CheckinOff: cards[i].CheckinOff})
+	}
+	return out
+}
 
 func accountRoutes(mux *http.ServeMux) {
 	subscriptionRoutes(mux)
@@ -51,6 +91,8 @@ func accountRoutes(mux *http.ServeMux) {
 		var b struct {
 			Agent  string            `json:"agent"`
 			Site   string            `json:"site"`
+			User   string            `json:"user"`
+			Proxy  *string           `json:"proxy"`
 			Plugin bool              `json:"plugin"`
 			Method int               `json:"method"`
 			Inputs map[string]string `json:"inputs"`
@@ -66,9 +108,9 @@ func accountRoutes(mux *http.ServeMux) {
 			_, err = provider.PluginAPIKey(r.Context(), b.Agent, b.Method, b.Inputs, b.Key)
 			st.State = "done"
 		} else if b.Plugin {
-			st, err = provider.StartPluginSignIn(b.Agent, b.Method, b.Inputs)
+			st, err = provider.StartPluginSignInWith(b.Agent, b.Method, b.Inputs, provider.SignInOptions{Site: b.Site, User: b.User, Proxy: b.Proxy})
 		} else {
-			st, err = provider.StartSignInAt(b.Agent, b.Site)
+			st, err = provider.StartSignInWith(b.Agent, provider.SignInOptions{Site: b.Site, User: b.User, Proxy: b.Proxy})
 		}
 		if err != nil {
 			http.Error(w, err.Error(), 400)
@@ -115,7 +157,7 @@ func accountRoutes(mux *http.ServeMux) {
 		writeJSON(w, map[string]any{"ok": true})
 	})
 	mux.HandleFunc("GET /api/accounts/{id}", func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, provider.WhaleBridgeLogins(r.PathValue("id")))
+		writeJSON(w, accountInfos(r.PathValue("id")))
 	})
 	mux.HandleFunc("GET /api/accounts/{id}/project", func(w http.ResponseWriter, r *http.Request) {
 		id := r.PathValue("id")

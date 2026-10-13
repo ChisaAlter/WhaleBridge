@@ -43,6 +43,23 @@ const (
 // folderVars are the variables Isolate points into the temporary home.
 var folderVars = []string{"HOME", "USERPROFILE", "XDG_CONFIG_HOME", "XDG_CACHE_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "APPDATA", "LOCALAPPDATA"}
 
+// proxyVars are the machine's proxy variables. net/http reads them once per
+// process, at its first routed request, so a test binary that lets them
+// stand freezes the machine's proxy into that read: a test that sets its
+// own afterwards reads the machine's instead (search's Auto, which follows
+// ALL_PROXY alone for that reason), and Offline's refused hosts are carried
+// for real by the machine's proxy standing on loopback.
+var proxyVars = []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"}
+
+// ClearProxy unsets the machine's proxy variables. Isolate calls it before
+// the tests run; a package that isolates itself in its own TestMain calls
+// it too, before the first request any test makes.
+func ClearProxy() {
+	for _, k := range proxyVars {
+		os.Unsetenv(k)
+	}
+}
+
 // Main runs the package's tests in a home of their own and exits with
 // their code.
 func Main(m *testing.M) {
@@ -112,6 +129,7 @@ func Isolate() (string, error) {
 			return "", err
 		}
 	}
+	ClearProxy()
 	if err := inertTools(home); err != nil {
 		return "", err
 	}

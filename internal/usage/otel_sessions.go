@@ -106,8 +106,8 @@ func (e *otelExporter) offerSession(s sessions.TraceSpan, config settings.OTel) 
 	}
 }
 
-func (e *otelExporter) watchSessions(ctx context.Context, started time.Time) {
-	ticker := time.NewTicker(2 * time.Second)
+func (e *otelExporter) watchSessions(ctx context.Context, started time.Time, every time.Duration) {
+	ticker := time.NewTicker(every)
 	defer ticker.Stop()
 	var reader *sessions.TraceReader
 	var prior settings.OTel

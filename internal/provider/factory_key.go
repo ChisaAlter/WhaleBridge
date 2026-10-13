@@ -52,6 +52,9 @@ func factoryKeysIn(texts []string) []string {
 // pasted texts, each checked with whoami first, and says what became of
 // each.
 func ImportFactoryKeys(ctx context.Context, texts []string) ([]ImportedAccount, error) {
+	if discoveryOff() {
+		return nil, errAccountDiscoveryOff
+	}
 	keys := factoryKeysIn(texts)
 	if len(keys) == 0 {
 		return nil, errors.New("no Factory API keys (fk-…) in it")

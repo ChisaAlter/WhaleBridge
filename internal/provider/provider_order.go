@@ -3,6 +3,7 @@ package provider
 import (
 	"fmt"
 	"slices"
+	"strings"
 )
 
 // ordered is ps in the order the user put them in (#499): those order
@@ -25,10 +26,30 @@ func ordered(ps []Provider, order []string) []Provider {
 		if i, ok := at[p.ID]; ok {
 			return i
 		}
+		if i, ok := at[samePlace(p.ID)]; ok {
+			return i
+		}
 		return len(order)
 	}
 	slices.SortStableFunc(ps, func(a, b Provider) int { return rank(a) - rank(b) })
 	return ps
+}
+
+// samePlace is the id the same subscription has on another computer: a
+// built-in's plugin is id-plugin where the built-in isn't moved onto it
+// and id where it is (PluginID), and whether it is moved is each
+// computer's own (migrations.json isn't synced). An order synced from
+// the other computer names it by the other id, and it keeps its place by
+// that one (#1940, Sun1090: WorkBuddy and WorkBuddy AI, put first on one
+// computer, weren't on the other).
+func samePlace(id string) string {
+	if base, ok := strings.CutSuffix(id, "-plugin"); ok && slices.Contains(accountIDs, base) {
+		return base
+	}
+	if slices.Contains(accountIDs, id) {
+		return id + "-plugin"
+	}
+	return ""
 }
 
 // SetOrder saves the order the providers are listed and tried in, by id.

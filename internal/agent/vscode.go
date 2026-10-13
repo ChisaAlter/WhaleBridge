@@ -31,16 +31,15 @@ package agent
 import (
 	"encoding/json"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 
-	"github.com/tidwall/gjson"
 	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
-	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
+	"github.com/ChisaAlter/WhaleBridge/internal/proc"
+	"github.com/tidwall/gjson"
 )
 
 // vscodeDefault is chat.defaultModel, a key with a dot in it, escaped for
@@ -109,9 +108,9 @@ var (
 // as it always was.
 func (k vscodeKind) token() string {
 	if k.ua != nil {
-		return gateway.Token
+		return hereKey()
 	}
-	return gateway.TokenFor(k.id)
+	return agentKey(k.id)
 }
 
 // VS Code keeps its User folder under Application Support on macOS, Roaming
@@ -216,7 +215,7 @@ func vscodeKindAt(k vscodeKind, dir string) *Agent {
 			if isDir(dir) {
 				return true
 			}
-			bin, err := exec.LookPath(k.bin)
+			bin, err := proc.Look(k.bin)
 			return err == nil && vscodeCodeBinary(bin)
 		},
 		Notice: func() string {
@@ -224,7 +223,7 @@ func vscodeKindAt(k vscodeKind, dir string) *Agent {
 				if k.exts != "" {
 					return k.chat().notice(k.name)
 				}
-				return "magpie's models are in " + k.name + "'s Chat model picker, under magpie, in each of its profiles (VS Code 1.122 or later). If they don't show, run Developer: Reload Window in " + k.name + "."
+				return noticeVSCodeJoined.say("agent", k.name)
 			}
 			return ""
 		},
@@ -541,14 +540,14 @@ func vscodeChatInstalled(dir string) (at, version string, found bool) {
 // notice is what a build without its own chat is told with magpie's group
 // written: what its Copilot Chat needs to list it.
 func (c vscodeChat) notice(name string) string {
-	setup := name + "'s Chat features must be enabled (chat.disableAIFeatures=false) and its product.json must include defaultChatAgent and trustedExtensionAuthAccess for GitHub.copilot-chat. Then run Developer: Reload Window in " + name + "."
+	setup := noticeVSCodeSetup.say("agent", name)
 	switch {
 	case c.none:
-		return "Install GitHub Copilot Chat in " + name + " to see magpie's models in its Chat. " + setup
+		return noticeVSCodeNoChat.say("agent", name) + " " + setup
 	case c.unsupported:
-		return name + "'s GitHub Copilot Chat " + c.version + " has neither a Custom Endpoint nor an OpenAI Compatible provider, so it can't list magpie's models."
+		return noticeVSCodeOld.say("agent", name, "version", c.version)
 	case c.vendor == vscodeOAI:
-		return "magpie's models are in " + name + "'s Chat model picker under magpie, from GitHub Copilot Chat " + c.version + "'s OpenAI Compatible provider, which it offers only while it is signed in to GitHub with a personal Copilot plan. " + setup
+		return noticeVSCodeOAI.say("agent", name, "version", c.version) + " " + setup
 	}
 	return setup
 }
@@ -571,3 +570,12 @@ func vscodeNewer(a, b string) bool {
 	}
 	return false
 }
+
+// what VS Code and its forks say after a change (notice.go)
+var (
+	noticeVSCodeJoined = newNotice("magpie's models are in {agent}'s Chat model picker, under magpie, in each of its profiles (VS Code 1.122 or later). If they don't show, run Developer: Reload Window in {agent}.")
+	noticeVSCodeSetup  = newNotice("{agent}'s Chat features must be enabled (chat.disableAIFeatures=false) and its product.json must include defaultChatAgent and trustedExtensionAuthAccess for GitHub.copilot-chat. Then run Developer: Reload Window in {agent}.")
+	noticeVSCodeNoChat = newNotice("Install GitHub Copilot Chat in {agent} to see magpie's models in its Chat.")
+	noticeVSCodeOld    = newNotice("{agent}'s GitHub Copilot Chat {version} has neither a Custom Endpoint nor an OpenAI Compatible provider, so it can't list magpie's models.")
+	noticeVSCodeOAI    = newNotice("magpie's models are in {agent}'s Chat model picker under magpie, from GitHub Copilot Chat {version}'s OpenAI Compatible provider, which it offers only while it is signed in to GitHub with a personal Copilot plan.")
+)

@@ -101,20 +101,38 @@ func membersAllowed(who access.Identity, ms []provider.Member) bool {
 	return true
 }
 
+// keyList weighs a model list's entries for one request's key (#1762):
+// the routing groups are read once for the list, not once an entry —
+// each read is every provider's models, its files stat'ed again, and a
+// list of 1,000 models with 500 groups took seconds — and each
+// provider's accounts and keys once, not once a model. Nothing is kept
+// past the request, so the next sees a group, account or key's models
+// changed, as before.
+type keyList struct {
+	who  access.Identity
+	find func(string) (provider.Group, []provider.Member, bool)
+	refs map[string][]provider.AccountRef
+}
+
+func newKeyList(who access.Identity) *keyList {
+	return &keyList{who: who, find: provider.GroupFinder(), refs: map[string][]provider.AccountRef{}}
+}
+
 // entryAllowed says the key is shown a model of the catalog — and some
 // account or key it may use serves it (#905): one the provider's
 // accounts are set not to serve (#474) is none of the key's.
-func entryAllowed(who access.Identity, e provider.Entry) bool {
+func (k *keyList) entryAllowed(e provider.Entry) bool {
+	who := k.who
 	if !who.Restricted() {
 		return true
 	}
 	if e.Group != "" {
-		g, ms, ok := provider.FindGroup(e.ID)
+		g, ms, ok := k.find(e.ID)
 		if !ok || !groupAllowed(who, g, ms) {
 			return false
 		}
 		for _, m := range ms {
-			if accountServes(who, m.Provider, m.Model) {
+			if k.accountServes(m.Provider, m.Model) {
 				return true
 			}
 		}
@@ -123,7 +141,21 @@ func entryAllowed(who access.Identity, e provider.Entry) bool {
 	if !modelAllowed(who, e.Provider, e.Model) {
 		return false
 	}
-	return accountServes(who, e.Provider, e.Model)
+	return k.accountServes(e.Provider, e.Model)
+}
+
+// accountServes is accountServes with p's accounts and keys read once
+// for the list.
+func (k *keyList) accountServes(p provider.Provider, model string) bool {
+	if len(k.who.Accounts) == 0 {
+		return true
+	}
+	refs, ok := k.refs[p.ID]
+	if !ok {
+		refs = p.AccountIDs()
+		k.refs[p.ID] = refs
+	}
+	return accountServesOn(k.who, p, model, refs)
 }
 
 // accountServes says some account or key the key may use serves the provider's
@@ -133,7 +165,11 @@ func accountServes(who access.Identity, p provider.Provider, model string) bool 
 	if len(who.Accounts) == 0 {
 		return true
 	}
-	refs := p.AccountIDs()
+	return accountServesOn(who, p, model, p.AccountIDs())
+}
+
+// accountServesOn is accountServes over refs, p's accounts and keys.
+func accountServesOn(who access.Identity, p provider.Provider, model string, refs []provider.AccountRef) bool {
 	if len(refs) == 0 {
 		// a provider with no account and no key (a local ollama): the
 		// list holds a key to some accounts of the providers it names
@@ -163,9 +199,10 @@ func keyAllowed(r *http.Request, es []provider.Entry) []provider.Entry {
 	if !held {
 		return es
 	}
+	k := newKeyList(who)
 	out := make([]provider.Entry, 0, len(es))
 	for _, e := range es {
-		if entryAllowed(who, e) {
+		if k.entryAllowed(e) {
 			out = append(out, e)
 		}
 	}
@@ -203,10 +240,13 @@ func allowedCandidates(who access.Identity, cs []candidate, pl planned, members 
 		}
 	}
 	pl.order = order
-	// nor is one held for its credits there for a reset to bring back
-	pl.held = slices.DeleteFunc(slices.Clone(pl.held), func(c candidate) bool {
+	// nor is one held for its credits there for a reset to bring back, or
+	// one past its cap for a conversation kept strictly on it
+	gone := func(c candidate) bool {
 		return !members[c.p.ID+"/"+c.model] && !modelAllowed(who, c.p, c.model) || !accountAllowed(who, c)
-	})
+	}
+	pl.held = slices.DeleteFunc(slices.Clone(pl.held), gone)
+	pl.capped = slices.DeleteFunc(slices.Clone(pl.capped), gone)
 	return out, pl, held && len(out) == 0
 }
 
@@ -224,13 +264,14 @@ func accountAllowed(who access.Identity, c candidate) bool {
 
 // allowedKey is p sent on the first of its keys in use the calling key
 // may use (#905), for the paths that send on one key of the provider
-// rather than over its candidates — a video, a drawing — in place of the
-// first, which may be one the key may not: a key held to a later one is
-// sent on it, and refused only when it may use none. A provider of an
-// account keeps its one account, checked as it is; one with no account
-// and no key (a local ollama) has nothing to hold. A key's own list of
-// models (#474) is not weighed here; the decision path, which gates on
-// one, picks its key itself.
+// rather than over its candidates — a Grok or Volcengine video, which is
+// asked after on the first key again — in place of the first, which may
+// be one the key may not: a key held to a later one is sent on it, and
+// refused only when it may use none. A provider of an account keeps its
+// one account, checked as it is; one with no account and no key (a local
+// ollama) has nothing to hold. A key's own list of models (#474) is not
+// weighed here; the paths that can go over the keys do (onKeys, a
+// drawing's, the decision path's).
 func allowedKey(who access.Identity, p provider.Provider, model string) (provider.Provider, bool) {
 	if p.Key == "" {
 		return p, p.Account == nil || accountAllowed(who, candidate{p: p, model: model})
@@ -241,6 +282,38 @@ func allowedKey(who access.Identity, p provider.Provider, model string) (provide
 		}
 	}
 	return p, false
+}
+
+// onKeys is the keys or accounts of p a request for model that isn't a
+// chat goes over (a drawing, a video, an embedding), as a chat's go over
+// them (#1657): in its routing's order, a key or account whose own list
+// of models (#474) leaves the model out never, one the vendor lists the
+// model to another only after those that list it, and those the calling
+// key may not use (#905) left out. p's fallback models are not among
+// them. With none left it gives the status and what the caller is told:
+// 403 when every one is set not to serve the model, or is one the calling
+// key may not use. A provider with no key and no account (a local ollama)
+// is itself.
+func (s *Server) onKeys(r *http.Request, p provider.Provider, model, asked string) ([]candidate, int, string) {
+	if p.Account == nil && p.Key == "" {
+		return []candidate{{p: p, model: model, rest: p.ID}}, 0, ""
+	}
+	q := p
+	q.Fallback = nil
+	cs, pl := s.plan(q, model, provider.Chat)
+	if len(cs) == 0 && len(pl.left) > 0 && !slices.ContainsFunc(pl.left, func(w Weighed) bool { return !w.Barred }) {
+		return nil, http.StatusForbidden, barredError(asked, pl.left)
+	}
+	if keyWho, held := accountHolds(r); held {
+		cs = slices.DeleteFunc(cs, func(c candidate) bool { return !accountAllowed(keyWho, c) })
+		if len(cs) == 0 {
+			return nil, http.StatusForbidden, keyAccountsError(keyWho, asked)
+		}
+	}
+	if len(cs) == 0 {
+		cs = []candidate{{p: p, model: model, rest: p.ID}}
+	}
+	return cs, 0, ""
 }
 
 // keyModelError is what a request for a model its key may not use is told.

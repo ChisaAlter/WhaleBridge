@@ -52,10 +52,13 @@ type captureResponseWriter struct {
 	full *spool
 	// otel: the whole body, for the OTLP export, when it asks for it uncut (#538)
 	otel *spool
+	// tools: whether the reply calls a tool, for a turn's end (turns)
+	tools *toolScan
 }
 
 func (w *captureResponseWriter) Write(p []byte) (int, error) {
 	w.body.add(p)
+	w.tools.add(p)
 	if w.full != nil {
 		w.full.add(p)
 	}

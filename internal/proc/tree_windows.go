@@ -39,11 +39,17 @@ func (g *group) join(cmd *exec.Cmd) {
 	g.job = job
 }
 
-func (g *group) kill(*exec.Cmd) {
+// kill ends the job's processes. Unlike a Unix group, a job takes no new
+// process once it is being ended, so nothing can be missed and nothing is
+// left to wait on: the channel is closed already.
+func (g *group) kill(*exec.Cmd) <-chan struct{} {
 	if g.job != 0 {
 		_ = windows.TerminateJobObject(g.job, 1)
 	}
+	return closed
 }
+
+var closed = func() chan struct{} { c := make(chan struct{}); close(c); return c }()
 
 func (g *group) sweep(*exec.Cmd) {
 	if g.job != 0 {

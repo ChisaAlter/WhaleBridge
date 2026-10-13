@@ -12,6 +12,7 @@
 package backup
 
 import (
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/pbkdf2"
@@ -22,7 +23,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"slices"
 	"strings"
 	"time"
@@ -30,6 +30,7 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/access"
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
+	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
@@ -80,6 +81,11 @@ type Bundle struct {
 	// GroupOrder is the order the user put the routing groups in (#779),
 	// by id; none from a magpie before it, or when never arranged.
 	GroupOrder []string `json:"groupOrder,omitempty"`
+	// Plugins are the OpenCode plugins and middlewares added from npm or
+	// git (provider.Carried), installed where the backup is put back:
+	// the providers they serve come with them. Their sign-ins don't, as a
+	// subscription's don't. Nil from a magpie before them.
+	Plugins *[]plugin.Entry `json:"plugins,omitempty"`
 	// Sync can carry one part's credentials without changing the others'
 	// Keys policy; these are absent from older backups and whole collects.
 	ProvidersKeys *bool `json:"providersKeys,omitempty"`
@@ -105,6 +111,11 @@ var ErrPassphrase = errors.New("wrong passphrase, or the file was changed")
 // wrong passphrase and from a newer magpie's file, so a sync can rebuild
 // the damaged one from this computer rather than fail on it forever.
 var ErrCorrupt = errors.New("not a magpie backup")
+
+// ErrNotBackup is a file that doesn't begin like a backup at all: an empty
+// one, a page a server answered with, another app's file. It reads as
+// ErrCorrupt does, but is never rebuilt over by a sync on its own.
+var ErrNotBackup = errors.New("not a magpie backup")
 
 // BundleVersion is the bundle's structure: 2 carries the per-part
 // credential markers (ProvidersKeys, SettingsKeys, LibraryKeys) as their
@@ -173,6 +184,8 @@ func Collect(keys bool, app string) (Bundle, error) {
 			}
 		}
 	}
+	plugins := provider.Carried(keys)
+	b.Plugins = &plugins
 	searches := []provider.SearchAPI{}
 	for _, a := range provider.StoredSearchAPIs() {
 		if !keys {
@@ -193,15 +206,14 @@ func Collect(keys bool, app string) (Bundle, error) {
 	return b, nil
 }
 
-var secretHeader = regexp.MustCompile(`(?i)auth|key|token|secret|cookie|session|password`)
-
 // Secret reports whether a header or an environment variable by that name
 // looks like it holds a key: what a backup without keys leaves empty.
-func Secret(name string) bool { return secretHeader.MatchString(name) }
+func Secret(name string) bool { return provider.SecretHeader(name) }
 
 func withoutKeys(p provider.Provider) provider.Provider {
 	p.Key, p.KeyName, p.Keys, p.KeyProtocol, p.KeyWeight = "", "", nil, "", 0
 	p.BalanceToken = ""
+	p.AccessKeyID, p.SecretAccessKey = "", ""
 	if len(p.Headers) > 0 {
 		h := map[string]string{}
 		for k, v := range p.Headers {
@@ -224,8 +236,7 @@ func Seal(b Bundle, pass string) ([]byte, error) {
 		return nil, err
 	}
 	e := envelope{Format: format, Version: 1, KDF: "pbkdf2-sha256", Iterations: iterations,
-		Salt: make([]byte, 16), Nonce: make([]byte, 12)}
-	rand.Read(e.Salt)
+		Salt: saltFor(pass), Nonce: make([]byte, 12)}
 	rand.Read(e.Nonce)
 	gcm, err := aead(pass, e)
 	if err != nil {
@@ -235,8 +246,12 @@ func Seal(b Bundle, pass string) ([]byte, error) {
 	return json.MarshalIndent(e, "", "  ")
 }
 
-// Open decrypts a backup.
+// Open decrypts a backup. A byte order mark in front of the JSON is read
+// through: the file is written back through edit.WriteAtomic, which keeps
+// the mark a Windows tool saved the file with (#1534), and a backup moved
+// through an editor that writes one opens as it is.
 func Open(data []byte, pass string) (Bundle, error) {
+	data = edit.TrimBOM(data)
 	var e envelope
 	if json.Unmarshal(data, &e) != nil {
 		// The JSON doesn't read whole. A backup a relay cut short ends in
@@ -248,10 +263,10 @@ func Open(data []byte, pass string) (Bundle, error) {
 		if isBackupJSON(data) {
 			return Bundle{}, ErrCorrupt
 		}
-		return Bundle{}, errors.New("not a magpie backup")
+		return Bundle{}, ErrNotBackup
 	}
 	if e.Format != format {
-		return Bundle{}, errors.New("not a magpie backup")
+		return Bundle{}, ErrNotBackup
 	}
 	if e.Version != 1 || e.KDF != "pbkdf2-sha256" {
 		return Bundle{}, errors.New("this backup was made by a newer magpie; update magpie to open it")
@@ -281,7 +296,7 @@ func header(e envelope) []byte {
 }
 
 func aead(pass string, e envelope) (cipher.AEAD, error) {
-	key, err := deriveKey(pass, e)
+	key, err := derived(pass, e)
 	if err != nil {
 		return nil, err
 	}
@@ -312,11 +327,18 @@ var All = Parts{Providers: true, Settings: true}
 type Result struct {
 	Added, Replaced int      // providers
 	NeedKey         []string // providers that came without a key and have none here
-	Settings        bool
-	Profiles        int
-	Agents          int      // agent fields changed
-	Skipped         []string // agent fields left alone: the agent is not on this machine, or the value failed
-	Library         bool     // the library was put in
+	// SignIn is the subscriptions whose settings came with no account
+	// here: a backup carries no sign-in, so they are listed once one is
+	SignIn []string `json:",omitempty"`
+	// Plugins are the plugins installed for it, PluginErrors why the others
+	// couldn't be, by spec
+	Plugins      []string          `json:",omitempty"`
+	PluginErrors map[string]string `json:",omitempty"`
+	Settings     bool
+	Profiles     int
+	Agents       int      // agent fields changed
+	Skipped      []string // agent fields left alone: the agent is not on this machine, or the value failed
+	Library      bool     // the library was put in
 }
 
 // Restore puts the chosen parts of the bundle in. Providers come first, so
@@ -356,12 +378,18 @@ func Restore(b Bundle, parts Parts) (Result, error) {
 				}
 			}
 		}
+		if b.Plugins != nil {
+			r.Plugins, r.PluginErrors = AddPlugins(*b.Plugins)
+		}
+		r.SignIn = provider.NotSignedIn(b.Providers)
 		stored, err := provider.Stored()
 		if err != nil {
 			return r, err
 		}
 		for _, p := range stored {
-			if !p.Ready() && slices.ContainsFunc(b.Providers, func(q provider.Provider) bool { return q.ID == p.ID }) {
+			// a subscription is signed in to (SignIn), never keyed: its
+			// entry has no name, and listed here it read "Needs a key: , "
+			if !p.Ready() && !provider.OnlyPicks(p) && slices.ContainsFunc(b.Providers, func(q provider.Provider) bool { return q.ID == p.ID }) {
 				r.NeedKey = append(r.NeedKey, p.Name)
 			}
 		}
@@ -370,6 +398,7 @@ func Restore(b Bundle, parts Parts) (Result, error) {
 		cur := settings.Load()
 		s := *b.Settings
 		s.KeepOwn(cur)
+		KeepOtherAgentSettings(&s, cur)
 		// Caller access and desktop/client modules stay local and untouched.
 		s.LAN, s.LANKey, s.LANKeyID, s.CORSOrigins = cur.LAN, cur.LANKey, cur.LANKeyID, cur.CORSOrigins
 		s.OTel.Sessions = false
@@ -387,4 +416,24 @@ func Restore(b Bundle, parts Parts) (Result, error) {
 		catalog.Touched()
 	}
 	return r, nil
+}
+
+// addPlugins is provider.AddPlugins: a var so a test installs nothing.
+var addPlugins = provider.AddPlugins
+
+// AddPlugins installs the plugins a backup or a sync carries that aren't
+// here (provider.AddPlugins), giving each its time: a first one downloads
+// Bun. It says why each it couldn't add wasn't, by spec.
+func AddPlugins(es []plugin.Entry) ([]string, map[string]string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+	added, failed := addPlugins(ctx, es)
+	var errs map[string]string
+	for spec, err := range failed {
+		if errs == nil {
+			errs = map[string]string{}
+		}
+		errs[spec] = err.Error()
+	}
+	return added, errs
 }

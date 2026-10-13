@@ -43,6 +43,9 @@ import (
 // Another magpie's videos (a Remote magpie's, #545) are asked of it, at its
 // own videos API: its id for one goes, encoded, in the id given here, and
 // what it answers comes back with this magpie's id and name for the model.
+// A provider set up with a base URL whose own model list marks a model
+// "kind": "video" (#1446) is asked the same way, at the OpenAI-shaped
+// videos API under its base, on the key that started the video.
 
 // grokVideoModels are the video models a Grok subscription makes videos with.
 var grokVideoModels = []catalog.Model{
@@ -57,7 +60,9 @@ var grokVideoAspects = []string{"1:1", "16:9", "9:16", "4:3", "3:4", "3:2", "2:3
 const maxVideoBytes = 512 << 20
 
 // Videomakers are the models a provider can make videos with: a Grok
-// subscription's, another magpie's, and Volcengine Agent Plan's models.
+// subscription's, another magpie's, a preset plan's models when magpie
+// implements that vendor's video API, and those a provider's own model list
+// marks as video models (customVideomakers).
 func Videomakers(p provider.Provider) []catalog.Model {
 	if p.IsRemoteMagpie() {
 		out := catalog.LiveVideomakers(p.ID)
@@ -70,13 +75,86 @@ func Videomakers(p provider.Provider) []catalog.Model {
 		return out
 	}
 	if !drawsGrok(p) {
-		return nil
+		return customVideomakers(p)
 	}
 	out := slices.Clone(grokVideoModels)
 	for i := range out {
 		out[i].Provider = p.ID
 	}
 	return out
+}
+
+// customVideomakers are the video models of a provider set up with a base
+// URL — not a subscription's account, not another magpie, not a preset plan
+// whose own video API magpie speaks — that its fetched model list marks
+// "kind": "video" (catalog.LiveVideomakers, #1446), or the user said make
+// videos (provider.SetModelKind, #1399). They are asked at the
+// OpenAI-shaped videos API under its base, as another magpie's are. A
+// model's name alone makes none of them one: a list that doesn't say so,
+// and a user who doesn't, leave the provider making no videos.
+func customVideomakers(p provider.Provider) []catalog.Model {
+	if p.Account != nil || p.IsRemoteMagpie() || len(p.PlanVideos()) > 0 || videoBase(p) == "" {
+		return nil
+	}
+	var out []catalog.Model
+	if p.ListsModels() {
+		out = catalog.LiveVideomakers(p.ID)
+	}
+	for i := range out {
+		out[i].Provider = p.ID
+	}
+	// those the user said make videos, whatever the list says, and none
+	// they said draws (shen-joe, #1399: a relay whose /models marks none)
+	for _, id := range p.KindModels(provider.KindVideo) {
+		if !slices.ContainsFunc(out, func(m catalog.Model) bool { return m.ID == id }) {
+			out = append(out, kindModel(p, id))
+		}
+	}
+	return slices.DeleteFunc(out, func(m catalog.Model) bool { return p.ModelKind(m.ID) == provider.KindImage })
+}
+
+// videoBase is the root of the OpenAI-shaped videos API of another magpie
+// or a provider set up with a base URL: its Chat base, or a Responses-only
+// relay's Responses base, under which it serves the images API too.
+func videoBase(p provider.Provider) string {
+	return strings.TrimRight(cmp.Or(p.Base(provider.Chat), p.Base(provider.Responses)), "/")
+}
+
+// filmsCustom is whether p makes model at its OpenAI-shaped videos API, as
+// its model list says (customVideomakers).
+func filmsCustom(p provider.Provider, model string) bool {
+	return slices.ContainsFunc(customVideomakers(p), func(m catalog.Model) bool { return m.ID == model })
+}
+
+// keyMark is the mark of the key p sends with, in the id of a video it
+// started at its OpenAI-shaped videos API: the vendor keeps a video for the
+// key that started it, so it is asked after on that key, whichever comes
+// first now. "0" for a provider with no key (a local server).
+func keyMark(p provider.Provider) string {
+	if p.Key == "" {
+		return "0"
+	}
+	return "k" + provider.KeyID(p.Key)
+}
+
+// customVideoID is the id of a video p started at its OpenAI-shaped videos
+// API, by the vendor's id for it, which goes in base64 (it may hold dots).
+func customVideoID(p provider.Provider, theirs string, t time.Time) string {
+	return "video_" + p.ID + "." + base64.RawURLEncoding.EncodeToString([]byte(theirs)) + "." + strconv.FormatInt(t.Unix(), 10) + "." + keyMark(p)
+}
+
+// markedKey is p on its key whose mark is by (keyMark), while that key is
+// still on.
+func markedKey(p provider.Provider, by string) (provider.Provider, bool) {
+	if p.Key == "" {
+		return p, by == "0"
+	}
+	for _, k := range p.KeysOn() {
+		if q := p.WithKey(k); keyMark(q) == by && videoBase(q) != "" {
+			return q, true
+		}
+	}
+	return p, false
 }
 
 // videomaker is the model a request that names none makes its video with:
@@ -121,8 +199,18 @@ func bareVideomaker(name string) (provider.Provider, string, bool) {
 			}
 		}
 	}
+	// any grok-imagine-video*, as videosCreate takes with the provider
+	// named: the vendor's newer ones work before magpie lists them (#1857)
+	for _, p := range provider.All() {
+		if p.On() && !p.DecideOnly() && drawsGrok(p) && strings.HasPrefix(name, grokVideoFamily) {
+			return p, name, true
+		}
+	}
 	return provider.Provider{}, "", false
 }
+
+// grokVideoFamily is the family of a Grok subscription's video models.
+const grokVideoFamily = "grok-imagine-video"
 
 // filming is one videos request, whichever shape it came in.
 type filming struct {
@@ -433,6 +521,14 @@ func videoMaker(id string) (p provider.Provider, vendorID string, started time.T
 		return p, "", started, fmt.Errorf("%q isn't the id of a video magpie is making", id)
 	}
 	found, ferr := provider.Find(pid)
+	if ferr == nil && !drawsGrok(*found) && !found.IsRemoteMagpie() && len(found.PlanVideos()) == 0 && len(customVideomakers(*found)) > 0 {
+		// asked on the key that started it
+		q, ok := markedKey(*found, by)
+		if !ok {
+			return p, "", started, fmt.Errorf("this video was started with a key of %s that is no longer on: turn it back on to get the video", found.Name)
+		}
+		return q, vendorID, started, nil
+	}
 	if ferr != nil || !drawsGrok(*found) && !found.IsRemoteMagpie() && len(found.PlanVideos()) == 0 {
 		return p, "", started, fmt.Errorf("no provider %q makes videos here", pid)
 	}
@@ -492,10 +588,16 @@ func asOurs(b []byte, p provider.Provider, id string) (map[string]any, error) {
 	return obj, nil
 }
 
-// remoteVideoURL is where another magpie answers for a video, with suffix
-// ("" or "/content").
+// filmsOpenAI is whether p makes videos at an OpenAI-shaped videos API:
+// another magpie, or a provider whose model list marks video models.
+func filmsOpenAI(p provider.Provider) bool {
+	return p.IsRemoteMagpie() || len(customVideomakers(p)) > 0
+}
+
+// remoteVideoURL is where another magpie, or a provider's OpenAI-shaped
+// videos API, answers for a video, with suffix ("" or "/content").
 func remoteVideoURL(p provider.Provider, vendorID, suffix string) string {
-	return strings.TrimRight(p.Base(provider.Chat), "/") + "/videos/" + url.PathEscape(theirVideoID(vendorID)) + suffix
+	return videoBase(p) + "/videos/" + url.PathEscape(theirVideoID(vendorID)) + suffix
 }
 
 // videoStatus asks the vendor how a video is going.
@@ -545,7 +647,7 @@ func (s *Server) videosCreate(w http.ResponseWriter, r *http.Request) {
 	if f.Model == "" {
 		m, ok := videomaker()
 		if !ok {
-			fail(400, "no model to make videos with: sign in to a Grok subscription or configure Volcengine Agent Plan and leave Settings → Images → Image generation on, or name one")
+			fail(400, "no model to make videos with: sign in to a Grok subscription or set up a provider that makes videos, and leave Settings → Images → Image generation on, or name one")
 			return
 		}
 		f.Model, call.Model = m, m
@@ -566,10 +668,28 @@ func (s *Server) videosCreate(w http.ResponseWriter, r *http.Request) {
 		fail(403, keyModelError(keyWho, f.Model))
 		return
 	}
-	// held to some accounts (#905): sent on a key the calling key may use,
-	// of those in use — not the provider's first alone, which a key held
-	// to a later one was refused by — or none, refused
-	if keyWho, held := accountHolds(r); held {
+	if msg, off := modelOff(p, model, f.Model); off { // disabled by the user (#1867)
+		fail(403, msg)
+		return
+	}
+	// the provider's other keys to start the video on, when the first
+	// says it doesn't serve the model
+	var keys []candidate
+	if !p.IsRemoteMagpie() && filmsCustom(p, model) {
+		// at a provider's own videos API: sent on the first key a chat
+		// for the model would go to (#1657), never one whose own list of
+		// models leaves it out, nor one the calling key may not use
+		// (#905); the video's id names the key, which it is asked after on
+		cs, code, msg := s.onKeys(r, p, model, f.Model)
+		if code != 0 {
+			fail(code, msg)
+			return
+		}
+		p, keys = cs[0].p, cs[1:]
+	} else if keyWho, held := accountHolds(r); held {
+		// held to some accounts (#905): sent on a key the calling key may
+		// use, of those in use — not the provider's first alone, which a
+		// key held to a later one was refused by — or none, refused
 		var ok bool
 		if p, ok = allowedKey(keyWho, p, model); !ok {
 			fail(403, keyAccountsError(keyWho, f.Model))
@@ -578,10 +698,11 @@ func (s *Server) videosCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	call.Provider, call.To = p.ID, provider.Chat
 	remote := p.IsRemoteMagpie()
+	custom := !remote && filmsCustom(p, model)
 	volcengine := p.Preset == "volcengine" && slices.ContainsFunc(p.PlanVideos(), func(m catalog.Model) bool { return m.ID == model })
 	// any grok-imagine-video*, not only those listed: the vendor's newer ones work before magpie names them
-	if !remote && !volcengine && (!drawsGrok(p) || !strings.HasPrefix(model, "grok-imagine-video")) {
-		fail(400, fmt.Sprintf("%s/%s can't make videos: magpie makes videos with a Grok subscription's grok-imagine-video or Volcengine Agent Plan's Seedance models", p.ID, model))
+	if !remote && !custom && !volcengine && (!drawsGrok(p) || !strings.HasPrefix(model, grokVideoFamily)) {
+		fail(400, fmt.Sprintf(`%s/%s can't make videos: magpie makes videos with a Grok subscription's grok-imagine-video, Volcengine Agent Plan's Seedance models, another magpie's, and a provider's models its own model list marks "kind": "video" or that you mark a Video model (right-click the model in the provider's editor: Makes…)`, p.ID, model))
 		return
 	}
 	var unmask func()
@@ -591,17 +712,29 @@ func (s *Server) videosCreate(w http.ResponseWriter, r *http.Request) {
 	// it can't make
 	at, field := strings.TrimRight(p.Base(provider.Responses), "/")+"/videos/generations", "request_id"
 	var body []byte
-	if remote {
-		at, field, body = strings.TrimRight(p.Base(provider.Chat), "/")+"/videos", "id", remoteVideoBody(model, f)
-	} else if volcengine {
+	switch {
+	case remote, custom:
+		// a provider's OpenAI-shaped videos API is asked as another
+		// magpie's is: OpenAI's body, its answer its own
+		at, field, body = videoBase(p)+"/videos", "id", remoteVideoBody(model, f)
+	case volcengine:
 		at, field, body = strings.TrimRight(p.Base(provider.Responses), "/")+"/contents/generations/tasks", "id", volcengineVideoBody(model, f)
-	} else if body, err = grokVideoBody(model, f); err != nil {
-		fail(400, err.Error())
-		return
+	default:
+		body, err = grokVideoBody(model, f)
+		if err != nil {
+			fail(400, err.Error())
+			return
+		}
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), drawTimeout)
 	defer cancel()
 	b, code, err := s.send(ctx, p, at, "application/json", body, true)
+	// a key answering 404 that it doesn't serve the model hands it to the
+	// next (#1657), as a drawing does; the id names the key that started it
+	for ; err != nil && len(keys) > 0 && ctx.Err() == nil && keyLacksModel(code, err); keys = keys[1:] {
+		p = keys[0].p
+		b, code, err = s.send(ctx, p, at, "application/json", body, true)
+	}
 	call.Millis, call.Status = time.Since(start).Milliseconds(), code
 	var started map[string]any
 	theirs := ""
@@ -626,7 +759,69 @@ func (s *Server) videosCreate(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, obj)
 		return
 	}
+	if custom {
+		obj, _ := asOurs(b, p, customVideoID(p, theirs, start))
+		if _, ok := obj["model"]; !ok {
+			obj["model"] = p.ID + "/" + model
+		}
+		writeJSON(w, 200, obj)
+		return
+	}
 	writeJSON(w, 200, videoObject(videoID(p, theirs, start), p.ID+"/"+model, start, videoState{}, f))
+}
+
+// videoAsker is p on a key or account the calling key may use, to ask
+// after a video (#905), as starting one is held: a video at the
+// OpenAI-shaped videos API of a provider set up with a base URL on the key
+// that started it, which the calling key must be allowed; any other on the
+// first key or account it may use, as videosCreate picks. What the calling
+// key is told when it may use none, else "".
+func videoAsker(r *http.Request, p provider.Provider) (provider.Provider, string) {
+	who, held := accountHolds(r)
+	if !held {
+		return p, ""
+	}
+	if !p.IsRemoteMagpie() && filmsOpenAI(p) {
+		if p.Key == "" && p.Account == nil || accountAllowed(who, candidate{p: p}) {
+			return p, ""
+		}
+		return p, keyAccountsError(who, p.ID)
+	}
+	q, ok := allowedKey(who, p, "")
+	if !ok {
+		return p, keyAccountsError(who, p.ID)
+	}
+	return q, ""
+}
+
+// videoModelHeld is what the calling key is told when its models hold it
+// from a video of p's model (#882), as they hold it from starting one: ""
+// when they don't. A video whose model the vendor doesn't say is held.
+func videoModelHeld(r *http.Request, p provider.Provider, model string) string {
+	who, held := keyHolds(r)
+	if !held || model != "" && modelAllowed(who, p, model) {
+		return ""
+	}
+	if model == "" {
+		return fmt.Sprintf("The gateway key %q may not ask after this video: %s didn't say which model makes it.", who.KeyName, p.Name)
+	}
+	return keyModelError(who, p.ID+"/"+model)
+}
+
+// openAIVideo is how a video at an OpenAI-shaped videos API (another
+// magpie's, a provider's) is going, with this magpie's id for it, and the
+// model making it as that API names it.
+func (s *Server) openAIVideo(ctx context.Context, p provider.Provider, vendorID, id string) (map[string]any, string, int, error) {
+	b, code, err := s.sendAs(ctx, p, http.MethodGet, remoteVideoURL(p, vendorID, ""), "", nil, true)
+	if err != nil {
+		return nil, "", code, err
+	}
+	obj, err := asOurs(b, p, id)
+	if err != nil {
+		return nil, "", 502, err
+	}
+	model, _ := obj["model"].(string)
+	return obj, strings.TrimPrefix(model, p.ID+"/"), 200, nil
 }
 
 // videosGet answers how a video is going.
@@ -641,17 +836,21 @@ func (s *Server) videosGet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, provider.Chat, 404, err.Error())
 		return
 	}
+	p, held := videoAsker(r, p)
+	if held != "" {
+		writeError(w, provider.Chat, 403, held)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), drawTimeout)
 	defer cancel()
-	if p.IsRemoteMagpie() {
-		b, code, err := s.sendAs(ctx, p, http.MethodGet, remoteVideoURL(p, vendorID, ""), "", nil, true)
+	if filmsOpenAI(p) {
+		obj, model, code, err := s.openAIVideo(ctx, p, vendorID, id)
 		if err != nil {
 			writeError(w, provider.Chat, code, err.Error())
 			return
 		}
-		obj, err := asOurs(b, p, id)
-		if err != nil {
-			writeError(w, provider.Chat, 502, err.Error())
+		if held := videoModelHeld(r, p, model); held != "" {
+			writeError(w, provider.Chat, 403, held)
 			return
 		}
 		writeJSON(w, 200, obj)
@@ -666,6 +865,10 @@ func (s *Server) videosGet(w http.ResponseWriter, r *http.Request) {
 	if model == "" {
 		model = "grok-imagine-video"
 	}
+	if held := videoModelHeld(r, p, model); held != "" {
+		writeError(w, provider.Chat, 403, held)
+		return
+	}
 	writeJSON(w, 200, videoObject(id, p.ID+"/"+model, started, st, filming{}))
 }
 
@@ -677,15 +880,36 @@ func (s *Server) videosContent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, provider.Chat, 404, err.Error())
 		return
 	}
+	p, held := videoAsker(r, p)
+	if held != "" {
+		writeError(w, provider.Chat, 403, held)
+		return
+	}
 	ctx, cancel := context.WithTimeout(r.Context(), drawTimeout)
 	defer cancel()
-	if p.IsRemoteMagpie() {
+	if filmsOpenAI(p) {
+		if _, models := keyHolds(r); models {
+			// the bytes say no model: the video's own answer does
+			_, model, code, err := s.openAIVideo(ctx, p, vendorID, id)
+			if err != nil {
+				writeError(w, provider.Chat, code, err.Error())
+				return
+			}
+			if held := videoModelHeld(r, p, model); held != "" {
+				writeError(w, provider.Chat, 403, held)
+				return
+			}
+		}
 		s.remoteVideoContent(ctx, w, p, vendorID)
 		return
 	}
 	st, code, err := s.videoStatus(ctx, p, vendorID)
 	if err != nil {
 		writeError(w, provider.Chat, code, err.Error())
+		return
+	}
+	if held := videoModelHeld(r, p, cmp.Or(st.Model, "grok-imagine-video")); held != "" {
+		writeError(w, provider.Chat, 403, held)
 		return
 	}
 	if st.Status != "done" && st.Status != "succeeded" {
@@ -727,8 +951,9 @@ func (s *Server) videosContent(w http.ResponseWriter, r *http.Request) {
 	io.Copy(w, io.LimitReader(res.Body, maxVideoBytes))
 }
 
-// remoteVideoContent passes on the bytes of a video another magpie made, or
-// what it says of one it hasn't.
+// remoteVideoContent passes on the bytes of a video another magpie, or a
+// provider's OpenAI-shaped videos API, made, or what it says of one it
+// hasn't.
 func (s *Server) remoteVideoContent(ctx context.Context, w http.ResponseWriter, p provider.Provider, vendorID string) {
 	ctx = p.Via(ctx)
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, remoteVideoURL(p, vendorID, "/content"), nil)
@@ -736,7 +961,13 @@ func (s *Server) remoteVideoContent(ctx context.Context, w http.ResponseWriter, 
 		writeError(w, provider.Chat, 502, err.Error())
 		return
 	}
-	passOnCaller(ctx, req)
+	// magpie's, or the agent's own where the provider passes it on (#1851)
+	stampUA(ctx, p, req.Header)
+	if p.IsRemoteMagpie() {
+		// vendors are told no caller
+		req.Header.Set("User-Agent", "magpie/"+Version)
+		passOnCaller(ctx, req)
+	}
 	if err := p.Sign(ctx, req, provider.Chat, nil); err != nil {
 		writeError(w, provider.Chat, 502, err.Error())
 		return

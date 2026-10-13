@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/pelletier/go-toml/v2"
 	"github.com/pelletier/go-toml/v2/unstable"
@@ -65,19 +66,46 @@ func GetTOMLTable(path, name string) (map[string]string, error) {
 
 // SetTOMLTable replaces table `name` with the given keys, or appends it.
 // An existing array table with that name is rejected.
+//
+// A key whose value is an Inline table is merged into the spelling the file
+// already has for it, rather than written inline beside it, which would
+// define the key twice: when the file holds it as its own table
+// ([name.key], which a replacement of [name] leaves where it is), each entry
+// is set in that table, its other keys and comments kept; when the table
+// holds it as dotted keys (key."x" = …), those lines are kept as written and
+// each entry is set among them. Otherwise it is written inline.
 func SetTOMLTable(path, name string, kvs ...KV) error {
 	raw, err := Read(path)
 	if err != nil {
 		return err
 	}
-	block := []string{"[" + name + "]"}
-	for _, kv := range kvs {
-		block = append(block, kv.Path+" = "+tomlLiteral(kv.Value))
-	}
 	lines := splitLines(string(raw))
+	tables, err := parseTOMLTables(lines)
+	if err != nil {
+		return fmt.Errorf("%s: %w", path, err)
+	}
 	table, err := parseTOMLTable(lines, name)
 	if err != nil {
 		return fmt.Errorf("%s: %w", path, err)
+	}
+	type subtable struct {
+		name    string
+		entries Inline
+	}
+	var subs []subtable
+	block := []string{"[" + name + "]"}
+	for _, kv := range kvs {
+		if in, ok := kv.Value.(Inline); ok {
+			if _, ok := tomlTableNamed(tables, name+"."+kv.Path); ok {
+				subs = append(subs, subtable{name + "." + kv.Path, in})
+				continue
+			}
+			if dotted := tomlDotted(lines, table, kv.Path, in); dotted != nil {
+				block = append(block, dotted...)
+				continue
+			}
+		}
+		block = append(block, kv.Path+" = "+tomlLiteral(kv.Value))
 	}
 	from, to := table.from, table.to
 	var out []string
@@ -96,7 +124,53 @@ func SetTOMLTable(path, name string, kvs ...KV) error {
 		}
 		out = append(out, lines[to:]...)
 	}
+	for _, sub := range subs {
+		for _, e := range sub.entries {
+			if out, err = setTOMLKeyLines(out, sub.name, e.Path, tomlString(e.Path), e.Value); err != nil {
+				return fmt.Errorf("%s: %w", path, err)
+			}
+		}
+	}
 	return writeTOML(path, out)
+}
+
+// tomlDotted is the lines of table's dotted keys under key (key."x" = …),
+// each as written, with in's entries set among them: one already there
+// replaced in place, the rest added after them. Nil when there are none.
+func tomlDotted(lines []string, table tomlTableSpan, key string, in Inline) []string {
+	var kept [][]string // each dotted key's lines
+	at := map[string]int{}
+	for _, kv := range table.keys {
+		if strings.HasPrefix(kv.name, key+".") {
+			at[kv.name] = len(kept)
+			kept = append(kept, lines[kv.from:kv.to])
+		}
+	}
+	if kept == nil {
+		return nil
+	}
+	for _, e := range in {
+		if i, ok := at[key+"."+e.Path]; ok {
+			kv := tomlKeyNamed(table, key+"."+e.Path)
+			kept[i] = []string{kv.prefix + tomlLiteral(e.Value) + kv.suffix}
+			continue
+		}
+		kept = append(kept, []string{key + "." + tomlString(e.Path) + " = " + tomlLiteral(e.Value)})
+	}
+	var out []string
+	for _, k := range kept {
+		out = append(out, k...)
+	}
+	return out
+}
+
+func tomlKeyNamed(table tomlTableSpan, name string) tomlKeySpan {
+	for _, kv := range table.keys {
+		if kv.name == name {
+			return kv
+		}
+	}
+	return tomlKeySpan{}
 }
 
 // SetTOMLKey sets one key of table `name` and leaves the table's other
@@ -108,19 +182,27 @@ func SetTOMLKey(path, name, key string, value any) error {
 	if err != nil {
 		return err
 	}
-	line := key + " = " + tomlLiteral(value)
-	lines := splitLines(string(raw))
-	table, err := parseTOMLTable(lines, name)
+	out, err := setTOMLKeyLines(splitLines(string(raw)), name, key, key, value)
 	if err != nil {
 		return fmt.Errorf("%s: %w", path, err)
+	}
+	return writeTOML(path, out)
+}
+
+// setTOMLKeyLines is SetTOMLKey on lines: the key named `key` (as the parser
+// names it, quotes taken off) is set, and a new one is written as `spelled`.
+func setTOMLKeyLines(lines []string, name, key, spelled string, value any) ([]string, error) {
+	line := spelled + " = " + tomlLiteral(value)
+	table, err := parseTOMLTable(lines, name)
+	if err != nil {
+		return nil, err
 	}
 	if table.from < 0 {
 		out := trimBlank(lines)
 		if len(out) > 0 {
 			out = append(out, "")
 		}
-		out = append(out, "["+name+"]", line, "")
-		return writeTOML(path, out)
+		return append(out, "["+name+"]", line, ""), nil
 	}
 	from, to := table.from+1, table.from+1
 	for _, kv := range table.keys {
@@ -131,8 +213,7 @@ func SetTOMLKey(path, name, key string, value any) error {
 		}
 		from, to = kv.to, kv.to
 	}
-	out := append(append(append([]string{}, lines[:from]...), line), lines[to:]...)
-	return writeTOML(path, out)
+	return append(append(append([]string{}, lines[:from]...), line), lines[to:]...), nil
 }
 
 // DelTOMLKey removes one key of table `name`, and the table with it when
@@ -270,7 +351,7 @@ func setTOMLTop(path string, preserve bool, kvs ...KV) error {
 		at = doc.root.keys[n-1].to
 	}
 	for _, kv := range kvs {
-		line := kv.Path + " = " + strconv.Quote(toString(kv.Value))
+		line := kv.Path + " = " + tomlLiteral(kv.Value)
 		found := false
 		for _, k := range doc.root.keys {
 			if k.name == kv.Path {
@@ -394,7 +475,7 @@ func tomlTablesOf(path string) ([]tomlTableSpan, error) {
 // file is an empty document and no error.
 func tomlFileOf(path string) (tomlFile, error) {
 	doc, err := filememo.Read("toml file", path, func(b []byte) (tomlFile, error) {
-		doc, err := parseTOMLFile(splitLines(string(b)))
+		doc, err := parseTOMLFile(splitLines(string(TrimBOM(b))))
 		if err != nil {
 			return tomlFile{}, fmt.Errorf("%s: %w", path, err)
 		}
@@ -558,9 +639,6 @@ func tomlParseError(p *unstable.Parser, err error) error {
 	if len(pe.Highlight) > 0 {
 		pos = p.Shape(p.Range(pe.Highlight)).Start
 	}
-	if pos.Offset == 0 && bytes.HasPrefix(data, []byte{0xef, 0xbb, 0xbf}) {
-		err = fmt.Errorf("UTF-8 BOM is not supported; save the file without BOM: %w", err)
-	}
 	return fmt.Errorf("line %d, column %d: %w", pos.Line, pos.Column, err)
 }
 
@@ -608,16 +686,76 @@ func trimBlank(lines []string) []string {
 // caller has already spelled out.
 type Raw string
 
+// Inline is an inline table, its keys in order, each written quoted. Given
+// to SetTOMLTable it is merged into the spelling the file already has for
+// the key (see there).
+type Inline []KV
+
 func tomlLiteral(v any) string {
 	switch x := v.(type) {
 	case Raw:
 		return string(x)
+	case Inline:
+		parts := make([]string, len(x))
+		for i, e := range x {
+			parts[i] = tomlString(e.Path) + " = " + tomlLiteral(e.Value)
+		}
+		return "{ " + strings.Join(parts, ", ") + " }"
 	case bool:
 		return strconv.FormatBool(x)
 	case int:
 		return strconv.Itoa(x)
 	}
-	return strconv.Quote(toString(v))
+	return tomlString(toString(v))
+}
+
+// tomlString spells s as a TOML basic string. Go's strconv.Quote is not a
+// substitute: it escapes a control byte as \x01, and TOML defines no \x
+// escape, so such a value leaves a file no TOML parser reads. writeTOML
+// refuses that file before any change reaches the disk, so the config is
+// never corrupted, but the edit then cannot be made at all — an agent's own
+// value has to be writable. Escapes taken from the TOML spec; anything else
+// that is printable, including non-ASCII, is written as it is.
+func tomlString(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 2)
+	b.WriteByte('"')
+	for i := 0; i < len(s); {
+		r, size := utf8.DecodeRuneInString(s[i:])
+		i += size
+		if r == utf8.RuneError && size == 1 {
+			// One byte that is not part of a rune: TOML has no escape for a
+			// single byte, only for code points, so a value that is not valid
+			// UTF-8 cannot be written. It is left as it is, and writeTOML
+			// refuses the file, rather than being quietly replaced by U+FFFD.
+			b.WriteByte(s[i-size])
+			continue
+		}
+		switch r {
+		case '\b':
+			b.WriteString(`\b`)
+		case '\t':
+			b.WriteString(`\t`)
+		case '\n':
+			b.WriteString(`\n`)
+		case '\f':
+			b.WriteString(`\f`)
+		case '\r':
+			b.WriteString(`\r`)
+		case '"':
+			b.WriteString(`\"`)
+		case '\\':
+			b.WriteString(`\\`)
+		default:
+			if r < 0x20 || r == 0x7f {
+				fmt.Fprintf(&b, `\u%04X`, r)
+				continue
+			}
+			b.WriteRune(r)
+		}
+	}
+	b.WriteByte('"')
+	return b.String()
 }
 
 // Table is one TOML table: its header name and its keys, in order.

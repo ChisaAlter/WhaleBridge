@@ -63,7 +63,7 @@ func startZedSignIn(s *signInFlow) error {
 		http.Redirect(w, r, zedSite+"/native_app_signin_succeeded", http.StatusFound)
 	})
 	srv := &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(s.via(context.Background()))
 	s.mu.Lock()
 	s.st.URL = zed.SignInURL(zedSite, port, pub, systemID)
 	s.srv, s.stop = srv, cancel

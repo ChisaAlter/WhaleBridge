@@ -16,12 +16,16 @@ func codexHome(t *testing.T, auth, config string) (home string, read func() stri
 	t.Setenv("USERPROFILE", home)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
 	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	// an app's data on Linux (Grok App's, #1668)
+	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
+	t.Setenv("XDG_STATE_HOME", filepath.Join(home, ".local", "state"))
 	t.Setenv("CODEX_HOME", "")
 	t.Setenv("HANA_HOME", "")
 	// folders an agent's own variable moves out of the sandbox home
 	t.Setenv("OPENCODE_CONFIG_DIR", "")
 	t.Setenv("OPENCHAMBER_DATA_DIR", "")
 	t.Setenv("MIMOCODE_HOME", "")
+	t.Setenv("DEVECO_CONFIG_DIR", "")
 	t.Setenv("MINIMAX_DATA_DIR", "")
 	// Windows' own folders too: Claude Desktop's are in LOCALAPPDATA
 	t.Setenv("APPDATA", filepath.Join(home, "AppData", "Roaming"))
@@ -206,6 +210,37 @@ func TestCodexSubagentModel(t *testing.T) {
 	}
 	if cfg := read(); strings.Contains(cfg, "default_subagent_model") {
 		t.Fatalf("\n%s", cfg)
+	}
+}
+
+// #1633 (laacmilan): the model magpie puts every Codex subagent on offers
+// another provider's models, not only a ChatGPT account's, and takes one;
+// one of Codex's own bare names, which magpie can't put a request on, is
+// refused.
+func TestCodexSubagentModelTakesAnyProvider(t *testing.T) {
+	home, _ := codexHome(t, `{"tokens":{"access_token":"x","id_token":"x.e30.x"}}`, "model = \"gpt-5.5\"\n")
+	sub := codex(home).Field("subagent_model")
+	if sub == nil {
+		t.Fatal("no subagent model field")
+	}
+	offered := false
+	for _, o := range sub.Options(nil) {
+		offered = offered || o.Value == "fake/m1"
+	}
+	if !offered {
+		t.Fatalf("fake/m1 not offered: %+v", sub.Options(nil))
+	}
+	if err := sub.Set("fake/m1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := sub.Get(); got != "fake/m1" {
+		t.Fatalf("subagent model = %q", got)
+	}
+	if err := sub.Set("gpt-5.5"); err == nil {
+		t.Error("a bare name of Codex's own was taken")
+	}
+	if err := sub.Set(""); err != nil || sub.Get() != "" {
+		t.Fatalf("Default: %v %q", err, sub.Get())
 	}
 }
 

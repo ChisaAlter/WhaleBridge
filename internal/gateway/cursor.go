@@ -33,6 +33,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"math"
 	"net/http"
@@ -210,6 +211,8 @@ func (s *Server) serveCursor(w http.ResponseWriter, r *http.Request, from provid
 	if err != nil {
 		return writeError(w, from, 400, err.Error()), err.Error()
 	}
+	// the vendor's own API is told the answer's format in words
+	req = req.inSystem()
 	req.Model = model
 	if conv := cursorConversation(r.Header, req.CacheKey, body); conv != "" {
 		r = r.WithContext(context.WithValue(r.Context(), cursorConvKey{}, conv))
@@ -226,7 +229,7 @@ func (s *Server) serveCursor(w http.ResponseWriter, r *http.Request, from provid
 	if events == nil {
 		return writeError(w, from, status, msg), msg
 	}
-	return relay(w, r, from, "Cursor", req, events, usage, cancel, func(string, string, bool) {})
+	return relay(w, r, from, "Cursor", req, events, usage, cancel, nil, func(string, string, bool) {})
 }
 
 // askCursor is a round for Cursor's API.
@@ -464,7 +467,8 @@ func cursorMessages(r *Request, tools []bridgeTool) [][]byte {
 	if sys := r.System + cursorCatalog(tools); sys != "" {
 		add(map[string]any{"role": "system", "content": sys})
 	}
-	var pending []string // calls the last reply made, not yet answered
+	var pending []string         // calls the last reply made, not yet answered
+	names := map[string]string{} // a call's tool, by the call's id
 	answer := func(results []any) {
 		for _, id := range pending {
 			results = append(results, cursorResult(id, devinNoResult, true))
@@ -474,7 +478,7 @@ func cursorMessages(r *Request, tools []bridgeTool) [][]byte {
 			add(map[string]any{"role": "tool", "content": results})
 		}
 	}
-	for _, m := range r.Messages {
+	for _, m := range joinSplitCalls(r.Messages) {
 		if m.Role == "assistant" {
 			answer(nil)
 			var content []any
@@ -492,6 +496,7 @@ func cursorMessages(r *Request, tools []bridgeTool) [][]byte {
 					content = append(content, map[string]any{"type": "tool-call", "toolCallId": cursorCallID(p.ID), "toolName": cursorCall,
 						"args": map[string]any{"namespace": "magpie", "toolName": p.Name, "arguments": args}})
 					pending = append(pending, p.ID)
+					names[p.ID] = p.Name
 				}
 			}
 			if len(content) > 0 {
@@ -499,36 +504,64 @@ func cursorMessages(r *Request, tools []bridgeTool) [][]byte {
 			}
 			continue
 		}
-		var results, content []any
+		// seen: the images tools returned, which a tool result can't hold
+		// (its text alone is shown); they open the user's message after
+		// the results, as magpie's Chat request gives them Cursor's plugin
+		var results, seen, content []any
 		for _, p := range m.Parts {
 			switch p.Kind {
 			case ToolResult:
 				if i := indexOf(pending, p.CallID); i >= 0 {
 					pending = append(pending[:i], pending[i+1:]...)
-					results = append(results, cursorResult(p.CallID, p.Text, p.IsError))
+					out := p.Text
+					if n := len(p.Images); n > 0 {
+						note := fmt.Sprintf("[The tool returned %d images; they follow in the next message.]", n)
+						if n == 1 {
+							note = "[The tool returned an image; it follows in the next message.]"
+						}
+						if strings.TrimSpace(out) != "" {
+							out += "\n\n"
+						}
+						out += note
+						of := "tool call " + p.CallID
+						if name := names[p.CallID]; name != "" {
+							of = name + " (" + of + ")"
+						}
+						seen = append(seen, map[string]any{"type": "text", "text": "[From the result of " + of + ":]"})
+						for _, im := range p.Images {
+							seen = append(seen, cursorImage(im))
+						}
+					}
+					results = append(results, cursorResult(p.CallID, out, p.IsError))
 				}
 			case Text:
 				if p.Text != "" {
 					content = append(content, map[string]any{"type": "text", "text": p.Text})
 				}
 			case Image:
-				if b, err := base64.StdEncoding.DecodeString(p.Data); err == nil && p.Data != "" {
-					content = append(content, map[string]any{"type": "image", "mimeType": p.MediaType,
-						"image": map[string]any{"__type": "Uint8Array", "hex": hex.EncodeToString(b)}})
-				} else {
-					content = append(content, map[string]any{"type": "text", "text": attachmentText(p)})
-				}
+				content = append(content, cursorImage(p))
 			case File:
 				content = append(content, map[string]any{"type": "text", "text": attachmentText(p)})
 			}
 		}
 		answer(results)
+		content = append(seen, content...)
 		if len(content) > 0 {
 			add(map[string]any{"role": "user", "content": content})
 		}
 	}
 	answer(nil)
 	return out
+}
+
+// cursorImage is an image as the AI SDK message takes it, its bytes
+// inline; one named only by a URL is told as an attachment.
+func cursorImage(p Part) map[string]any {
+	if b, err := base64.StdEncoding.DecodeString(p.Data); err == nil && p.Data != "" {
+		return map[string]any{"type": "image", "mimeType": p.MediaType,
+			"image": map[string]any{"__type": "Uint8Array", "hex": hex.EncodeToString(b)}}
+	}
+	return map[string]any{"type": "text", "text": attachmentText(p)}
 }
 
 func indexOf(ids []string, id string) int {

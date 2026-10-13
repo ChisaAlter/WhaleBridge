@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // A plugin's provider is signed in to as many times as the user likes, as
@@ -120,6 +121,9 @@ var pluginOwnUser = func(id string) string {
 // own account is named as the agent is signed in now; removed in magpie,
 // it is only hidden, and shows again once the agent signs in anew.
 func pluginLogins(pp plugin.Provider) []pluginLogin {
+	if settings.AccountDiscoveryOff() {
+		return nil
+	}
 	agent := pluginAgent(pp)
 	labels := pluginLabels(pp)
 	byKey := map[string]plugin.Account{}
@@ -311,12 +315,51 @@ func keepPluginPlan(pp plugin.Provider, key, plan string) {
 // a request (401), as a built-in's refused sign-in is marked, and clears
 // the mark once one goes through.
 func notePluginLapse(pp plugin.Provider, key string, status int) {
+	notePluginLapseSince(pp, key, status, toldNow)
+}
+
+// What plugin accounts' sign-ins were told of (a request's answer, a usage
+// reading, a sign-in) is counted, under loginsMu: pluginSignInTold
+// counts it all, and pluginSignInSaid has the count each account was last
+// told of at. A count, not a time: Windows' clock moves in ticks of up to
+// 15.6ms, and a reading begun just after an answer would read as begun
+// with it.
+var (
+	pluginSignInTold uint64
+	pluginSignInSaid = map[string]uint64{}
+)
+
+// toldNow is the began of what is told now, not read from earlier.
+const toldNow = ^uint64(0)
+
+// pluginSignInAt is the count a usage reading beginning now goes by.
+func pluginSignInAt() uint64 {
+	loginsMu.Lock()
+	defer loginsMu.Unlock()
+	return pluginSignInTold
+}
+
+// notePluginLapseSince is notePluginLapse for what a usage reading begun
+// at began (pluginSignInAt) found, toldNow for what is told now: what was
+// told of the sign-in since began stands over it. A reading begun before
+// a request's 401 that ended clean took the mark off an account the
+// vendor had just refused.
+func notePluginLapseSince(pp plugin.Provider, key string, status int, began uint64) {
 	refused := status == http.StatusUnauthorized
 	if !refused && (status < 200 || status > 299) {
 		return
 	}
 	loginsMu.Lock()
 	defer loginsMu.Unlock()
+	said := pluginAgent(pp) + "/" + key
+	if pluginSignInSaid[said] > began {
+		return
+	}
+	if began == toldNow {
+		pluginSignInTold++
+		began = pluginSignInTold
+	}
+	pluginSignInSaid[said] = began
 	ls := readLogins()
 	for i, l := range ls {
 		if l.Agent == pluginAgent(pp) && l.Home == key {
@@ -341,11 +384,17 @@ func lapsedText(pp plugin.Provider, user string) string {
 
 // clearPluginLapse takes the mark off an account signed in again, and
 // brings back the agent's own account removed in magpie, as signing in to
-// the built-in's did (#320).
+// the built-in's did (#320). The account's kept usage reading goes too: it
+// was read under the old sign-in, and for a minute it would answer the
+// next reading with the old sign-in's "expired" without asking the plugin,
+// and so without marking or clearing anything.
 func clearPluginLapse(saved plugin.Saved) {
 	for _, pp := range plugin.Cached() {
 		if pp.ID == saved.Provider {
 			notePluginLapse(pp, saved.Account, http.StatusOK)
+			if user := pluginLabels(pp)[saved.Account]; user != "" {
+				StaleAllowance(pluginAgent(pp), user)
+			}
 		}
 	}
 	loginsMu.Lock()

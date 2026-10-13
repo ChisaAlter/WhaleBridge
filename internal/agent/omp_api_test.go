@@ -15,8 +15,9 @@ import (
 // omp asks each model on the API its provider serves it on, as Pi does: a
 // Claude over Chat lost its thinking's signatures between tool turns. A
 // Messages-only provider's models go on anthropic-messages at the gateway,
-// a Responses-only one's on openai-responses, and a Chat provider's and a
-// group's stay on the provider's openai-completions, keyless.
+// a Responses-only one's on openai-responses, and a Chat provider's stay on
+// the provider's openai-completions, keyless. A group goes on
+// openai-responses when all its members are best there (#1594), else stays.
 func TestOmpModelsAskedOnTheirNativeAPI(t *testing.T) {
 	home := syncHome(t)
 	was := ompVersion
@@ -30,6 +31,9 @@ func TestOmpModelsAskedOnTheirNativeAPI(t *testing.T) {
 		if err := provider.Save(p); err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := provider.SaveGroup(provider.Group{ID: "mixed", Name: "Mixed", Members: []string{"resp/grok-5", "relay/glm-4.6"}}); err != nil {
+		t.Fatal(err)
 	}
 	var live []catalog.Model
 	for _, id := range []string{"claude-sonnet-5", "claude-sonnet-4-5", "kimi-k3"} {
@@ -64,7 +68,8 @@ func TestOmpModelsAskedOnTheirNativeAPI(t *testing.T) {
 		"anth/claude-sonnet-5":   "anthropic-messages",
 		"anth/claude-sonnet-4-5": "anthropic-messages",
 		"anth/kimi-k3":           "anthropic-messages",
-		"group/auto-gpt-5-5":     nil,
+		"group/auto-gpt-5-5":     "openai-responses",
+		"group/mixed":            nil,
 	} {
 		e, ok := entries[id]
 		if !ok {

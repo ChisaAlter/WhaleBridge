@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/middleware"
 	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
@@ -39,21 +40,21 @@ func setAdapterMirror(on bool) error {
 
 func subscriptionAdapters(ctx context.Context) map[string]any {
 	installed, available, moves := []map[string]any{}, []plugin.Listing{}, []map[string]any{}
-	es := plugin.Load().Plugins
-	var ps []plugin.Provider
+	list := plugin.Load()
+	es := list.Plugins
+	ps := plugin.Cached()
 	var providerErr error
-	if len(es) > 0 {
-		ps, providerErr = plugin.Providers(ctx)
-	}
 	errs := map[string]string{}
+	clashes := map[string][]plugin.Clash{}
 	if len(es) > 0 && (plugin.Running() || plugin.HasBun()) {
 		loaded, err := plugin.Plugins(ctx)
-		if err != nil && providerErr == nil {
+		if err != nil {
 			providerErr = err
 		}
 		for _, p := range loaded {
-			errs[plugin.Name(p.Spec)] = p.Error
+			errs[p.Spec] = p.Error
 		}
+		clashes = plugin.Clashes(loaded)
 	}
 	names := []string{}
 	for _, e := range es {
@@ -62,30 +63,57 @@ func subscriptionAdapters(ctx context.Context) map[string]any {
 		}
 	}
 	known := plugin.InfoCached(names)
+	middlewares := middleware.States()
+	providerNames := map[string]string{}
+	for _, p := range ps {
+		providerNames[p.ID] = p.Name
+	}
 	for _, e := range es {
 		ids := []string{}
 		for _, p := range ps {
-			if plugin.Name(p.Spec) == plugin.Name(e.Spec) {
+			if p.Spec == e.Spec {
 				ids = append(ids, p.ID)
 			}
 		}
-		row := map[string]any{"id": plugin.Name(e.Spec), "name": plugin.Name(e.Spec), "package": e.Spec, "version": plugin.Installed(e.Spec), "enabled": !e.Off, "providers": ids, "error": errs[plugin.Name(e.Spec)], "latest": known[plugin.Name(e.Spec)].Version, "moved": provider.MovedOnto(e.Spec), "optionsExample": plugin.OptionsExample(plugin.Target(e.Spec))}
+		target := plugin.Target(e.Spec)
+		mwFile, mwOnly := plugin.Middleware(target)
+		agentFile, agentOnly := plugin.Agent(target)
+		kind := "provider"
+		if len(ids) == 0 {
+			switch {
+			case mwFile != "":
+				kind = "middleware"
+			case agentFile != "":
+				kind = "agent"
+			}
+		}
+		row := map[string]any{"id": plugin.Name(e.Spec), "name": plugin.Name(e.Spec), "package": e.Spec, "version": plugin.Installed(e.Spec), "enabled": !e.Off, "providers": ids, "named": plugin.Answered(), "error": errs[e.Spec], "latest": known[plugin.Name(e.Spec)].Version, "moved": provider.MovedOnto(e.Spec), "optionsExample": plugin.OptionsExample(target), "kind": kind, "isMiddleware": mwFile != "", "middlewareOnly": mwOnly, "isAgent": agentFile != "", "agentOnly": agentOnly, "inMagpieOnly": plugin.InMagpieOnly(target)}
+		if state, ok := middlewares[e.Spec]; ok {
+			row["middleware"] = state
+		}
+		conflicts := []map[string]any{}
+		for _, clash := range clashes[e.Spec] {
+			name := providerNames[clash.ID]
+			if name == "" {
+				name = clash.ID
+			}
+			conflicts = append(conflicts, map[string]any{"id": clash.ID, "name": name, "by": clash.By, "with": clash.With})
+		}
+		row["clashes"] = conflicts
 		if u, ok := plugin.LastUpdated(plugin.Name(e.Spec), time.Now().Add(-3*24*time.Hour)); ok && !plugin.IsPath(e.Spec) {
 			row["autoUpdated"] = u
 		}
 		installed = append(installed, row)
 	}
 	for _, e := range plugin.Market(ctx) {
-		if len(e.Providers) > 0 {
-			available = append(available, e)
-		}
+		available = append(available, e)
 	}
 	for _, id := range provider.MovableIDs() {
 		m, _ := provider.MigrationOf(id)
 		p, _ := provider.Find(id)
 		moves = append(moves, map[string]any{"id": id, "package": provider.MovePackage(id), "moved": provider.Moved(id), "signedIn": p != nil && p.Account != nil, "state": m.State, "error": m.Err})
 	}
-	out := map[string]any{"installed": installed, "available": available, "moves": moves, "updates": plugin.PendingUpdates(), "bun": plugin.HasBun(), "bunVer": plugin.BunInUse(), "mirror": settings.Load().ChinaMirror}
+	out := map[string]any{"installed": installed, "available": available, "moves": moves, "updates": plugin.PendingUpdates(), "bun": plugin.HasBun(), "bunVer": plugin.BunInUse(), "mirror": settings.Load().ChinaMirror, "prefer": list.Prefer}
 	if providerErr != nil {
 		out["error"] = providerErr.Error()
 	}

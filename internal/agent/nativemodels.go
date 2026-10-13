@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 	"github.com/ChisaAlter/WhaleBridge/internal/filememo"
+	"github.com/ChisaAlter/WhaleBridge/internal/proc"
 )
 
 // A Pi-family agent's built-in providers are the ones its own model
@@ -26,7 +26,7 @@ import (
 var nodeModulesOf = findNodeModules
 
 func findNodeModules(bin string, pkgs []string) []string {
-	path, err := exec.LookPath(bin)
+	path, err := proc.LookPath(bin)
 	if err != nil {
 		return nil
 	}

@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"html"
 	"io"
+	"io/fs"
 	"net"
 	"net/http"
 	"net/url"
@@ -35,6 +36,8 @@ import (
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
+	"github.com/ChisaAlter/WhaleBridge/internal/filelock"
+	"github.com/ChisaAlter/WhaleBridge/internal/lastgood"
 	"github.com/ChisaAlter/WhaleBridge/internal/netproxy"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 	"github.com/ChisaAlter/WhaleBridge/internal/steady"
@@ -72,6 +75,21 @@ var ErrExpired = errors.New("magpie's sign-in to this server has run out: sign i
 // mcp.exa.ai/mcp?login) is signed in to there. The GUI has it in Chinese.
 var ErrNoSignIn = errors.New("this server already works without signing in, so there is nothing to sign in to: the agents given it can use it as it is. A key it takes goes in Headers; a server that signs in at another address (as Exa's ?login) needs that URL")
 
+// ErrClientRefused is a server whose authorization server turned magpie's
+// registration away with 401 or 403: it admits only the clients it lists,
+// as Figma's (mcp.figma.com, a 403 "Forbidden" to any client_name it doesn't
+// list, #1619). magpie doesn't pass itself off as a listed client; a server
+// magpie isn't signed in to is given to the agents at its own address, so
+// each agent signs in there itself. The GUI has it in every language.
+var ErrClientRefused = errors.New("this server's sign-in admits only the apps it lists and turned magpie away, so magpie can't sign in for the agents. The agents given it still have the server's own address: sign in from each agent itself (in Claude Code, run /mcp and pick the server)")
+
+// ErrNoRegistration is a server whose sign-in doesn't let an app register
+// itself (GitHub's, 新v学员 on Discord): magpie signs in to it only as an
+// OAuth app of the user's own, made with the server's vendor, as Claude
+// Code does with --client-id. The page opens the server's fields for one
+// on it.
+var ErrNoRegistration = errors.New("the server's sign-in doesn't let an app register itself (no dynamic client registration), so magpie signs in to it only as an OAuth app of your own: make one with the server's vendor (GitHub's under Settings › Developer settings › OAuth Apps), with http://localhost/callback as its callback URL, then give its client ID and secret under \"OAuth app\" in the server's editor")
+
 // Record is magpie's sign-in to one server.
 type Record struct {
 	URL      string `json:"url"`                // the server's, as the library has it
@@ -93,21 +111,45 @@ type Record struct {
 	Dead bool `json:"dead,omitempty"`
 }
 
-var fileMu sync.Mutex
+// fileMu is held for a change to mcp-signins.json read afresh under it,
+// across magpies too (#1674): the gateway renews a sign-in while a magpie
+// run from a terminal checks or renames a server.
+var fileMu = filelock.Mutex{Path: func() string { return path() + ".lock" }}
 
 func path() string { return filepath.Join(settings.Dir(), "mcp-signins.json") }
 
 func load() map[string]*Record {
-	m := map[string]*Record{}
-	if b, err := os.ReadFile(path()); err == nil {
-		_ = json.Unmarshal(b, &m)
-	}
+	m, _ := read()
 	return m
+}
+
+// read is the sign-ins, or their last good generation when a crash left
+// the file all zero (#1505); an error when neither reads, for a change
+// not to write them over as none.
+func read() (map[string]*Record, error) {
+	m := map[string]*Record{}
+	b, err := lastgood.Read(path(), validRecords)
+	if errors.Is(err, fs.ErrNotExist) {
+		return m, nil
+	}
+	if err != nil {
+		return m, err
+	}
+	_ = json.Unmarshal(b, &m)
+	return m, nil
+}
+
+func validRecords(b []byte) bool {
+	var m map[string]*Record
+	return json.Unmarshal(b, &m) == nil
 }
 
 func save(m map[string]*Record) error {
 	b, err := json.MarshalIndent(m, "", "  ")
 	if err != nil {
+		return err
+	}
+	if err := lastgood.Keep(path(), validRecords, 0o600); err != nil {
 		return err
 	}
 	return writePrivate(path(), append(b, '\n'))
@@ -122,30 +164,20 @@ func writePrivate(p string, b []byte) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o700); err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(p), "."+filepath.Base(p)+".*")
-	if err != nil {
-		return err
-	}
-	defer os.Remove(tmp.Name())
-	if _, err := tmp.Write(b); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Chmod(0o600); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Close(); err != nil {
-		return err
-	}
-	return steady.Rename(tmp.Name(), p)
+	return steady.WriteFile(p, b, 0o600) // on the disk before it is renamed in
 }
 
 func update(f func(m map[string]*Record) bool) error {
 	fileMu.Lock()
 	defer fileMu.Unlock()
-	m := load()
-	if !f(m) {
+	// sign-ins that don't read are kept aside before a new one is saved
+	// (save), and never written over with none
+	m, err := read()
+	changed := f(m)
+	if err != nil && len(m) == 0 {
+		return err // what to change may be in what doesn't read
+	}
+	if !changed {
 		return nil
 	}
 	return save(m)
@@ -265,6 +297,10 @@ func renew(ctx context.Context, name string, still func(Record) bool) (string, e
 	mu := lockOf(name)
 	mu.Lock()
 	defer mu.Unlock()
+	// one renewal at a time across magpies as well: a server that rotates
+	// its refresh tokens takes each once
+	unlock, _ := filelock.Lock(path()+".renew.lock", filelock.Wait)
+	defer unlock()
 	r, ok := Get(name)
 	if !ok {
 		return "", ErrNotSignedIn
@@ -286,7 +322,7 @@ func renew(ctx context.Context, name string, still func(Record) bool) (string, e
 	t, err := tokenRequest(ctx, r, form)
 	if err != nil {
 		var te *tokenError
-		if errors.As(err, &te) && (te.Code == "invalid_grant" || te.Code == "invalid_client" || te.Status == http.StatusUnauthorized) {
+		if errors.As(err, &te) && (dead(te.Code) || te.Status == http.StatusUnauthorized) {
 			markDead(name, r.Access)
 			return "", ErrExpired
 		}
@@ -306,6 +342,23 @@ func renew(ctx context.Context, name string, still func(Record) bool) (string, e
 	})
 	return t.Access, err
 }
+
+// dead says a token endpoint's error means the refresh token, or the app
+// it was given to, won't be taken again; GitHub's has its own names.
+func dead(code string) bool {
+	switch code {
+	case "invalid_grant", "invalid_client", "bad_refresh_token", "incorrect_client_credentials":
+		return true
+	}
+	return false
+}
+
+// Rejected says the server refused access, a token magpie had just
+// renewed: renewing it again won't help, so the sign-in has run out, and
+// the page says so instead of calling it signed in beside the server's
+// refusal (新v学员 on Discord). A sign-in renewed or redone meanwhile is
+// left as it is.
+func Rejected(name, access string) { markDead(name, access) }
 
 func markDead(name, access string) {
 	_ = update(func(m map[string]*Record) bool {
@@ -378,6 +431,10 @@ func tokenRequest(ctx context.Context, r Record, form url.Values) (tokens, error
 		return tokens{}, te
 	}
 	var t tokens
+	// GitHub's answers its errors with a 200 too
+	if te := (&tokenError{Status: resp.StatusCode}); json.Unmarshal(b, te) == nil && te.Code != "" {
+		return tokens{}, te
+	}
 	if err := json.Unmarshal(b, &t); err != nil {
 		// a few answer as a form, as GitHub's does
 		if v, perr := url.ParseQuery(string(b)); perr == nil && v.Get("access_token") != "" {
@@ -612,16 +669,19 @@ func contains(l []string, s string) bool {
 // redirect.
 func register(ctx context.Context, m meta, redirect string) (id, secret, method string, err error) {
 	if m.RegisterURL == "" {
-		return "", "", "", errors.New("the server's sign-in doesn't let an app register itself (no dynamic client registration), so magpie can't sign in to it")
+		return "", "", "", ErrNoRegistration
 	}
 	method = "none"
 	if len(m.AuthMethods) > 0 && !contains(m.AuthMethods, "none") {
-		method = m.AuthMethods[0]
-		if !contains(m.AuthMethods, "client_secret_post") && !contains(m.AuthMethods, "client_secret_basic") {
-			return "", "", "", fmt.Errorf("the server's token endpoint takes only %s, which magpie can't do", strings.Join(m.AuthMethods, ", "))
-		}
-		if contains(m.AuthMethods, "client_secret_post") {
+		// the metadata's order is no preference: one listing private_key_jwt
+		// first, which magpie can't do, may take a secret too
+		switch {
+		case contains(m.AuthMethods, "client_secret_post"):
 			method = "client_secret_post"
+		case contains(m.AuthMethods, "client_secret_basic"):
+			method = "client_secret_basic"
+		default:
+			return "", "", "", fmt.Errorf("the server's token endpoint takes only %s, which magpie can't do", strings.Join(m.AuthMethods, ", "))
 		}
 	}
 	reg := map[string]any{
@@ -648,6 +708,9 @@ func register(ctx context.Context, m meta, redirect string) (id, secret, method 
 	}
 	defer resp.Body.Close()
 	rb, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return "", "", "", ErrClientRefused
+	}
 	if resp.StatusCode/100 != 2 {
 		return "", "", "", fmt.Errorf("registering magpie with the server's sign-in failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(rb)))
 	}
@@ -660,6 +723,13 @@ func register(ctx context.Context, m meta, redirect string) (id, secret, method 
 		return "", "", "", errors.New("the server's sign-in registered magpie but gave it no client id")
 	}
 	if out.Method != "" {
+		// the server may register magpie for another of the methods it
+		// supports than the one asked for (RFC 7591's registration
+		// response): one magpie can't send would fail the code exchange
+		// after the browser round trip, so it is said here instead
+		if !contains([]string{"none", "client_secret_post", "client_secret_basic"}, out.Method) {
+			return "", "", "", fmt.Errorf("the server's sign-in registered magpie for %s, which magpie can't do", out.Method)
+		}
 		method = out.Method
 	}
 	if out.Secret == "" {
@@ -668,6 +738,18 @@ func register(ctx context.Context, m meta, redirect string) (id, secret, method 
 		method = "client_secret_post"
 	}
 	return out.ID, out.Secret, method, nil
+}
+
+// appMethod is how an app of the user's own gives its secret to the token
+// endpoint: in the form unless the endpoint takes only basic auth.
+func appMethod(m meta, secret string) string {
+	switch {
+	case secret == "":
+		return "none"
+	case contains(m.AuthMethods, "client_secret_basic") && !contains(m.AuthMethods, "client_secret_post"):
+		return "client_secret_basic"
+	}
+	return "client_secret_post"
 }
 
 // ---- the sign-in -------------------------------------------------------------
@@ -701,23 +783,60 @@ func randomToken(n int) string {
 	return base64.RawURLEncoding.EncodeToString(b)
 }
 
+// App is an OAuth app of the user's own, for a server whose sign-in
+// doesn't let magpie register itself: Claude Code's --client-id,
+// --client-secret and --callback-port. Its callback is Claude Code's,
+// http://localhost:<port>/callback, so an app made for Claude Code signs
+// magpie in as it is; the callback is still listened for on 127.0.0.1
+// alone, as Claude Code does. Without a CallbackPort the port is any free
+// one, which a loopback callback URL registered without one takes
+// (GitHub's, RFC 8252).
+type App struct {
+	ClientID     string
+	ClientSecret string
+	CallbackPort int
+}
+
 // Start begins signing magpie in to the server called name at serverURL:
 // open the State's URL in a browser and the rest happens on its own;
 // StatusOf follows it.
 func Start(ctx context.Context, name, serverURL string) (State, error) {
+	return StartWith(ctx, name, serverURL, nil)
+}
+
+// StartWith is Start as app when there is one, which magpie then doesn't
+// register in its place.
+func StartWith(ctx context.Context, name, serverURL string, app *App) (State, error) {
 	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	m, err := discover(ctx, serverURL)
 	if err != nil {
 		return State{}, err
 	}
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	port := 0
+	if app != nil {
+		port = app.CallbackPort
+	}
+	ln, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
+		if port != 0 {
+			return State{}, fmt.Errorf("the OAuth app's callback port %d is in use by another program: %w", port, err)
+		}
 		return State{}, err
 	}
-	redirect := fmt.Sprintf("http://127.0.0.1:%d/callback", ln.Addr().(*net.TCPAddr).Port)
-	id, secret, method, err := register(ctx, m, redirect)
-	if err != nil {
+	// magpie's own registration names 127.0.0.1, as RFC 8252 asks; an
+	// app of the user's own is called back as Claude Code calls it back,
+	// at localhost (its v2.1.231 went back to localhost because servers
+	// that match the registered URL exactly refused 127.0.0.1).
+	host := "127.0.0.1"
+	if app != nil {
+		host = "localhost"
+	}
+	redirect := fmt.Sprintf("http://%s:%d/callback", host, ln.Addr().(*net.TCPAddr).Port)
+	var id, secret, method string
+	if app != nil {
+		id, secret, method = app.ClientID, app.ClientSecret, appMethod(m, app.ClientSecret)
+	} else if id, secret, method, err = register(ctx, m, redirect); err != nil {
 		ln.Close()
 		return State{}, err
 	}

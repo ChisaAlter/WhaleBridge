@@ -74,6 +74,8 @@ func (s *Server) serveCommandCode(w http.ResponseWriter, r *http.Request, from p
 	if err != nil {
 		return writeError(w, from, 400, err.Error()), err.Error()
 	}
+	// the vendor's own API is told the answer's format in words
+	req = req.inSystem()
 	req.Model = model
 	if req.Effort != "" && !req.ThinkOff {
 		req.Effort = fitEffort(req.Effort, p.Efforts(model))
@@ -217,9 +219,12 @@ func cmdPlatform() string {
 	return runtime.GOOS
 }
 
-// cmdRequest is req as the CLI asks /alpha/generate. There is no project
-// behind a request through magpie: the config is the CLI's outside a git
-// repository (buildServerConfig), in the user's home.
+// cmdRequest is req as the CLI asks /alpha/generate, with no structure,
+// branch or status behind it (buildServerConfig). The working directory and
+// whether it is a git repository are the agent's, as its request says them
+// (workPlace), else as this computer's disk says (magpie-community/plugins
+// #86); a request that names no folder is the CLI's outside a git
+// repository, in the user's home.
 func cmdRequest(req *Request, model string) []byte {
 	tools := []cmdTool{}
 	for _, t := range req.Tools {
@@ -244,11 +249,16 @@ func cmdRequest(req *Request, model string) []byte {
 	if req.Effort != "" && !req.ThinkOff {
 		params["reasoning_effort"] = req.Effort
 	}
-	home, _ := os.UserHomeDir()
+	dir, git := workPlace(req)
+	if dir == "" {
+		dir, _ = os.UserHomeDir()
+	} else if git == "" {
+		git = provider.GitOnDisk(dir)
+	}
 	b, _ := json.Marshal(map[string]any{
 		"config": map[string]any{
-			"workingDir": home, "date": time.Now().Format("2006-01-02"), "environment": cmdPlatform(),
-			"structure": []string{}, "isGitRepo": false, "currentBranch": "", "mainBranch": "", "gitStatus": "",
+			"workingDir": dir, "date": time.Now().Format("2006-01-02"), "environment": cmdPlatform(),
+			"structure": []string{}, "isGitRepo": git == "yes", "currentBranch": "", "mainBranch": "", "gitStatus": "",
 			"recentCommits": []string{},
 		},
 		"memory": nil, "taste": nil, "skills": nil,

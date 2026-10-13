@@ -10,6 +10,9 @@ import (
 
 // stage is an explicit offline write, separate from confirmed runtime apply.
 func (c *asideConnection) stage(key, value string) error {
+	if key == "account" {
+		return c.pickAccount(value)
+	}
 	asideMu.Lock()
 	defer asideMu.Unlock()
 	if key == "effort" || value == "" {

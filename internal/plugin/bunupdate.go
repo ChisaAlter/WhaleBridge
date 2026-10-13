@@ -42,7 +42,20 @@ type bunState struct {
 	Checked time.Time `json:"checked,omitzero"`
 }
 
-func bunRoot() string { return filepath.Join(filepath.Dir(catalog.CachePath()), "bun") }
+// bunRoot is where magpie keeps its Buns and their state.json. A musl
+// Linux keeps them under bun/musl: one version is a different build there,
+// so a machine whose C library changed under it (a container's image
+// moved from Debian to Alpine, or back) never runs the other one's build,
+// nor takes its state, whose Bad may list versions only the wrong build
+// failed (#1877). Everywhere else they stay in bun itself, where a Bun
+// downloaded before is.
+func bunRoot() string {
+	root := filepath.Join(filepath.Dir(catalog.CachePath()), "bun")
+	if t, err := bunTarget(); err == nil && strings.Contains(t, "-musl") {
+		root = filepath.Join(root, "musl")
+	}
+	return root
+}
 
 func bunDirOf(v string) string { return filepath.Join(bunRoot(), v) }
 
@@ -132,7 +145,7 @@ func bunReported(exe string) string {
 
 // bunLatest is Bun's newest release and when it was published (tests stub it).
 var bunLatest = func(ctx context.Context) (string, time.Time, error) {
-	b, err := getURL(ctx, "https://api.github.com/repos/oven-sh/bun/releases/latest", 4<<20)
+	b, err := getURL(ctx, githubAPI+"/repos/oven-sh/bun/releases/latest", 4<<20)
 	if err != nil {
 		return "", time.Time{}, err
 	}

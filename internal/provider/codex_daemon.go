@@ -138,16 +138,6 @@ func findCodexDaemon(ps []proc.Process, home string) int {
 	return ids[0]
 }
 
-// codexDaemon is the process id of Codex's managed app-server, 0 when none
-// runs; known is false when the processes couldn't be listed.
-func codexDaemon(ctx context.Context) (pid int, known bool) {
-	ps, err := listProcesses(ctx)
-	if err != nil {
-		return 0, false
-	}
-	return findCodexDaemon(ps, codexHome()), true
-}
-
 // codexDaemonLeft is the app-server that was running when Codex's account
 // last changed, and the account it was started on: it stays on that one
 // until it restarts.
@@ -160,6 +150,13 @@ var (
 	codexDaemonMu      sync.Mutex
 	codexDaemonLeft    leftDaemon
 	codexDaemonChecked time.Time
+	// codexAppLeft is the Codex desktop app's own app-server (ChatGPT.app's
+	// CodexCLI.app) that was running when Codex's account changed: it
+	// keeps the account it started on until the app is quit and opened
+	// again (codex-rs AuthManager reloads auth.json only for the same
+	// account), so the app goes on reading that account's limits, and
+	// stops sending in every thread once those are spent.
+	codexAppLeft leftDaemon
 )
 
 // codexDaemonRecheck is how long CodexDaemonStale trusts what it last saw.
@@ -170,21 +167,31 @@ const codexDaemonRecheck = 5 * time.Second
 func noteCodexSwitch(from, to string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	pid, known := codexDaemon(ctx)
+	ps, err := listProcesses(ctx)
+	known := err == nil
 	codexDaemonMu.Lock()
 	defer codexDaemonMu.Unlock()
 	codexDaemonChecked = time.Now()
+	if !known {
+		return
+	}
+	noteLeft(&codexDaemonLeft, findCodexDaemon(ps, codexHome()), from, to)
+	noteLeft(&codexAppLeft, findCodexApp(ps), from, to)
+}
+
+// noteLeft updates what is known of the app-server pid, running as Codex's
+// account changes from one to another.
+func noteLeft(left *leftDaemon, pid int, from, to string) {
 	switch {
-	case !known:
 	case pid == 0:
-		codexDaemonLeft = leftDaemon{}
-	case pid == codexDaemonLeft.pid:
-		// the daemon is on the account it started with, whatever came between
-		if strings.EqualFold(to, codexDaemonLeft.user) {
-			codexDaemonLeft = leftDaemon{}
+		*left = leftDaemon{}
+	case pid == left.pid:
+		// it is on the account it started with, whatever came between
+		if strings.EqualFold(to, left.user) {
+			*left = leftDaemon{}
 		}
 	default:
-		codexDaemonLeft = leftDaemon{pid, from}
+		*left = leftDaemon{pid, from}
 	}
 }
 
@@ -194,20 +201,43 @@ func noteCodexSwitch(from, to string) {
 func CodexDaemonStale() string {
 	codexDaemonMu.Lock()
 	defer codexDaemonMu.Unlock()
-	if codexDaemonLeft.pid == 0 {
-		return ""
-	}
-	if time.Since(codexDaemonChecked) > codexDaemonRecheck {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		pid, known := codexDaemon(ctx)
-		cancel()
-		codexDaemonChecked = time.Now()
-		if known && pid != codexDaemonLeft.pid {
-			// restarted, or stopped, since: it reads the sign-in afresh
-			codexDaemonLeft = leftDaemon{}
-		}
-	}
+	recheckLeft()
 	return codexDaemonLeft.user
+}
+
+// CodexAppStale answers the account the Codex desktop app is still signed
+// in to when Codex has been switched to another since the app opened, ""
+// when it isn't open or is on the account Codex is. The app shows that
+// account's limits, and once they are spent won't send in any thread,
+// until it is quit and opened again.
+func CodexAppStale() string {
+	codexDaemonMu.Lock()
+	defer codexDaemonMu.Unlock()
+	recheckLeft()
+	return codexAppLeft.user
+}
+
+// recheckLeft forgets an app-server left on an account before that has
+// restarted, or stopped, since: a new one reads the sign-in afresh. What
+// was known stays when the processes can't be listed. codexDaemonMu is
+// held.
+func recheckLeft() {
+	if codexDaemonLeft.pid == 0 && codexAppLeft.pid == 0 || time.Since(codexDaemonChecked) <= codexDaemonRecheck {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	ps, err := listProcesses(ctx)
+	cancel()
+	codexDaemonChecked = time.Now()
+	if err != nil {
+		return
+	}
+	if findCodexDaemon(ps, codexHome()) != codexDaemonLeft.pid {
+		codexDaemonLeft = leftDaemon{}
+	}
+	if findCodexApp(ps) != codexAppLeft.pid {
+		codexAppLeft = leftDaemon{}
+	}
 }
 
 // DismissCodexDaemon stops saying the app-server is on another account.
@@ -217,12 +247,61 @@ func DismissCodexDaemon() {
 	codexDaemonLeft = leftDaemon{}
 }
 
+// DismissCodexApp stops saying the Codex app is on another account.
+func DismissCodexApp() {
+	codexDaemonMu.Lock()
+	defer codexDaemonMu.Unlock()
+	codexAppLeft = leftDaemon{}
+}
+
+// findCodexApp picks, among the running processes, the app-server the
+// Codex desktop app runs for itself: 0 when it isn't open. On macOS that
+// is ChatGPT.app's (or Codex.app's) bundled codex, `…/CodexCLI.app/
+// Contents/MacOS/codex [-c k=v…] app-server --analytics-default-enabled …`;
+// on Windows the Store app's `…\WindowsApps\OpenAI.Codex_…\codex.exe
+// app-server`. Not the managed daemon, nor an app-server's helpers or
+// proxy, nor an editor's codex.
+func findCodexApp(ps []proc.Process) int {
+	for _, p := range ps {
+		if isManagedDaemon(p.Args) {
+			continue
+		}
+		// the program's own path: ps leaves a path's spaces unquoted, so
+		// "…/Codex Computer Use.app/Contents/MacOS/…" reads as one named Codex
+		exe, rest := splitExe(p.Args)
+		if !strings.Contains(exe, ".app/Contents/") && !strings.Contains(exe, `\WindowsApps\OpenAI.`) {
+			continue
+		}
+		if base := strings.ToLower(exe[strings.LastIndexAny(exe, `/\`)+1:]); base != "codex" && base != "codex.exe" {
+			continue
+		}
+		f := strings.Fields(rest)
+		i := slices.Index(f, "app-server")
+		if i < 0 || i+1 < len(f) && !strings.HasPrefix(f[i+1], "-") {
+			continue
+		}
+		return p.PID
+	}
+	return 0
+}
+
 // RestartCodexDaemon has Codex restart its app-server, which reads the
 // sign-in again: `codex app-server daemon restart`, run with the codex CLI
-// magpie finds and the Codex home it signs Codex in through. The Codex
-// sessions attached to it are ended.
+// magpie finds and the Codex home it signs Codex in through. Codex 0.162's
+// sessions attached to it reconnect to the new one, a turn running is let
+// finish first (for up to a minute); an older Codex's are ended.
 func RestartCodexDaemon(ctx context.Context) error {
-	cmd, err := codexDaemonCommand(ctx, "restart")
+	codexRestarting.Lock()
+	defer codexRestarting.Unlock()
+	if err := restartCodexDaemon(ctx, codexHome()); err != nil {
+		return err
+	}
+	DismissCodexDaemon()
+	return nil
+}
+
+func restartCodexDaemon(ctx context.Context, home string) error {
+	cmd, err := codexDaemonCommand(ctx, home, "restart")
 	if err != nil {
 		return err
 	}
@@ -232,21 +311,163 @@ func RestartCodexDaemon(ctx context.Context) error {
 		}
 		return errors.New("codex app-server daemon restart: " + err.Error())
 	}
-	DismissCodexDaemon()
 	return nil
 }
 
 // codexDaemonCommand is `codex app-server daemon <verb>`, with CODEX_HOME
 // set to the home magpie switches, and nothing to read on stdin (Codex
 // waits on a stdin left open).
-func codexDaemonCommand(ctx context.Context, verb string) (*exec.Cmd, error) {
+func codexDaemonCommand(ctx context.Context, home, verb string) (*exec.Cmd, error) {
 	exe := codexExecutable()
 	if exe == "" {
 		return nil, errors.New("the codex CLI isn't installed, or magpie can't find it")
 	}
 	cmd := proc.CommandContext(ctx, exe, "app-server", "daemon", verb)
 	env := slices.DeleteFunc(os.Environ(), func(kv string) bool { return strings.HasPrefix(kv, "CODEX_HOME=") })
-	cmd.Env = append(env, "CODEX_HOME="+codexHome())
+	cmd.Env = append(env, "CODEX_HOME="+home)
 	cmd.Stdin = nil // os/exec reads it from the null device
 	return cmd, nil
 }
+
+// The daemon also builds Codex's model list once, as it starts, from
+// config.toml and the catalog it names (codex-rs app-server's models
+// manager): a codex session started after magpie wires Codex in, or takes
+// it out, attaches to the daemon left running and shows the list from
+// before — Codex's own models, or magpie's — until it restarts (luci on
+// Discord, Codex 0.162). It runs per CODEX_HOME, not per terminal, and
+// has no idle exit. Restarting it with no codex session attached ends
+// nothing, so magpie does that itself (KeepCodexDaemonCurrent); with one
+// attached, the Agents page offers it.
+
+// A CodexDaemonCheck is what KeepCodexDaemonCurrent found and did.
+type CodexDaemonCheck struct {
+	// Behind: a daemon runs that started before what it reads changed
+	Behind bool
+	// Since is when that daemon started
+	Since time.Time
+	// Attached is how many codex sessions may be on it, which magpie
+	// doesn't restart it under
+	Attached int
+	// Restarted: magpie restarted it, and new sessions get the new list
+	Restarted bool
+	Err       error
+}
+
+// codexRestarting keeps one restart of the daemon at a time.
+var codexRestarting sync.Mutex
+
+// KeepCodexDaemonCurrent restarts the managed app-server of the Codex home
+// home when it started before changed (when magpie last changed what Codex
+// reads at start) and no codex session is attached to it. One that can't
+// be found or timed, or a restart already under way, is left as it is.
+func KeepCodexDaemonCurrent(ctx context.Context, home string, changed time.Time) CodexDaemonCheck {
+	var c CodexDaemonCheck
+	if changed.IsZero() {
+		return c
+	}
+	ps, err := listProcesses(ctx)
+	if err != nil {
+		return c
+	}
+	pid := findCodexDaemon(ps, home)
+	if pid == 0 {
+		return c
+	}
+	since, ok := daemonStarted(home, pid)
+	// a second's slack: the pid file and the config are written by
+	// different programs, whose clocks round differently
+	if !ok || !since.Before(changed.Add(-time.Second)) {
+		return c
+	}
+	c.Behind, c.Since, c.Attached = true, since, codexClients(ps, home)
+	if c.Attached > 0 || !codexRestarting.TryLock() {
+		return c
+	}
+	defer codexRestarting.Unlock()
+	if c.Err = restartCodexDaemon(ctx, home); c.Err == nil {
+		c.Restarted = true
+	}
+	return c
+}
+
+// daemonStarted is when the daemon pid started: the time Codex wrote its
+// pid file, which it does once, as the daemon comes up, on every OS. ok is
+// false when no pid file of home's names pid.
+func daemonStarted(home string, pid int) (time.Time, bool) {
+	for _, name := range []string{"app-server.pid", "daemon.pid"} {
+		p := filepath.Join(home, "app-server-daemon", name)
+		b, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		if id, ok := parsePIDFile(b); !ok || id != pid {
+			continue
+		}
+		if st, err := os.Stat(p); err == nil {
+			return st.ModTime(), true
+		}
+	}
+	return time.Time{}, false
+}
+
+// codexClients counts the codex sessions that may be attached to home's
+// daemon: codex run in a terminal (its TUI, exec, resume, an app-server
+// proxy); not the daemon, its helpers and the commands that drive it, nor
+// an app's or an editor's codex, which serve themselves. One started for
+// another CODEX_HOME is left out where that can be read.
+func codexClients(ps []proc.Process, home string) int {
+	n := 0
+	for _, p := range ps {
+		if !isCodexClient(p.Args) {
+			continue
+		}
+		if h, ok := processCodexHome(p.PID); ok && h != "" && filepath.Clean(h) != filepath.Clean(home) {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// isCodexClient reports whether a command line is a codex session that
+// may attach to the daemon.
+func isCodexClient(args string) bool {
+	exe, rest := splitExe(args)
+	base := strings.ToLower(exe[strings.LastIndexAny(exe, `/\`)+1:])
+	if base != "codex" && base != "codex.exe" {
+		return false
+	}
+	// an app's (ChatGPT.app's CodexCLI.app) or an editor extension's; ps
+	// leaves a path's spaces unquoted, so "…/Codex Computer Use.app/
+	// Contents/MacOS/…" reads as a program named Codex: the whole line
+	// is looked at
+	if strings.Contains(args, ".app/Contents/") || strings.Contains(exe, "/extensions/") || strings.Contains(exe, `\extensions\`) {
+		return false
+	}
+	f := strings.Fields(rest)
+	if slices.Contains(f, "exec-server") || slices.Contains(f, "mcp-server") {
+		return false
+	}
+	if i := slices.Index(f, "app-server"); i >= 0 {
+		// the daemon, its helpers, `daemon restart` and other apps'
+		// app-servers serve; a proxy is a client of the daemon
+		return i+1 < len(f) && f[i+1] == "proxy"
+	}
+	return true
+}
+
+// splitExe parts a command line into the program and its arguments, the
+// program quoted as Windows lists it (`"C:\Program Files\…\codex.exe" …`).
+func splitExe(args string) (exe, rest string) {
+	args = strings.TrimSpace(args)
+	if q, ok := strings.CutPrefix(args, `"`); ok {
+		if exe, rest, ok = strings.Cut(q, `"`); ok {
+			return exe, rest
+		}
+	}
+	exe, rest, _ = strings.Cut(args, " ")
+	return exe, rest
+}
+
+// CodexHome is the Codex home magpie wires and signs Codex in through.
+func CodexHome() string { return codexHome() }

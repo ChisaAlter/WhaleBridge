@@ -17,32 +17,47 @@ import (
 // 请求看是否返回200): each of the three magpie speaks upstream — Chat
 // Completions, Responses and Anthropic Messages — is sent the smallest
 // request Test sends, at that URL as the API takes it, and what answered
-// is what the provider can be given. Gemini's isn't among them: magpie
-// serves it to clients but never asks a vendor on it, so a URL for it
-// would be one the provider has nowhere to keep.
+// is what the provider can be given. Since a custom provider can keep a
+// Gemini API's URL (#1346), Gemini's generateContent is asked too, at the
+// …/v1beta a relay serves it under (NagaseMinato: 「检测」不会探测 Gemini
+// 端点，为什么呢？).
+
+// detectProtocols are the APIs a detection asks, in the order it says
+// what they answered: magpie's three, then Gemini's.
+var detectProtocols = []Protocol{Chat, Responses, Anthropic, Gemini}
 
 // Detection is what one API answered at the URL it was asked at.
 type Detection struct {
 	Result
 	// Base is the URL the provider keeps for it, as the editor's fields
-	// take it: …/v1 for OpenAI's two, the root for Anthropic's.
+	// take it: …/v1 for OpenAI's two, the root for Anthropic's, …/v1beta
+	// for Gemini's.
 	Base string `json:"base"`
 }
 
 // DetectBase is base as proto takes it: an endpoint pasted whole (…/v1/chat/
-// completions) cut to its base, then the root for Anthropic, which adds
-// /v1/messages itself, and …/v1 for OpenAI's two when base is a bare host —
+// completions, …/models/gemini-2.5-pro:generateContent) cut to its base, then the root for Anthropic, which adds
+// /v1/messages itself, …/v1 for OpenAI's two when base is a bare host, and
+// for Gemini's the …/v1beta beside a …/v1 or on a bare host (GeminiBase) —
 // the editor's respellURL, in Go.
 func DetectBase(base string, proto Protocol) string {
 	u := strings.TrimRight(strings.TrimSpace(base), "/")
 	for _, end := range []string{"/chat/completions", "/responses", "/v1/messages", "/messages"} {
 		u = strings.TrimSuffix(u, end)
 	}
+	// a Gemini endpoint or a model list pasted whole
+	u = strings.TrimRight(geminiMethod.ReplaceAllString(u, ""), "/")
 	if u == "" {
 		return ""
 	}
-	if proto == Anthropic {
+	switch proto {
+	case Anthropic:
 		return strings.TrimSuffix(u, "/v1")
+	case Gemini:
+		if pu, err := url.Parse(u); err == nil && pu.Host != "" && strings.Trim(pu.Path, "/") == "v1" {
+			return u + "beta"
+		}
+		return GeminiBase(u)
 	}
 	if pu, err := url.Parse(u); err == nil && strings.Trim(pu.Path, "/") == "" {
 		return u + "/v1"
@@ -53,15 +68,17 @@ func DetectBase(base string, proto Protocol) string {
 // ErrNoURL is a detection with no URL to ask at.
 var ErrNoURL = errors.New("type the base URL first")
 
-// Detect asks each of Chat, Responses and Anthropic at the URL p has for
+// Detect asks each of Chat, Responses, Anthropic and Gemini at the URL p has for
 // it, else at base as it takes it (DetectBase), the smallest request, and
 // says what each answered, in that order. model is asked on all three;
-// with none, one from p's list is picked for each — a Claude model on
-// Anthropic's, an OpenAI one on Responses — and with no list, the vendor
-// is asked for one first (a GET of its models, which costs nothing).
-// Only those URLs are asked, and only a key's provider: a sign-in's API
-// is its agent's.
-func (p Provider) Detect(ctx context.Context, base, model string) ([]Detection, error) {
+// with none, one is picked for each — a Claude model on Anthropic's, an
+// OpenAI one on Responses — from picked, the models the editor's form has
+// and hasn't saved yet (#1545: a relay with no model list is asked for
+// the models typed in the form, not only after a Save), else from p's
+// list, and with no list the vendor is asked for one first (a GET of its
+// models, which costs nothing). Only those URLs are asked, and only a
+// key's provider: a sign-in's API is its agent's.
+func (p Provider) Detect(ctx context.Context, base, model string, picked ...string) ([]Detection, error) {
 	q, err := p.detecting(base)
 	if err != nil {
 		return nil, err
@@ -70,11 +87,18 @@ func (p Provider) Detect(ctx context.Context, base, model string) ([]Detection, 
 	model = strings.TrimSpace(model)
 	var ids []string
 	if model == "" {
-		ids = q.detectModels(ctx)
+		for _, m := range picked {
+			if m = strings.TrimSpace(m); m != "" && !slices.Contains(ids, m) {
+				ids = append(ids, m)
+			}
+		}
+		if len(ids) == 0 {
+			ids = q.detectModels(ctx)
+		}
 	}
-	out := make([]Detection, len(Protocols))
+	out := make([]Detection, len(detectProtocols))
 	var wg sync.WaitGroup
-	for i, proto := range Protocols {
+	for i, proto := range detectProtocols {
 		m := model
 		if m == "" {
 			m = detectModel(ids, proto)
@@ -101,7 +125,7 @@ func (p Provider) detecting(base string) (Provider, error) {
 		return p, errors.New("a sign-in is asked on its agent's own API; there is nothing to detect")
 	}
 	q := p
-	for _, proto := range Protocols {
+	for _, proto := range detectProtocols {
 		u := strings.TrimSpace(p.Base(proto))
 		if u == "" {
 			u = DetectBase(base, proto)
@@ -118,6 +142,8 @@ func (p Provider) detecting(base string) (Provider, error) {
 			q.Responses = u
 		case Anthropic:
 			q.Anthropic = u
+		case Gemini:
+			q.Gemini = u
 		}
 	}
 	if len(q.Speaks()) == 0 {
@@ -145,7 +171,7 @@ func (q Provider) detectOne(proto Protocol, m string, wait time.Duration) (Detec
 	}
 	return d, func(ctx context.Context) Result {
 		u, body := tiny(k, proto, UpstreamName(q, m))
-		return probe(ctx, k, proto, u, k.Prepare([]byte(body)), m, wait)
+		return probe(ctx, k, proto, u, k.tested(body), m, wait)
 	}
 }
 
@@ -197,8 +223,8 @@ const (
 )
 
 // DetectModels asks each of models (the first DetectMax, an image model
-// left out: it is asked on the images API) on each of Chat, Responses and
-// Anthropic at the URL p has for it, else at base as it takes it, and
+// left out: it is asked on the images API) on each of Chat, Responses,
+// Anthropic and Gemini at the URL p has for it, else at base as it takes it, and
 // says what each answered, model by model; and, by API, the first answer
 // from a model it served, else the first model's — what Detect says for
 // one. A probe not started before ctx ends says so, unasked.
@@ -224,8 +250,8 @@ func (p Provider) DetectModels(ctx context.Context, base string, models []string
 	sem := make(chan struct{}, DetectWide)
 	var wg sync.WaitGroup
 	for i, m := range ids {
-		out[i] = ModelDetection{Model: m, Results: make([]Detection, len(Protocols))}
-		for j, proto := range Protocols {
+		out[i] = ModelDetection{Model: m, Results: make([]Detection, len(detectProtocols))}
+		for j, proto := range detectProtocols {
 			d, ask := q.detectOne(proto, m, detectWait)
 			if ask != nil && catalog.ImagesAPI(m) {
 				d.Error, ask = "an image model: asked on the images API, not here", nil
@@ -253,8 +279,8 @@ func (p Provider) DetectModels(ctx context.Context, base string, models []string
 		}
 	}
 	wg.Wait()
-	sum := make([]Detection, len(Protocols))
-	for j := range Protocols {
+	sum := make([]Detection, len(detectProtocols))
+	for j := range detectProtocols {
 		sum[j] = out[0].Results[j]
 		for _, md := range out {
 			if md.Results[j].OK {
@@ -282,19 +308,19 @@ func (p Provider) detectModels(ctx context.Context) []string {
 	if len(ids) > 0 {
 		return ids
 	}
-	ms, _, err := p.fetchOne(ctx)
+	l, err := p.fetchOne(ctx)
 	if err != nil {
 		return nil
 	}
-	for _, m := range ms {
+	for _, m := range l.models {
 		ids = append(ids, m.ID)
 	}
 	return ids
 }
 
 // detectModel is the model of ids to ask proto for: one made for it — a
-// Claude model on Anthropic's, an OpenAI one on Responses, any other on
-// Chat — else the first that chats.
+// Claude model on Anthropic's, an OpenAI one on Responses, a Gemini one on
+// Gemini's, any other on Chat — else the first that chats.
 func detectModel(ids []string, proto Protocol) string {
 	made := func(id string) bool {
 		switch proto {
@@ -302,6 +328,8 @@ func detectModel(ids []string, proto Protocol) string {
 			return isClaude(id)
 		case Responses:
 			return openAIModel(id)
+		case Gemini:
+			return strings.Contains(strings.ToLower(id), "gemini")
 		}
 		return !isClaude(id)
 	}

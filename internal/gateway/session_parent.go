@@ -11,6 +11,16 @@ func isTitleKind(kind string) bool {
 	return kind == "thread_title" || kind == "thread_title_reconsideration" || kind == "title_generation"
 }
 
+func isDescriptionKind(kind string) bool {
+	return kind == "thread_description"
+}
+
+// isPredictionKind: the Codex app's guess at the user's next message,
+// shown in its composer (composer_predictions, #1970)
+func isPredictionKind(kind string) bool {
+	return kind == "composer_predictions"
+}
+
 // Codex projects turn metadata into headers, but its canonical transport is
 // client_metadata in the Responses body. Read only identity fields; never keep
 // prompts or the rest of the metadata in the trace.

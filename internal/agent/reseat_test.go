@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
@@ -24,7 +25,7 @@ func reseatHome(t *testing.T) string {
 		}
 	}
 	os.MkdirAll(filepath.Join(home, ".claude"), 0o755)
-	os.MkdirAll(filepath.Join(home, ".hermes"), 0o755)
+	os.MkdirAll(appdir.HermesHomeIn(home), 0o755)
 	return home
 }
 
@@ -172,7 +173,7 @@ func TestReseatUnmovable(t *testing.T) {
 	c, h := mustFind(t, "claude"), mustFind(t, "hermes")
 	mustApply(t, c, "model", "cop/only-here")
 	mustApply(t, h, "model", "magpie/cop/only-here")
-	dir := filepath.Join(home, ".hermes")
+	dir := appdir.HermesHomeIn(home)
 	if err := os.Chmod(dir, 0o555); err != nil {
 		t.Fatal(err)
 	}

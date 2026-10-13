@@ -18,9 +18,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/proc"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 	"golang.org/x/text/unicode/norm"
 )
 
@@ -45,6 +47,9 @@ func claudeDirService(dir string) string {
 // readClaudeDir is the sign-in Claude Code keeps in config directory dir,
 // where it looks first: the keychain on a Mac, then the file.
 func readClaudeDir(dir string) (claudeCredentials, bool) {
+	if settings.AccountDiscoveryOff() {
+		return claudeCredentials{}, false
+	}
 	if claudeKeychain {
 		out, err := proc.Command("security", "find-generic-password", "-s", claudeDirService(dir), "-a", claudeKeychainAccount(), "-w").Output()
 		if err == nil {
@@ -56,7 +61,7 @@ func readClaudeDir(dir string) (claudeCredentials, bool) {
 			}
 		}
 	}
-	b, err := os.ReadFile(filepath.Join(dir, ".credentials.json"))
+	b, err := readAccountFile(filepath.Join(dir, ".credentials.json"))
 	if err != nil {
 		return claudeCredentials{}, false
 	}
@@ -66,6 +71,9 @@ func readClaudeDir(dir string) (claudeCredentials, bool) {
 // clearClaudeDir takes the sign-in out of config directory dir, so the one
 // it was moved to is its only holder.
 func clearClaudeDir(dir string) {
+	if discoveryOff() {
+		return
+	}
 	if claudeKeychain {
 		_ = proc.Command("security", "delete-generic-password", "-s", claudeDirService(dir), "-a", claudeKeychainAccount()).Run()
 	}
@@ -91,6 +99,81 @@ func forgetClaudeDir(user string) {
 	dir := claudeAccountDir(user)
 	clearClaudeDir(dir)
 	_ = os.RemoveAll(dir)
+}
+
+// claudeDirRuns are the runs magpie waits on in a saved Claude account's
+// config directory (inSavedClaudeDir), by account: its /usage, a warm-up.
+// Claude Code may refresh the sign-in it keeps there as it runs, spending
+// the refresh token, so the account isn't handed over to Claude Code
+// itself (switchSavedLogin) until they end: Claude Code's own copy would
+// be the spent one. Two Claude Codes in one directory don't both refresh
+// it: Claude Code takes a lock in its config directory to refresh, and
+// reads the sign-in again once it has it.
+var claudeDirRuns struct {
+	sync.Mutex
+	m map[string]*sync.RWMutex
+}
+
+func claudeDirRun(user string) *sync.RWMutex {
+	key := strings.ToLower(strings.TrimSpace(user))
+	claudeDirRuns.Lock()
+	defer claudeDirRuns.Unlock()
+	if claudeDirRuns.m == nil {
+		claudeDirRuns.m = map[string]*sync.RWMutex{}
+	}
+	mu := claudeDirRuns.m[key]
+	if mu == nil {
+		mu = &sync.RWMutex{}
+		claudeDirRuns.m[key] = mu
+	}
+	return mu
+}
+
+// inSavedClaudeDir runs f with the config directory of the saved Claude
+// account user (claudeSavedDir), and keeps what Claude Code made of the
+// sign-in there in logins.json once it is done: a refreshed one is the
+// account's now, the one it replaced spent.
+func inSavedClaudeDir(user string, f func(dir string) error) error {
+	mu := claudeDirRun(user)
+	mu.RLock()
+	defer mu.RUnlock()
+	dir, err := claudeSavedDir(user)
+	if err != nil {
+		return err
+	}
+	defer syncSavedClaude(user)
+	return f(dir)
+}
+
+// syncSavedClaude brings the saved Claude account user in logins.json up
+// to what Claude Code keeps in its config directory, making nothing there.
+func syncSavedClaude(user string) {
+	savedTokenMu.Lock()
+	defer savedTokenMu.Unlock()
+	loginsMu.Lock()
+	defer loginsMu.Unlock()
+	ls := readLogins()
+	for i := range ls {
+		if ls[i].Agent == "claude" && strings.EqualFold(ls[i].User, user) {
+			if _, changed, err := syncClaudeDir(&ls[i]); err == nil && changed {
+				_ = writeLogins(ls)
+			}
+			return
+		}
+	}
+}
+
+// readSavedClaudeUsage is the allowance of the saved Claude account user:
+// Claude Code's /usage run in the account's own config directory, through
+// the account's own proxy. Claude Code's own sign-in isn't touched.
+func readSavedClaudeUsage(ctx context.Context, user string) ([]QuotaWindow, error) {
+	ws := []QuotaWindow{}
+	err := inSavedClaudeDir(user, func(dir string) error {
+		var err error
+		ws, err = readClaudeUsage(ViaLogin(ctx, "claude", user), dir)
+		return err
+	})
+	return ws, err
 }
 
 // claudeSavedDir is the config directory to run Claude Code in for the
@@ -303,19 +386,28 @@ func (a *Account) AgentsOwn() bool { return a != nil && a.token == nil }
 // ClaudeCodeMovedOff says Claude Code itself is signed in to another
 // account than user now: what a Claude Code run in its own home says of
 // the account it is on is no longer user's. false when it can't be told.
+// A profile names the whole account: a Team seat and a personal plan of
+// one email are different accounts with different usage.
 func ClaudeCodeMovedOff(user string) bool {
-	on := claudeCodeOn()
-	return on != "" && !sameClaudeUser(on, user)
+	on, named := claudeCodeOn()
+	if on == "" {
+		return false
+	}
+	if named {
+		return !strings.EqualFold(strings.TrimSpace(on), strings.TrimSpace(user))
+	}
+	return !sameClaudeUser(on, user)
 }
 
 // claudeCodeOn is the account Claude Code itself is signed in to now, as
-// magpie names it; "" when signed out or unknown.
-func claudeCodeOn() string {
+// magpie names it; "" when signed out or unknown. named means the name
+// came from its profile rather than the email alone from auth status.
+func claudeCodeOn() (user string, named bool) {
 	l, ok := liveLogin("claude")
 	if !ok {
-		return ""
+		return "", false
 	}
-	return l.User
+	return l.User, len(l.Profile) > 0
 }
 
 // sameClaudeUser: a and b name one account, the one as magpie names a Team

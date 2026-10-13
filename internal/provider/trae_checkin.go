@@ -15,6 +15,12 @@ package provider
 // got none is tried again later. Trae counts a check-in by device as well
 // as by account (9095: this device is in for today); that is an answer
 // for the day, and magpie doesn't send another device id to get round it.
+// Nor does a claim answered 9074 (当前参与用户太多，请稍后再试) get another
+// try that day: Trae pays out only to a device its own app registered
+// through its device-register service and security SDK, which the
+// plugin's device id isn't, so no retry ever succeeded (#808, ~5 days),
+// and claim after claim from an unknown device may read as abuse. The
+// account is told to check in in the Trae CN app.
 
 import (
 	"context"
@@ -42,7 +48,7 @@ var traeCheckinURL = "https://api.trae.cn/trae/api/v2/ug/checkin_credits"
 // Trae CN's check-in answers, the codes it refuses with.
 const (
 	traeSignedOut     = 1001 // the token isn't taken
-	traeRateLimited   = 9074 // asked too often; tried again later
+	traeOwnAppOnly    = 9074 // a claim from a device Trae's app didn't register; final for the day
 	traeDeviceChecked = 9095 // this device is in for today
 )
 
@@ -106,6 +112,11 @@ func traeCheckin(ctx context.Context, a traeAccount) WorkBuddyCheckin {
 	if err := traeCall(ctx, a, "/claim", &got); err != nil {
 		return wbCheckinFailed(err)
 	}
+	if got.Code == traeOwnAppOnly {
+		// status said on and not in, so the claim itself is refused:
+		// Trae pays only its own app, and asking again won't change it
+		return WorkBuddyCheckin{Outcome: CheckinOwnApp, Msg: orStr(got.Message, "Trae CN gives check-in credits only to its own app")}
+	}
 	if got.Code != 0 {
 		return traeRefused(got.Code, got.Message)
 	}
@@ -124,7 +135,8 @@ func traeRefused(code int, msg string) WorkBuddyCheckin {
 		return WorkBuddyCheckin{Outcome: CheckinIneligible, Msg: orStr(msg, "this device has checked in today")}
 	case traeSignedOut:
 		return WorkBuddyCheckin{Outcome: CheckinFailed, Msg: "Trae CN's sign-in has expired — sign in again"}
-	case traeRateLimited:
+	case traeOwnAppOnly:
+		// on /status, before any claim: tried again later as before
 		return WorkBuddyCheckin{Outcome: CheckinFailed, Msg: orStr(msg, "asked too often")}
 	}
 	return WorkBuddyCheckin{Outcome: CheckinFailed, Msg: fmt.Sprintf("code %d: %s", code, msg)}

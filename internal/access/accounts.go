@@ -81,3 +81,33 @@ func (who Identity) AllowsAccount(pid, ref string) bool {
 	}
 	return !named
 }
+
+// ReplaceAccount moves every key's account list from one of provider
+// pid's keys to the fingerprint it has now (#1869: the key's value
+// replaced in place), so a key held to it is held to it still. It
+// returns how many keys it moved.
+func ReplaceAccount(pid, was, now string) (int, error) {
+	if was == now {
+		return 0, nil
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	keys, err := load()
+	if err != nil {
+		return 0, err
+	}
+	old := strings.ToLower(pid + "/" + was)
+	moved := 0
+	for i := range keys {
+		for j, a := range keys[i].Accounts {
+			if strings.ToLower(strings.TrimSpace(a)) == old {
+				keys[i].Accounts[j] = pid + "/" + now
+				moved++
+			}
+		}
+	}
+	if moved == 0 {
+		return 0, nil
+	}
+	return moved, save(keys)
+}

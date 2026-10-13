@@ -5,8 +5,11 @@
 // expected to use, and those are settled with what the call recorded.
 //
 // The rules:
-//   - A call counts in the window it started in (its record's time), and
-//     windows are calendar ones in local time (access.Window).
+//   - A call counts in the window it started in (its record's time).
+//     Windows are calendar ones in local time, or cycles of N days from
+//     when the limit was set (access.Limit.Window). A reset (#1509)
+//     starts the window again from then: what came before it doesn't
+//     count, tokens and cost alike.
 //   - Tokens are a call's uncached input, output and cache writes, and
 //     its cache reads when the limit says so; cost is an estimate at the
 //     Usage page's prices, and a call with no known price adds none.
@@ -87,7 +90,9 @@ var state = struct {
 func slot(keyID string) string { return usage.Path() + "\x00" + keyID }
 
 // counts reports whether r is a call a key's budget counts.
-func counts(r usage.Record) bool { return !r.IsRejected() && r.Computer == "" }
+// A call an app reported itself (#1874) never counts: it didn't go through
+// magpie, and may be a backfill of calls long past.
+func counts(r usage.Record) bool { return !r.IsRejected() && !r.IsReported() && r.Computer == "" }
 
 // sumsFor is keyID's sums for the window starting at start, read from
 // usage.jsonl the first time. Called with state held.
@@ -145,7 +150,9 @@ func Append(rec usage.Record) {
 
 // Status is a key's limit and what it has used of it.
 type Status struct {
-	Period   string    `json:"period"`
+	Period string `json:"period"`
+	// Days is a "days" period's cycle
+	Days     int       `json:"days,omitempty"`
 	Start    time.Time `json:"start"`
 	Reset    time.Time `json:"reset"`
 	Calls    int       `json:"calls"`
@@ -167,7 +174,7 @@ type Status struct {
 }
 
 func status(keyID string, l *access.Limit, s *sums, h *held, reset time.Time) Status {
-	st := Status{Period: l.Period, Start: s.start, Reset: reset, Calls: s.calls, Tokens: s.tokens(l), Cost: s.cost, Unpriced: s.unpriced,
+	st := Status{Period: l.Period, Days: l.Days, Start: s.start, Reset: reset, Calls: s.calls, Tokens: s.tokens(l), Cost: s.cost, Unpriced: s.unpriced,
 		TokenLimit: l.Tokens, CostLimit: l.Cost, CacheReads: l.CacheReads}
 	if h != nil {
 		st.InFlight, st.Reserved, st.ReservedCost = h.n, h.tokens, h.cost
@@ -190,7 +197,7 @@ func Of(k access.Key, now time.Time) *Status {
 	if !k.Limit.Limited() {
 		return nil
 	}
-	start, reset := access.Window(k.Limit.Period, now)
+	start, reset := k.Limit.Window(now)
 	s := read(k.ID, start)
 	state.Lock()
 	h := state.held[window{slot(k.ID), start.Unix()}]
@@ -222,7 +229,7 @@ func (r *Refusal) Error() string {
 		what += fmt.Sprintf(", with %d requests in flight holding the rest", r.InFlight)
 	}
 	return fmt.Sprintf("magpie gateway key %q has used %s for this %s; it resets at %s",
-		r.Key, what, r.Period, r.Reset.Format("2006-01-02 15:04 MST"))
+		r.Key, what, (&access.Limit{Period: r.Period, Days: r.Days}).Per(), r.Reset.Format("2006-01-02 15:04 MST"))
 }
 
 // RetryAfter is how long until the window resets, in whole seconds.
@@ -239,7 +246,7 @@ func Reserve(who access.Identity, body int64, model string, now time.Time) (rele
 	if who.KeyID == "" || !l.Limited() {
 		return func() {}, nil
 	}
-	start, reset := access.Window(l.Period, now)
+	start, reset := l.Window(now)
 	state.Lock()
 	defer state.Unlock()
 	k := window{slot(who.KeyID), start.Unix()}

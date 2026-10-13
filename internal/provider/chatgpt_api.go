@@ -114,12 +114,15 @@ func setSIWCLoginOn(user string, on bool) error {
 }
 
 // forgetSIWCLogin removes an account, and has OpenAI revoke its refresh
-// token: signed out, it is gone there too.
+// token: signed out, it is gone there too. The revoke leaves through the
+// account's own proxy, as its sign-in and requests did (#1663), read
+// before the account is forgotten.
 func forgetSIWCLogin(user string) error {
+	via := ViaLogin(context.Background(), ChatGPTAPIID, user)
 	return forgetSideLogin(ChatGPTAPIID, user, siwcSide(), func(l savedLogin) {
 		if c, ok := siwcSaved(l); ok {
 			go func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+				ctx, cancel := context.WithTimeout(via, 15*time.Second)
 				defer cancel()
 				_ = siwcRevoke(ctx, c)
 			}()
@@ -611,6 +614,15 @@ func siwcBody(body []byte) []byte {
 			}
 		}
 	}
+	// the conversation is named, as on a Codex account: OpenAI keeps a
+	// ChatGPT sign-in's cached prompt by it (#933)
+	if k, _ := m["prompt_cache_key"].(string); k == "" {
+		own, _ := m["instructions"].(string)
+		input, _ := m["input"].([]any)
+		if k = conversationKey(own, input); k != "" {
+			m["prompt_cache_key"] = k
+		}
+	}
 	if tools, ok := m["tools"].([]any); ok {
 		if tools = siwcOwnTools(tools); len(tools) == 0 {
 			delete(m, "tools")
@@ -701,12 +713,15 @@ func siwcExplain(status int, body []byte) string {
 func siwcProvider(l Login) Provider {
 	user := l.User
 	a := &Account{Agent: ChatGPTAPIID, User: user, Plan: l.Plan, Stream: true}
-	a.sign = func(ctx context.Context, req *http.Request, _ []byte) error {
+	a.sign = func(ctx context.Context, req *http.Request, body []byte) error {
 		c, err := siwcFresh(ctx, user, false)
 		if err != nil {
 			return err
 		}
 		req.Header.Set("Authorization", "Bearer "+c.Access)
+		if body != nil {
+			sessionHeaders(req.Header, body)
+		}
 		return nil
 	}
 	a.body = siwcBody

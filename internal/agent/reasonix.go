@@ -18,10 +18,10 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/pelletier/go-toml/v2"
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/pelletier/go-toml/v2"
 )
 
 const reasonixKey = "MAGPIE_REASONIX_API_KEY"
@@ -297,11 +297,11 @@ func reasonixIn(at place) *Agent {
 	}
 
 	a := &Agent{
-		ID: "reasonix", Name: "Reasonix Studio", Icon: "reasonix-color", Aliases: []string{"reasonix-studio"},
+		ID: "reasonix", Name: "Reasonix Studio", Icon: "reasonix-color", Aliases: []string{"reasonix-studio"}, NoNames: true,
 		Bin: "reasonix", Dir: dir, Path: path, UA: []string{"reasonix"},
 		detect: func() bool { return reasonixDetected(at.home) },
 		Notice: func() string {
-			return "Reasonix Studio 2.x and the native 1.39.x/2.x CLI read global settings at startup. Start a new process to load changes. Project/session models can override Executor and Plan."
+			return noticeReasonix.String()
 		},
 		Check: func() string {
 			ref, on := strings.CutPrefix(model(), magpieID+"/")
@@ -328,7 +328,7 @@ func reasonixIn(at place) *Agent {
 			if err := checkOwner(cfg, state); err != nil {
 				return err.Error()
 			}
-			if p.Kind != "openai" || p.BaseURL != at.v1() {
+			if p.Kind != "openai" || p.BaseURL != at.v1() && !reachesMagpie(p.BaseURL, at.v1()) {
 				return "Reasonix's magpie base_url or kind changed"
 			}
 			if token, _ := edit.GetEnvFile(env, reasonixKey); token != gwKey() {
@@ -672,3 +672,8 @@ func reasonixArray(values []string) edit.Raw {
 	}
 	return edit.Raw("[" + strings.Join(quoted, ", ") + "]")
 }
+
+// what reasonix says after a change (notice.go)
+var (
+	noticeReasonix = newNotice("Reasonix Studio 2.x and the native 1.39.x/2.x CLI read global settings at startup. Start a new process to load changes. Project/session models can override Executor and Plan.")
+)

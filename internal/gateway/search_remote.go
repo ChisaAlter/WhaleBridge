@@ -72,12 +72,12 @@ func webSearchOf(e provider.Entry, magpie bool) string {
 			return searchNative
 		}
 		for _, proto := range p.Speaks() {
-			if searchesItself(p, proto) {
+			if searchesItself(p, proto) || modelSearches(p, proto, e.Model) {
 				return searchNative
 			}
 		}
 	}
-	if magpie || provider.KimiCodeSearch(p) != "" || googleAccount(p) && searcherModel(p) != "" {
+	if magpie || searchesOwn(p) {
 		return searchMagpie
 	}
 	return ""

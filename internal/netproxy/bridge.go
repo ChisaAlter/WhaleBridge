@@ -16,6 +16,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -263,4 +264,24 @@ func ForBun(proxy string) string {
 		return a
 	}
 	return proxy
+}
+
+// EnvForBun is env for a bun that magpie starts (bun add, update, remove,
+// run, or an agent CLI's bun add -g): its *_PROXY with a SOCKS5 one
+// bridged (ForBun). Bun takes only http:// and https:// proxies, and with
+// a socks5:// one every registry fetch failed as UnsupportedProxyProtocol
+// (#1409), which a Mac with only a SOCKS system proxy hands it through Env.
+func EnvForBun(env []string) []string {
+	out := make([]string, 0, len(env))
+	for _, e := range env {
+		k, v, _ := strings.Cut(e, "=")
+		switch strings.ToUpper(k) {
+		case "HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY":
+			if v = strings.TrimSpace(v); v != "" {
+				e = k + "=" + ForBun(v)
+			}
+		}
+		out = append(out, e)
+	}
+	return out
 }

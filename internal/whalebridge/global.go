@@ -11,17 +11,20 @@ import (
 	"strings"
 	"time"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/agent"
 	"github.com/ChisaAlter/WhaleBridge/internal/backup"
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 	"github.com/ChisaAlter/WhaleBridge/internal/davsync"
 	"github.com/ChisaAlter/WhaleBridge/internal/fx"
 	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/redact"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 	"github.com/ChisaAlter/WhaleBridge/internal/usage"
+	"github.com/ChisaAlter/WhaleBridge/internal/usageapi"
 )
 
-var globalSettingKeys = strings.Fields("proxy currency chineseUnits searcher searchFirst vision imageGen redact redactPersonal redactWords redactRules plainNames plainOwnNames memberModel fullContext compactAt quotaLeft usageAlert balanceAlert resetReminder requestArchive requestArchiveMaxMB")
+var globalSettingKeys = strings.Fields("proxy currency chineseUnits searcher searcherEffort searchFirst vision visionEffort imageGen redact redactPersonal redactKinds redactWords redactRules noAccountDiscovery quotaReads noLoopGuard refusalRetries codexPredictions plainNames plainOwnNames memberModel fullContext compactAt quotaLeft usageAlert balanceAlert resetReminder requestArchive requestArchiveMaxMB")
 
 func globalState() map[string]any {
 	s := settings.Load()
@@ -56,7 +59,7 @@ func globalState() map[string]any {
 			}
 			models = append(models, map[string]string{"id": c.Provider.ID + "/" + m.ID, "name": name})
 		}
-		searchers = append(searchers, map[string]any{"id": c.Provider.ID, "name": c.Provider.Name, "small": c.Small, "models": models})
+		searchers = append(searchers, map[string]any{"id": c.Provider.ID, "name": c.Provider.Name, "small": c.Small, "models": models, "manualOnly": c.ManualOnly})
 	}
 	visionModels := []map[string]string{}
 	for _, m := range provider.Served() {
@@ -84,13 +87,19 @@ func globalState() map[string]any {
 		_, _, ok := provider.Resolve(id)
 		return !ok
 	}
-	models, _ := provider.CatalogFor("dsh")
+	models := provider.Catalog()
 	rate := fx.Soon()
 	fxAt := ""
 	if !rate.At.IsZero() {
 		fxAt = rate.At.Format(time.RFC3339)
 	}
-	return map[string]any{"settings": out, "searchVendors": searchVendors, "searches": searches, "searchers": searchers, "autoSearcher": gateway.AutoSearcher(), "searcher": gateway.Searcher(), "searcherUnused": gateway.SearcherUnused(), "visionModels": visionModels, "drawingModels": drawingModels, "autoVision": gateway.AutoVision(), "autoDrawer": gateway.AutoDrawer(), "visionUnused": unresolved(s.Vision), "imageGenUnused": unresolved(s.ImageGen), "models": models, "fx": map[string]any{"rate": rate.CNYPerUSD, "at": fxAt, "stale": rate.Stale()}, "sync": davsync.Status(), "modelPrices": s.ModelPrices}
+	failure, failed := gateway.SearcherFailed()
+	failure.Why = redact.Scrub(failure.Why)
+	categories := make([]map[string]any, 0, len(redact.Categories))
+	for _, c := range redact.Categories {
+		categories = append(categories, map[string]any{"id": c.ID, "on": c.On})
+	}
+	return map[string]any{"settings": out, "noAccountsEnv": settings.AccountDiscoveryOff() && !s.NoAccountDiscovery, "redactCategories": categories, "searchVendors": searchVendors, "searches": searches, "searchers": searchers, "autoSearcher": gateway.AutoSearcher(), "searcher": gateway.Searcher(), "searcherUnused": gateway.SearcherUnused(), "searcherFailure": failure, "searcherFailed": failed, "searcherEfforts": gateway.SearchEfforts(), "searcherEffortNow": gateway.SearchEffortNow(), "visionEfforts": gateway.VisionEfforts(), "visionEffortNow": gateway.VisionEffortNow(), "visionModels": visionModels, "drawingModels": drawingModels, "autoVision": gateway.AutoVision(), "autoDrawer": gateway.AutoDrawer(), "visionUnused": unresolved(s.Vision), "imageGenUnused": unresolved(s.ImageGen), "models": models, "fx": map[string]any{"rate": rate.CNYPerUSD, "at": fxAt, "stale": rate.Stale()}, "sync": davsync.Status(), "modelPrices": s.ModelPrices}
 }
 
 // Settings patches preserve omitted fields and never send saved authorization
@@ -101,6 +110,7 @@ func saveGlobalSettings(r *http.Request) error {
 		return err
 	}
 	s := settings.Load()
+	discoveryWasOff := s.NoAccountDiscovery
 	b, _ := json.Marshal(s)
 	merged := map[string]json.RawMessage{}
 	_ = json.Unmarshal(b, &merged)
@@ -148,6 +158,9 @@ func saveGlobalSettings(r *http.Request) error {
 		}
 	}
 	s.OTel.Sessions = false
+	if s.RefusalRetries != nil && *s.RefusalRetries < 0 {
+		return fmt.Errorf("拒绝重试次数不能小于 0")
+	}
 	if s.RequestArchive {
 		if _, ok := davsync.S3Bucket(); !ok {
 			return fmt.Errorf("请先配置 S3 同步，再开启请求归档")
@@ -156,25 +169,32 @@ func saveGlobalSettings(r *http.Request) error {
 	if err := settings.Save(s); err != nil {
 		return err
 	}
+	if s.NoAccountDiscovery != discoveryWasOff {
+		provider.ForgetAccounts()
+	}
 	gateway.WakeWhaleBridgeQuotaAlerts()
 	return nil
 }
 
 func requestFilter(r *http.Request) usage.Filter {
-	q := r.URL.Query()
-	id, _ := strconv.ParseInt(q.Get("route"), 10, 64)
-	return usage.Filter{Day: q.Get("day"), RouteID: id, Model: q.Get("model"), Provider: q.Get("provider"), Purpose: q.Get("purpose"), Account: q.Get("account"), Failed: q.Get("failed") == "1", Query: q.Get("q"), Computer: q.Get("computer")}
+	f := usageapi.FilterOf(r.URL.Query())
+	f.Through = usage.SourceGateway
+	return f
 }
 func usagePeriod(r *http.Request) usage.Period {
-	p := usage.Period(r.URL.Query().Get("period"))
-	for _, v := range usage.Periods {
-		if p == v {
-			return p
-		}
-	}
-	return usage.Month
+	return usageapi.PeriodOf(r.URL.Query().Get("period"))
 }
 func globalRoutes(mux *http.ServeMux, server *gateway.Server, version string) {
+	usageapi.Clients = func() []usageapi.Client {
+		out := []usageapi.Client{{ID: "dsh", Name: "鲸屿", Icon: "generic"}}
+		for _, a := range agent.Clients() {
+			if a.ID == "dsh" {
+				continue
+			}
+			out = append(out, usageapi.Client{ID: a.ID, Name: a.Name, Icon: a.Icon})
+		}
+		return out
+	}
 	mux.HandleFunc("POST /api/group/switch", mutate(func(w http.ResponseWriter, r *http.Request) error {
 		var in struct {
 			ID  string `json:"id"`
@@ -261,7 +281,13 @@ func globalRoutes(mux *http.ServeMux, server *gateway.Server, version string) {
 		if offset < 0 {
 			offset = 0
 		}
-		writeJSON(w, usage.QueryPage(usagePeriod(r), requestFilter(r), offset, 50))
+		writeJSON(w, usageapi.LedgerPage(usagePeriod(r), requestFilter(r), offset, 50))
+	})
+	mux.HandleFunc("GET /api/requests/heatmap", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, usage.HeatmapOf(requestFilter(r)))
+	})
+	mux.HandleFunc("GET /api/tools/efforts", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, gateway.ModelEfforts(r.URL.Query().Get("model")))
 	})
 	mux.HandleFunc("GET /api/requests/export", func(w http.ResponseWriter, r *http.Request) {
 		rows := usage.LedgerOf(usagePeriod(r), requestFilter(r))
@@ -354,6 +380,8 @@ func globalRoutes(mux *http.ServeMux, server *gateway.Server, version string) {
 			_, err = davsync.Restore(r.Context())
 		case "undo":
 			_, err = davsync.Undo()
+		case "upload":
+			err = davsync.Upload(r.Context())
 		default:
 			http.NotFound(w, r)
 			return
@@ -362,7 +390,7 @@ func globalRoutes(mux *http.ServeMux, server *gateway.Server, version string) {
 			http.Error(w, err.Error(), 400)
 			return
 		}
-		if err = syncDSH(); err != nil {
+		if err = syncConfiguration(); err != nil {
 			http.Error(w, err.Error(), 500)
 			return
 		}

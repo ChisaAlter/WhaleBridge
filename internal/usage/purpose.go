@@ -22,11 +22,14 @@ var purposeKinds = func() map[string]PurposeKind {
 	add("Compaction", "compact")
 	add("Memory", "memory_consolidation", "memgen", "memory")
 	add("Title", "thread_title", "thread_title_reconsideration", "title_generation", "title")
+	add("Description", "thread_description")
+	add("Prediction", "composer_predictions")
 	add("Subagent", "collab_spawn", "thread_spawn", "agent_job")
 	add("Luna Reserve", "luna_reserve")
 	add("Suggestions", "ambient_suggestions", "ambient_suggestion_safety")
 	add("Web search", "web_search")
 	add("Image description", "vision")
+	add("Routing classifier", "routing")
 	return out
 }()
 

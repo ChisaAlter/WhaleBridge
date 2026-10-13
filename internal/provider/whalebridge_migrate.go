@@ -22,7 +22,7 @@ func whaleBridgeOwnAccounts(id string, accounts []Moving) bool {
 // WhaleBridgeHandOver adopts an installed provider plugin and transfers
 // component-owned accounts. A native client's borrowed login stays in place.
 func WhaleBridgeHandOver(ctx context.Context) map[string]error {
-	return handOver(ctx, true, whaleBridgeOwnAccounts)
+	return handOverAccounts(ctx, true, whaleBridgeOwnAccounts)
 }
 
 func KeepWhaleBridgeRetiringMoved(ctx context.Context) {

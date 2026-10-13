@@ -15,6 +15,15 @@ package provider
 // turn is never moved to another model halfway through (the gateway keeps
 // that; see gateway/rules.go). The member a rule names goes first; the
 // group's other members stay behind it for failover.
+//
+// A pause rule (Rule.Pause) sends nothing first: while it holds, the
+// member it names is out of the group altogether — not first, not a
+// failover, not where a conversation was — as a member switched off is
+// (Group.Off), but only at its hours, on its days, for its agents or in its
+// folders (or outside them: #1606, an account's quota kept for the long
+// task in one project). It is
+// looked at on every request, not as a turn begins: a paused model is
+// paid nothing in its hours, so a turn on it moves when they begin.
 
 import (
 	"fmt"
@@ -54,6 +63,25 @@ type Rule struct {
 	// Time: the turn begins within these hours of the day, local time — a
 	// vendor's peak-price hours sent to another, say.
 	Time *TimeWindow `json:"time,omitempty"`
+	// Folders: the request's working folder, as the agent states it in
+	// the request, is one of these or inside one — a project, or every
+	// project under a folder (Cario0x on X). "~/work", "/Users/me/x",
+	// "C:\work"; WSL's /mnt/c/work is C:\work. When the agent doesn't
+	// say its folder, it doesn't match.
+	Folders []string `json:"folders,omitempty"`
+	// ExceptFolders: the request's working folder is none of these nor
+	// inside one, as Folders reads them. A request whose agent doesn't say
+	// its folder is not known to be in one, so it holds for it: a pause
+	// "except in ~/big-task" keeps the model for requests known to come
+	// from there (#1606), never for one that may come from elsewhere.
+	ExceptFolders []string `json:"exceptFolders,omitempty"`
+	// Pause: rather than sending to Use first, the rule leaves Use out of
+	// the group while it holds (John on Discord: a model paused in a
+	// vendor's peak hours). Only Time, Agents, Folders and ExceptFolders
+	// can be its conditions: the request's clock, its agent and the folder
+	// it says, never what it asks for — a pause keeps the model out of the
+	// request whatever it is.
+	Pause bool `json:"pause,omitempty"`
 }
 
 // TimeWindow is hours of the day, local time: From until To, "HH:MM" each,
@@ -229,6 +257,12 @@ func (r Rule) Conditions() []string {
 	if r.Time != nil {
 		out = append(out, "time "+r.Time.Text())
 	}
+	if len(r.Folders) > 0 {
+		out = append(out, "folder "+strings.Join(r.Folders, "|"))
+	}
+	if len(r.ExceptFolders) > 0 {
+		out = append(out, "not folder "+strings.Join(r.ExceptFolders, "|"))
+	}
 	return out
 }
 
@@ -243,6 +277,13 @@ func cleanRules(rules []Rule, members []string) ([]Rule, error) {
 			r.Agents[j] = strings.ToLower(r.Agents[j])
 		}
 		n := i + 1
+		var err error
+		if r.Folders, err = cleanFolders(r.Folders); err != nil {
+			return nil, fmt.Errorf("rule %d: %w", n, err)
+		}
+		if r.ExceptFolders, err = cleanFolders(r.ExceptFolders); err != nil {
+			return nil, fmt.Errorf("rule %d: %w", n, err)
+		}
 		if r.Time != nil {
 			w := *r.Time
 			if err := w.clean(); err != nil {
@@ -265,7 +306,9 @@ func cleanRules(rules []Rule, members []string) ([]Rule, error) {
 		case len([]rune(r.Intent)) > MaxIntent:
 			return nil, fmt.Errorf("rule %d: an intent is at most %d characters", n, MaxIntent)
 		case len(r.Conditions()) == 0:
-			return nil, fmt.Errorf("rule %d: it needs a condition (tokens, images, effort, agents, intent, compacting or time)", n)
+			return nil, fmt.Errorf("rule %d: it needs a condition (tokens, images, effort, agents, intent, compacting, time or folders)", n)
+		case r.Pause && (r.Tokens > 0 || r.Images || r.Effort != "" || r.Intent != "" || r.Compact):
+			return nil, fmt.Errorf("rule %d: a pause holds by hours, days, agents or folders only", n)
 		}
 		if len(r.Agents) == 0 {
 			r.Agents = nil
@@ -290,9 +333,13 @@ type RuleRequest struct {
 	// At is when the request came, for a rule's hours; a zero time is in
 	// none.
 	At time.Time
+	// Folder is the working folder the agent says the request is from;
+	// "" when it doesn't say, which is in no rule's folders.
+	Folder string
 }
 
-// Matches reports whether the request is one the rule is for.
+// Matches reports whether the request is one the rule sends to its member
+// first; a pause rule sends none (see Pauses).
 func (r Rule) Matches(q RuleRequest) bool {
 	if r.Intent != "" && !strings.EqualFold(r.Intent, q.Intent) {
 		return false
@@ -303,6 +350,9 @@ func (r Rule) Matches(q RuleRequest) bool {
 // MatchesBesidesIntent is Matches but for the rule's intent: whether the
 // classifier's answer is all it waits on.
 func (r Rule) MatchesBesidesIntent(q RuleRequest) bool {
+	if r.Pause {
+		return false
+	}
 	if r.Tokens > 0 && q.Tokens < r.Tokens {
 		return false
 	}
@@ -313,6 +363,9 @@ func (r Rule) MatchesBesidesIntent(q RuleRequest) bool {
 		return false
 	}
 	if r.Time != nil && !r.Time.Holds(q.At) {
+		return false
+	}
+	if !r.inFolders(q.Folder) {
 		return false
 	}
 	switch r.Effort {
@@ -410,14 +463,14 @@ func ruledEntry(e *Entry, g Group, ms []Member, entries []Entry) {
 	sees := func(x Entry) bool { return x.Images && (x.ImageInput == nil || *x.ImageInput) }
 	for i, r := range g.Rules {
 		x, ok := of(r.Use)
-		if !ok {
+		if !ok || r.Pause {
 			continue
 		}
-		if r.Images && r.Tokens == 0 && r.Effort == "" && len(r.Agents) == 0 && r.Intent == "" && !r.Compact && r.Time == nil && sees(x) && !e.Images &&
-			!slices.ContainsFunc(g.Rules[:i], func(b Rule) bool { y, ok := of(b.Use); return !ok || !sees(y) }) {
+		if r.Images && r.Tokens == 0 && r.Effort == "" && len(r.Agents) == 0 && r.Intent == "" && !r.Compact && r.Time == nil && !r.ByFolder() && sees(x) && !e.Images &&
+			!slices.ContainsFunc(g.Rules[:i], func(b Rule) bool { y, ok := of(b.Use); return !b.Pause && (!ok || !sees(y)) }) {
 			e.Images, e.ImageInput = true, x.ImageInput
 		}
-		if r.Tokens == 0 || r.Images || r.Effort != "" || len(r.Agents) > 0 || r.Intent != "" || r.Compact || r.Time != nil || x.Context <= e.Context {
+		if r.Tokens == 0 || r.Images || r.Effort != "" || len(r.Agents) > 0 || r.Intent != "" || r.Compact || r.Time != nil || r.ByFolder() || x.Context <= e.Context {
 			continue // only a rule of length alone takes every long request
 		}
 		// every request up to the rule's length must fit whoever may get
@@ -433,6 +486,9 @@ func ruledEntry(e *Entry, g Group, ms []Member, entries []Entry) {
 		}
 		for _, before := range g.Rules[:i] {
 			// one not ready now leaves what it matches to the group's order
+			if before.Pause {
+				continue
+			}
 			if y, ok := of(before.Use); !ok {
 				fits = 0
 			} else if y.Context < fits {
@@ -443,4 +499,105 @@ func ruledEntry(e *Entry, g Group, ms []Member, entries []Entry) {
 			e.Context = fits
 		}
 	}
+}
+
+// Pauses reports whether a pause rule holds for a request from agent at
+// the time given, working in folder ("" when it didn't say).
+func (r Rule) Pauses(agent, folder string, at time.Time) bool {
+	if !r.Pause || r.Time == nil && len(r.Agents) == 0 && !r.ByFolder() {
+		return false
+	}
+	if r.Time != nil && !r.Time.Holds(at) {
+		return false
+	}
+	if !r.inFolders(folder) {
+		return false
+	}
+	return len(r.Agents) == 0 || slices.Contains(r.Agents, strings.ToLower(agent))
+}
+
+// ByFolder reports whether the rule holds by the folder the agent works
+// in, in some or outside them: the request's folder is then read for it.
+func (r Rule) ByFolder() bool { return len(r.Folders) > 0 || len(r.ExceptFolders) > 0 }
+
+// inFolders reports whether folder ("" unknown) is as the rule's folders
+// ask: in one of Folders, when it has some (an unknown folder is in none),
+// and in none of ExceptFolders (an unknown folder is not known to be in
+// one, so it is outside them).
+func (r Rule) inFolders(folder string) bool {
+	under := func(root string) bool { return FolderUnder(folder, root) }
+	if len(r.Folders) > 0 && !slices.ContainsFunc(r.Folders, under) {
+		return false
+	}
+	return !slices.ContainsFunc(r.ExceptFolders, under)
+}
+
+// PausesByFolder reports whether a pause rule of g, or of a group in it on
+// the way to one of ms, holds by folder: the request's folder is then
+// read before the pauses are looked at.
+func PausesByFolder(g Group, ms []Member) bool {
+	byFolder := func(x Group) bool {
+		return slices.ContainsFunc(x.Rules, func(r Rule) bool { return r.Pause && r.ByFolder() })
+	}
+	return byFolder(g) || slices.ContainsFunc(ms, func(m Member) bool { return slices.ContainsFunc(m.Via, byFolder) })
+}
+
+// Paused is a model a pause rule left out of a request's group.
+type Paused struct {
+	Member string   `json:"member"`          // "provider/model[:effort]"
+	Group  string   `json:"group,omitempty"` // the group in the group whose rule it is; "" the group's own
+	Rule   int      `json:"rule"`            // the rule, from 1
+	Use    string   `json:"use"`             // the member the rule names: the model, or a group in the group
+	When   []string `json:"when"`
+	// Folder: the folder the agent said it works in, when the rule holds
+	// by folder (ByFolder); "" when it said none, which is outside every
+	// folder of a rule's ExceptFolders.
+	Folder   string `json:"folder,omitempty"`
+	ByFolder bool   `json:"byFolder,omitempty"`
+}
+
+// PausedOut leaves out of ms the models a pause rule holds for now, for a
+// request from agent working in folder ("" when it didn't say, or wasn't
+// read: see PausesByFolder): the group's own, or those of a group in it on
+// the way to them. A rule naming a group in the group pauses every model
+// of it.
+func PausedOut(g Group, ms []Member, agent, folder string, at time.Time) (kept []Member, paused []Paused) {
+	if !slices.ContainsFunc(g.Rules, func(r Rule) bool { return r.Pause }) &&
+		!slices.ContainsFunc(ms, func(m Member) bool {
+			return slices.ContainsFunc(m.Via, func(v Group) bool { return slices.ContainsFunc(v.Rules, func(r Rule) bool { return r.Pause }) })
+		}) {
+		return ms, nil
+	}
+	for _, m := range ms {
+		var hit *Paused
+		for d := 0; d <= len(m.Via) && hit == nil; d++ {
+			by, in := g, ""
+			if d > 0 {
+				by, in = m.Via[d-1], m.Via[d-1].ID
+			}
+			for i, r := range by.Rules {
+				if d < len(m.Path) && pathNames(m.Path[d:], r.Use) && r.Pauses(agent, folder, at) {
+					hit = &Paused{Member: WithMemberEffort(m.Provider.ID+"/"+m.Model, m.Effort), Group: in, Rule: i + 1, Use: r.Use, When: r.Conditions(), ByFolder: r.ByFolder()}
+					if r.ByFolder() {
+						hit.Folder = folder
+					}
+					break
+				}
+			}
+		}
+		if hit != nil {
+			paused = append(paused, *hit)
+			continue
+		}
+		kept = append(kept, m)
+	}
+	return kept, paused
+}
+
+// pathNames reports whether a member's way down from a group (its id
+// there first, its model last) is what that group's rule names: the
+// member itself, or the model when a group in the group, ahead of it, has
+// it too (#625).
+func pathNames(path []string, id string) bool {
+	return path[0] == id || !strings.HasPrefix(id, GroupPrefix) && len(path) > 1 && path[len(path)-1] == id
 }

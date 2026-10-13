@@ -184,7 +184,11 @@ task:
 	}
 	b, _ := os.ReadFile(configPath)
 	got := string(b)
-	want := strings.NewReplacer("magpie/deepseek/", "magpie/ds/").Replace(before)
+	// the default role set on magpie, its one model on the list became
+	// every model of magpie's (#1769)
+	want := strings.NewReplacer("magpie/deepseek/", "magpie/ds/").Replace(strings.Replace(before,
+		"  - magpie/deepseek/pro\n  - path: /work\n    models:\n      - magpie/deepseek/flash\n",
+		"  - path: /work\n    models:\n      - magpie/deepseek/flash\n  - magpie/**\n", 1))
 	var gotDoc, wantDoc any
 	yaml.Unmarshal(b, &gotDoc)
 	yaml.Unmarshal([]byte(want), &wantDoc)

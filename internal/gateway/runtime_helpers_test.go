@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -222,9 +223,13 @@ func keepFast(t *testing.T, gap, every, longest time.Duration) {
 // key, its requests going to up; it gives the provider's id.
 func besideFake(t *testing.T, id string, up http.Handler) string {
 	t.Helper()
-	bun, err := exec.LookPath("bun")
-	if err != nil {
-		t.Skip("no bun on PATH")
+	bun := os.Getenv("MAGPIE_BUN")
+	if bun == "" {
+		var err error
+		bun, err = exec.LookPath("bun")
+		if err != nil {
+			t.Skip("no bun on PATH")
+		}
 	}
 	fresh(t)
 	t.Setenv("MAGPIE_BUN", bun)

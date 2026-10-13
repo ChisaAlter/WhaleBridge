@@ -191,12 +191,12 @@ func TestAsideRestoreReadbackFailureKeepsProvider(t *testing.T) {
 	}
 	inner := asideRead
 	reads := 0
-	asideRead = func() (map[string]json.RawMessage, error) {
+	asideRead = func(account string) (map[string]json.RawMessage, error) {
 		reads++
 		if reads > 1 {
 			return nil, errors.New("readback unavailable")
 		}
-		return inner()
+		return inner(account)
 	}
 	if err := a.Disconnect(); err == nil {
 		t.Fatal("unconfirmed restoration reported success")

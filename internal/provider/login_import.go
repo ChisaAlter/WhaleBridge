@@ -4,9 +4,15 @@ package provider
 // rather than signed in again: CLIProxyAPI keeps each as
 // {type: "codex", id_token, access_token, refresh_token, account_id, email, …}
 // or {type: "claude", access_token, refresh_token, email, …}, Codex CLI as
-// auth.json ({tokens: {…}}) and Claude Code as .credentials.json
-// ({claudeAiOauth: {…}}); a bare refresh token a line is taken too. They
-// all sign in with the agents' own OAuth clients, the ones magpie uses.
+// auth.json ({tokens: {…}}), Claude Code as .credentials.json
+// ({claudeAiOauth: {…}}), and Sub2API as {accounts: [{platform, type:
+// "oauth", credentials: {…}}]}. Cockpit Tools (jlcodes99/cockpit-tools)
+// exports its Codex accounts in these shapes: its own (CLIProxyAPI's),
+// Codex's auth.json, CPA and Sub2API. codexbar (lizhelang/codexbar), a
+// menu-bar switcher, keeps its ChatGPT accounts in ~/.codexbar/config.json
+// (see codexbarEntries); its own export is Sub2API's. A bare refresh token
+// a line is taken too. They all sign in with the agents' own OAuth clients, the ones
+// magpie uses.
 //
 // A ChatGPT one is checked the way a sign-in is finished: its refresh token
 // traded for new tokens and the account asked for. That rotates the token,
@@ -16,6 +22,7 @@ package provider
 // time it runs on it. Tokens are never logged or sent back.
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -23,6 +30,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // loginImport is one account read from a file.
@@ -30,6 +39,11 @@ type loginImport struct {
 	email, idToken, accessToken, refreshToken, accountID string
 	scopes                                               []string
 	err                                                  string
+	file                                                 int // a file that held no account (ImportedAccount.File)
+	// claudeAccount and claudeOrg: the Claude account's and organization's
+	// uuids, Claude Code's oauthAccount accountUuid and organizationUuid,
+	// when the file has them
+	claudeAccount, claudeOrg string
 }
 
 // claudeImportScopes are what Claude Code's sign-in asks for, taken when a
@@ -56,6 +70,16 @@ func parseLoginImport(agent, data string) ([]loginImport, error) {
 					walk(it)
 				}
 			case map[string]any:
+				// a Sub2API account: its vendor in platform, its sign-in
+				// in credentials
+				if c, ok := x["credentials"].(map[string]any); ok && jsonStr(x, "platform") != "" {
+					out = append(out, sub2apiEntry(agent, x, c))
+					return
+				}
+				if es, ok := codexbarEntries(agent, x); ok {
+					out = append(out, es...)
+					return
+				}
 				if as, ok := x["accounts"].([]any); ok && jsonStr(x, "refresh_token", "refreshToken") == "" {
 					walk(as)
 					return
@@ -104,16 +128,7 @@ func loginEntry(agent string, x map[string]any) loginImport {
 	e.accessToken = jsonStr(src, "access_token", "accessToken")
 	e.refreshToken = jsonStr(src, "refresh_token", "refreshToken")
 	e.accountID = jsonStr(src, "account_id", "accountId")
-	switch sc := src["scopes"].(type) {
-	case []any:
-		for _, s := range sc {
-			if s, ok := s.(string); ok && s != "" {
-				e.scopes = append(e.scopes, s)
-			}
-		}
-	case string:
-		e.scopes = strings.Fields(sc)
-	}
+	e.scopes = importScopes(src["scopes"])
 	typ := strings.ToLower(jsonStr(x, "type"))
 	switch {
 	case typ != "" && typ != agent:
@@ -122,6 +137,116 @@ func loginEntry(agent string, x map[string]any) loginImport {
 		e.err = "not a " + name + " sign-in"
 	case e.refreshToken == "" && jsonStr(x, "OPENAI_API_KEY", "api_key", "apiKey") != "":
 		e.err = "an API key, not a sign-in; add it as a key instead"
+	case e.refreshToken == "" && (e.accessToken != "" || jsonStr(x, "personal_access_token") != ""):
+		e.err = accessOnly
+	}
+	return e
+}
+
+// codexbarEntries reads codexbar's config.json, as its CodexBarConfigStore
+// writes it: {version, active, openAI: {remoteConnectionAccounts: […]},
+// providers: [{id, kind, accounts: […]}]}. The ChatGPT sign-ins are the
+// accounts of the provider of kind "openai_oauth" and the remote
+// connection's, each {id, kind: "oauth_tokens" or "api_key", email,
+// openAIAccountId, accessToken, refreshToken, idToken, …}: the account's
+// workspace is openAIAccountId, its id is codexbar's own. The other
+// providers are other vendors' API endpoints, not accounts, and are left
+// alone. A sign-in in both places is read once.
+func codexbarEntries(agent string, x map[string]any) ([]loginImport, bool) {
+	ps, ok := x["providers"].([]any)
+	if !ok {
+		return nil, false
+	}
+	var accts []any
+	for _, p := range ps {
+		if p, ok := p.(map[string]any); ok && jsonStr(p, "kind") == "openai_oauth" {
+			as, _ := p["accounts"].([]any)
+			accts = append(accts, as...)
+		}
+	}
+	if o, ok := x["openAI"].(map[string]any); ok {
+		as, _ := o["remoteConnectionAccounts"].([]any)
+		accts = append(accts, as...)
+	}
+	var out []loginImport
+	seen := map[string]bool{}
+	for _, a := range accts {
+		a, ok := a.(map[string]any)
+		if !ok {
+			continue
+		}
+		e := loginImport{email: jsonStr(a, "email"), idToken: jsonStr(a, "idToken"), accessToken: jsonStr(a, "accessToken"),
+			refreshToken: jsonStr(a, "refreshToken"), accountID: jsonStr(a, "openAIAccountId")}
+		if e.refreshToken != "" {
+			if seen[e.refreshToken] {
+				continue
+			}
+			seen[e.refreshToken] = true
+		}
+		switch {
+		case agent != "codex":
+			e.err = "a ChatGPT account, not Claude's"
+		case jsonStr(a, "kind") == "api_key":
+			e.err = "an API key, not a sign-in; add it as a key instead"
+		case e.refreshToken == "" && e.accessToken != "":
+			e.err = accessOnly
+		}
+		out = append(out, e)
+	}
+	return out, true
+}
+
+// accessOnly: an account with an access token and no refresh token (a
+// ChatGPT web session, an access-token export) works for days at most and
+// can't be renewed, so it isn't kept as an account that would just stop.
+const accessOnly = "only an access token, no refresh_token: it would stop working within days and can't be renewed; sign in to this account instead"
+
+// importScopes reads a sign-in's scopes, a list or one string of them
+// apart by spaces, as OAuth's scope is.
+func importScopes(v any) []string {
+	var out []string
+	switch sc := v.(type) {
+	case []any:
+		for _, s := range sc {
+			if s, ok := s.(string); ok && s != "" {
+				out = append(out, s)
+			}
+		}
+	case string:
+		out = strings.Fields(sc)
+	}
+	return out
+}
+
+// sub2apiEntry reads one account of a Sub2API export. A ChatGPT one keeps
+// email, id_token and chatgpt_account_id in credentials. A Claude one's
+// credentials are the token Sub2API was given, with Anthropic's own names
+// (email_address, scope, account_uuid, org_uuid), and extra holds the
+// account's email_address and uuids again (useAccountOAuth's
+// buildExtraInfo): email_address alone was "the file doesn't say which
+// Claude account this is" (#1975).
+func sub2apiEntry(agent string, x, c map[string]any) loginImport {
+	name := map[string]string{"codex": "Codex", "claude": "Claude"}[agent]
+	platform := jsonStr(x, "platform")
+	ours := map[string]string{"openai": "codex", "anthropic": "claude", "claude": "claude"}[strings.ToLower(platform)] == agent
+	extra, _ := x["extra"].(map[string]any)
+	e := loginImport{email: cmp.Or(jsonStr(c, "email", "email_address"), jsonStr(extra, "email_address", "email")),
+		idToken: jsonStr(c, "id_token"), accessToken: jsonStr(c, "access_token"), refreshToken: jsonStr(c, "refresh_token"),
+		accountID: jsonStr(c, "chatgpt_account_id", "account_id"), scopes: importScopes(c["scope"]),
+		claudeAccount: cmp.Or(jsonStr(c, "account_uuid"), jsonStr(extra, "account_uuid")),
+		claudeOrg:     cmp.Or(jsonStr(c, "org_uuid"), jsonStr(extra, "org_uuid"))}
+	if n := jsonStr(x, "name"); e.email == "" && strings.Contains(n, "@") {
+		e.email = n // Cockpit Tools names each account by its email
+	}
+	switch typ := strings.ToLower(jsonStr(x, "type")); {
+	case !ours:
+		e.err = fmt.Sprintf("a %s account, not %s's", platform, name)
+	case typ == "apikey":
+		e.err = "an API key, not a sign-in; add it as a key instead"
+	case typ != "oauth":
+		e.err = "not a " + name + " sign-in"
+	case e.refreshToken == "" && e.accessToken != "":
+		e.err = accessOnly
 	}
 	return e
 }
@@ -130,16 +255,21 @@ func loginEntry(agent string, x map[string]any) loginImport {
 // accounts from other tools' files (see above), each file's text one
 // element of files, and says what became of each.
 func ImportLogins(ctx context.Context, agent string, files []string) ([]ImportedAccount, error) {
+	if settings.AccountDiscoveryOff() {
+		return nil, errAccountDiscoveryOff
+	}
 	if agent != "codex" && agent != "claude" {
 		return nil, fmt.Errorf("accounts can't be imported for %s", agent)
 	}
 	var all []loginImport
-	for _, f := range files {
+	for i, f := range files {
 		es, err := parseLoginImport(agent, f)
 		if err != nil {
 			if len(files) == 1 {
 				return nil, err
 			}
+			// one file of several that holds none: said, not passed over
+			all = append(all, loginImport{file: i + 1, err: err.Error()})
 			continue
 		}
 		all = append(all, es...)
@@ -175,12 +305,12 @@ func ImportLogins(ctx context.Context, agent string, files []string) ([]Imported
 	sem := make(chan struct{}, 4)
 	for i, e := range all {
 		name := e.email
-		if name == "" {
+		if name == "" && e.file == 0 {
 			name = fmt.Sprintf("#%d", i+1)
 		}
 		switch {
 		case e.err != "":
-			out[i] = ImportedAccount{User: name, Status: "failed", Error: e.err}
+			out[i] = ImportedAccount{User: name, File: e.file, Status: "failed", Error: e.err}
 			continue
 		case e.refreshToken == "":
 			out[i] = ImportedAccount{User: name, Status: "failed", Error: "no refresh_token in it"}
@@ -271,6 +401,12 @@ func importLogin(ctx context.Context, agent string, e loginImport, name string, 
 			return fail("the file doesn't say which Claude account this is; sign in to it from magpie instead")
 		}
 		acct := map[string]any{"emailAddress": e.email}
+		if e.claudeAccount != "" {
+			acct["accountUuid"] = e.claudeAccount
+		}
+		if e.claudeOrg != "" {
+			acct["organizationUuid"] = e.claudeOrg
+		}
 		l, err = claudeLogin(c, acct)
 	}
 	if err != nil {

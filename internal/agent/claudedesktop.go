@@ -18,8 +18,12 @@ package agent
 //	  "entries":[…,{"id":"<id>","name":"magpie"}]}
 //
 // as CC Switch writes them (claude_desktop_config.rs). The folders are in
-// ~/Library/Application Support on macOS, %LOCALAPPDATA% on Windows and
-// $XDG_CONFIG_HOME on Linux. With no inferenceModels Desktop lists the
+// ~/Library/Application Support on macOS, %LOCALAPPDATA% on Windows (the
+// MSIX package's LocalCache\Local for a packaged Desktop) and
+// $XDG_CONFIG_HOME on Linux, as internal/desktopdir finds them. A
+// packaged Desktop gets all of it twice, in the package's folders and the
+// real ones: up to 2.x it reads the package's copy, from 2.31226 the real
+// %LOCALAPPDATA%\Claude-3p (desktopdir.Sets). With no inferenceModels Desktop lists the
 // gateway's /v1/models, which the gateway gives it by ids it keeps (see
 // gateway/desktop.go). Desktop reads all this at start-up only.
 
@@ -30,12 +34,11 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 	"slices"
-	"sort"
 	"strings"
+	"time"
 
-	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/desktopdir"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
 )
@@ -46,6 +49,7 @@ const desktopProfileID = "00000000-0000-4000-8000-6d6167706965"
 
 // desktopPaths are the files and folders magpie writes for Claude Desktop.
 type desktopPaths struct {
+	key                 string // the stash's keys end with it: "" or ".package"
 	dir, dir3p          string // Claude, Claude-3p
 	config, config3p    string // their claude_desktop_config.json
 	library, meta, prof string // configLibrary, its _meta.json, magpie's profile
@@ -61,105 +65,84 @@ func desktopPathsOf(dir, dir3p string) desktopPaths {
 	}
 }
 
-// desktopDirs are Desktop's Claude and Claude-3p folders on goos.
+// desktopDirs are Desktop's Claude and Claude-3p folders on goos: the ones
+// magpie writes deploymentMode and its profile into (desktopdir.Find).
 func desktopDirs(goos, home string, getenv func(string) string) (string, string) {
-	switch goos {
-	case "darwin":
-		d := filepath.Join(home, "Library", "Application Support")
-		return filepath.Join(d, "Claude"), filepath.Join(d, "Claude-3p")
-	case "windows":
-		d := getenv("LOCALAPPDATA")
-		if d == "" {
-			d = filepath.Join(home, "AppData", "Local")
-		}
-		return windowsDesktopDir(d, false), windowsDesktopDir(d, true)
-	}
-	d := getenv("XDG_CONFIG_HOME")
-	if d == "" || !filepath.IsAbs(d) {
-		d = filepath.Join(home, ".config")
-	}
-	return filepath.Join(d, "Claude"), filepath.Join(d, "Claude-3p")
+	d := desktopdir.Find(goos, home, getenv)
+	return d.Mode, d.ThreeP
 }
 
-// DesktopConfig3p is the claude_desktop_config.json Claude Desktop reads in
-// its 3p mode: there its whole userData is Claude-3p, its MCP servers too
-// (%LOCALAPPDATA%\Claude-3p on Windows, Claude-3p beside Claude elsewhere).
-func DesktopConfig3p(home string) string {
-	_, d := desktopDirs(runtime.GOOS, home, os.Getenv)
-	return filepath.Join(d, "claude_desktop_config.json")
+// desktopSets are those of every set of Desktop's folders, Find's first:
+// for a packaged Desktop the package's and the real ones, each with its
+// own stash.
+func desktopSets(goos, home string, getenv func(string) string) []desktopPaths {
+	var out []desktopPaths
+	for _, d := range desktopdir.Sets(goos, home, getenv) {
+		p := desktopPathsOf(d.Mode, d.ThreeP)
+		if d.Package != "" {
+			p.key = ".package"
+		}
+		out = append(out, p)
+	}
+	return out
 }
 
-// windowsDesktopDir is %LOCALAPPDATA%\Claude (or Claude-3p), else the first
-// folder there named Claude… (with -3p in it or not), as CC Switch finds it.
-func windowsDesktopDir(local string, threep bool) string {
-	name := "Claude"
-	if threep {
-		name = "Claude-3p"
+// DesktopConfigs3p are the claude_desktop_config.json files Claude Desktop
+// reads in its 3p mode: there its whole userData is Claude-3p, its MCP
+// servers too (%LOCALAPPDATA%\Claude-3p on Windows, and the MSIX package's;
+// Claude-3p beside Claude elsewhere).
+func DesktopConfigs3p(home string) []string {
+	var out []string
+	for _, p := range desktopSets(desktopdir.OS, home, os.Getenv) {
+		out = append(out, p.config3p)
 	}
-	exact := filepath.Join(local, name)
-	if _, err := os.Stat(exact); err == nil {
-		return exact
-	}
-	ents, _ := os.ReadDir(local)
-	var found []string
-	for _, e := range ents {
-		if n := e.Name(); e.IsDir() && strings.HasPrefix(n, "Claude") && strings.Contains(n, "-3p") == threep {
-			found = append(found, n)
-		}
-	}
-	if len(found) == 0 {
-		return exact
-	}
-	sort.Strings(found)
-	return filepath.Join(local, found[0])
+	return out
 }
 
 func claudeDesktop(home string) *Agent {
-	p := desktopPathsOf(desktopDirs(runtime.GOOS, home, os.Getenv))
-	// %APPDATA%\Claude is where Desktop keeps its MCP servers on Windows
-	also := ""
-	if runtime.GOOS == "windows" {
-		if d := appdir.Getenv("APPDATA"); d != "" {
-			also = filepath.Join(d, "Claude")
-		}
-	}
+	sets := desktopdir.Sets(desktopdir.OS, home, os.Getenv)
+	ps := desktopSets(desktopdir.OS, home, os.Getenv)
+	p := ps[0]
 	return &Agent{
 		ID: "claude-desktop", Name: "Claude Desktop", Icon: "claude-color", Aliases: []string{"claude-app"},
 		Dir: p.dir, Path: p.config,
 		detect: func() bool {
-			for _, d := range []string{p.dir, p.dir3p, also} {
-				if d == "" {
-					continue
-				}
-				if isDir(d) {
-					return true
+			// its own data (%APPDATA%\Claude on Windows, or the MSIX
+			// package's), the folder magpie writes or Claude-3p
+			for _, s := range sets {
+				for _, d := range s.All() {
+					if isDir(d) {
+						return true
+					}
 				}
 			}
-			return false
+			// installed on Windows and not yet opened: none of them yet
+			return desktopdir.Installed(desktopdir.OS, home, os.Getenv)
 		},
 		Notice: func() string {
-			if desktopWired(p) {
-				return "Claude Desktop reads this at start-up — quit and reopen it to run on magpie (Code and Cowork, no Anthropic sign-in)."
+			if desktopWiredAny(ps) {
+				return noticeClaudedesktop1.String()
 			}
-			return "Claude Desktop reads this at start-up — quit and reopen it to sign in with Anthropic again."
+			return noticeClaudedesktop2.String()
 		},
 		Check: func() string {
-			if !desktopWired(p) {
+			if !desktopWiredAny(ps) {
 				return ""
 			}
-			if m, _ := edit.GetJSON(p.config, "deploymentMode"); m != "3p" {
-				return "Claude Desktop's deploymentMode (claude_desktop_config.json) is no longer 3p, so it signs in with Anthropic rather than using magpie"
+			for _, p := range desktopRead(ps) {
+				if msg := desktopCheck(p); msg != "" {
+					if len(ps) > 1 {
+						msg += " (" + p.dir3p + ")"
+					}
+					return msg
+				}
 			}
-			if id, _ := edit.GetJSON(p.meta, "appliedId"); id != desktopProfileID {
-				return "Claude Desktop uses another gateway configuration now (appliedId in configLibrary/_meta.json), not magpie's"
-			}
-			return wiringOff("Claude Desktop", p.prof, func(k string) (string, bool) { return edit.GetJSON(p.prof, k) },
-				"inferenceGatewayBaseUrl", gateway.URL(), "inferenceGatewayApiKey", gateway.TokenFor("claude-desktop"))
+			return ""
 		},
 		Fields: append([]Field{{
 			Key: "provider", Label: "provider",
 			Get: func() string {
-				if desktopWired(p) {
+				if desktopWiredAny(ps) {
 					return magpieID
 				}
 				return ""
@@ -169,8 +152,11 @@ func claudeDesktop(home string) *Agent {
 				if v == "" {
 					on = desktopOff
 				}
-				if err := on(p); err != nil {
-					return err
+				desktopAdoptStash(ps)
+				for _, p := range ps {
+					if err := on(p); err != nil {
+						return err
+					}
 				}
 				// its Code tab is Claude Code, told what Desktop's ids for
 				// magpie's models can do while that one runs on magpie
@@ -181,8 +167,45 @@ func claudeDesktop(home string) *Agent {
 				return []Option{{Value: magpieID, Label: "magpie", Icon: "magpie",
 					Note: "Desktop's third-party gateway: Code and Cowork on magpie's models, no Anthropic sign-in (restart Desktop)"}}
 			},
-		}}, desktopTierFields(p)...),
+		}}, desktopTierFields(ps)...),
 	}
+}
+
+// desktopRead are the sets of Desktop's folders whose wiring counts: the
+// one whose Claude-3p Desktop ran in last, which is where it reads
+// deploymentMode and the gateway from, or every set when it has run in
+// none. Magpie writes both of a packaged Desktop's sets, not knowing the
+// build: 2.31226's MSIX keeps Claude-3p out of the package
+// (ExcludedDirectory), so the package's copy is one Desktop no longer
+// reads, and one gone from there (emptied by an update) isn't Desktop off
+// magpie (dumplings on Discord: "配置已变更" while Desktop ran on magpie).
+func desktopRead(ps []desktopPaths) []desktopPaths {
+	var newest time.Time
+	var at []desktopPaths
+	for _, p := range ps {
+		if t := desktopdir.LastRun(p.dir3p); t.After(newest) {
+			newest, at = t, []desktopPaths{p}
+		}
+	}
+	if at == nil {
+		return ps
+	}
+	return at
+}
+
+// desktopCheck is what keeps one set of Desktop's folders off magpie's
+// gateway, "" for nothing.
+func desktopCheck(p desktopPaths) string {
+	m, _ := edit.GetJSON(p.config, "deploymentMode")
+	m3, _ := edit.GetJSON(p.config3p, "deploymentMode")
+	if m != "3p" || m3 != "3p" {
+		return "Claude Desktop's deploymentMode (claude_desktop_config.json) is no longer 3p, so it signs in with Anthropic rather than using magpie"
+	}
+	if id, _ := edit.GetJSON(p.meta, "appliedId"); id != desktopProfileID {
+		return "Claude Desktop uses another gateway configuration now (appliedId in configLibrary/_meta.json), not magpie's"
+	}
+	return wiringOff("Claude Desktop", p.prof, func(k string) (string, bool) { return edit.GetJSON(p.prof, k) },
+		"inferenceGatewayBaseUrl", gateway.URL(), "inferenceGatewayApiKey", agentKey("claude-desktop"))
 }
 
 // desktopTierFields pick the model each of Claude Code's tiers runs on in
@@ -190,7 +213,7 @@ func claudeDesktop(home string) *Agent {
 // (gateway.DesktopTiers). Unset, a Claude model magpie serves stands in for
 // its own tier, else the chat's model does. Desktop reads them from the
 // gateway's /v1/models when it starts.
-func desktopTierFields(p desktopPaths) []Field {
+func desktopTierFields(ps []desktopPaths) []Field {
 	var fields []Field
 	for _, tier := range gateway.DesktopTierNames {
 		fields = append(fields, Field{
@@ -204,7 +227,7 @@ func desktopTierFields(p desktopPaths) []Field {
 				return gateway.SetDesktopTier(tier, v)
 			},
 			Options: func(map[string]string) []Option {
-				if !desktopWired(p) {
+				if !desktopWiredAny(ps) {
 					return nil
 				}
 				return viaMagpie("claude-desktop", "")
@@ -219,6 +242,9 @@ func desktopWired(p desktopPaths) bool {
 	entries, _, err := desktopEntries(p.meta)
 	return err == nil && slices.ContainsFunc(entries, desktopOurs)
 }
+
+// desktopWiredAny: any set of Desktop's folders is on magpie.
+func desktopWiredAny(ps []desktopPaths) bool { return slices.ContainsFunc(ps, desktopWired) }
 
 // desktopEntries reads _meta.json's entries, and whether the file is there.
 func desktopEntries(meta string) ([]json.RawMessage, bool, error) {
@@ -269,6 +295,7 @@ func desktopObject(path string) error {
 // The stash keeps what Desktop had before magpie: each file's
 // deploymentMode ("" when it had none), the profile applied, and the
 // files and folders magpie made, so switching off puts all of it back.
+// A package's folders keep theirs under the same keys ending in ".package".
 const (
 	desktopStashed = "claude-desktop.on"
 	desktopMode    = "claude-desktop.mode"
@@ -276,6 +303,35 @@ const (
 	desktopApplied = "claude-desktop.applied"
 	desktopMade    = "claude-desktop.made"
 )
+
+var desktopStashKeys = []string{desktopStashed, desktopMode, desktopMode3p, desktopApplied, desktopMade}
+
+// desktopAdoptStash moves the stash a packaged Desktop's folders got
+// before they had keys of their own (when magpie wrote only one set) onto
+// the package's keys: the stash is theirs when the package's folders are
+// on magpie and the real ones aren't.
+func desktopAdoptStash(ps []desktopPaths) {
+	var pkg, real *desktopPaths
+	for i := range ps {
+		if ps[i].key == ".package" {
+			pkg = &ps[i]
+		} else {
+			real = &ps[i]
+		}
+	}
+	if pkg == nil || real == nil || !desktopWired(*pkg) || desktopWired(*real) {
+		return
+	}
+	m := stashLoad()
+	if m[desktopStashed] == "" || m[desktopStashed+pkg.key] != "" {
+		return
+	}
+	kv := map[string]string{}
+	for _, k := range desktopStashKeys {
+		kv[k+pkg.key], kv[k] = m[k], ""
+	}
+	stash(kv)
+}
 
 // desktopOn points Claude Desktop at the gateway: deploymentMode 3p in both
 // config files, magpie's profile written and applied. Every other key, and
@@ -302,9 +358,10 @@ func desktopOn(p desktopPaths) error {
 		mode, _ := edit.GetJSON(p.config, "deploymentMode")
 		mode3p, _ := edit.GetJSON(p.config3p, "deploymentMode")
 		applied, _ := edit.GetJSON(p.meta, "appliedId")
-		forget(desktopMode, desktopMode3p, desktopApplied, desktopMade)
-		stash(map[string]string{desktopStashed: "1", desktopMode: mode, desktopMode3p: mode3p,
-			desktopApplied: applied, desktopMade: strings.Join(made, "\n")})
+		k := p.key
+		forget(desktopMode+k, desktopMode3p+k, desktopApplied+k, desktopMade+k)
+		stash(map[string]string{desktopStashed + k: "1", desktopMode + k: mode, desktopMode3p + k: mode3p,
+			desktopApplied + k: applied, desktopMade + k: strings.Join(made, "\n")})
 	}
 
 	// the profile: the gateway's address and key set, Desktop's own
@@ -320,7 +377,7 @@ func desktopOn(p desktopPaths) error {
 	kvs := []edit.KV{
 		{Path: "inferenceProvider", Value: "gateway"},
 		{Path: "inferenceGatewayBaseUrl", Value: gateway.URL()},
-		{Path: "inferenceGatewayApiKey", Value: gateway.TokenFor("claude-desktop")},
+		{Path: "inferenceGatewayApiKey", Value: agentKey("claude-desktop")},
 		{Path: "inferenceGatewayAuthScheme", Value: "bearer"},
 	}
 	// policies seeded once: the user may tighten them in Desktop
@@ -364,10 +421,11 @@ func desktopOff(p desktopPaths) error {
 	if err != nil {
 		return err
 	}
-	stashed := unstash(desktopStashed) != ""
-	mode, mode3p, applied := unstash(desktopMode), unstash(desktopMode3p), unstash(desktopApplied)
+	k := p.key
+	stashed := unstash(desktopStashed+k) != ""
+	mode, mode3p, applied := unstash(desktopMode+k), unstash(desktopMode3p+k), unstash(desktopApplied+k)
 	var made []string
-	if m := unstash(desktopMade); m != "" {
+	if m := unstash(desktopMade + k); m != "" {
 		made = strings.Split(m, "\n")
 	}
 	if !stashed && !slices.ContainsFunc(entries, desktopOurs) {
@@ -446,3 +504,9 @@ func desktopEmpty(b []byte) bool {
 	var m map[string]json.RawMessage
 	return json.Unmarshal(b, &m) == nil && len(m) == 0
 }
+
+// what claudedesktop says after a change (notice.go)
+var (
+	noticeClaudedesktop1 = newNotice("Claude Desktop reads this at start-up — quit and reopen it to run on magpie (Code and Cowork, no Anthropic sign-in).")
+	noticeClaudedesktop2 = newNotice("Claude Desktop reads this at start-up — quit and reopen it to sign in with Anthropic again.")
+)

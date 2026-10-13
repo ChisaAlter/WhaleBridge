@@ -66,6 +66,13 @@ func supplierInfo(p provider.Provider) map[string]any {
 			prefs[m] = v
 		}
 	}
+	for ref, n := range set.ModelKinds {
+		if m, ok := strings.CutPrefix(ref, p.ID+"/"); ok {
+			v := prefs[m]
+			v.Kind = &n
+			prefs[m] = v
+		}
+	}
 	for ref, n := range set.ModelPrices {
 		if m, ok := strings.CutPrefix(ref, p.ID+"/"); ok {
 			if price, bad := n.Price(); bad == "" {
@@ -83,7 +90,7 @@ func supplierInfo(p provider.Provider) map[string]any {
 	exposed := map[string]bool{}
 	defaultModels := []string{}
 	defaults := p
-	defaults.Models = nil
+	defaults.Models, defaults.PickedFrom, defaults.NoModels = nil, nil, false
 	for _, m := range defaults.Exposed() {
 		defaultModels = append(defaultModels, m.ID)
 	}
@@ -104,6 +111,17 @@ func supplierInfo(p provider.Provider) map[string]any {
 		row["id"], row["name"], row["provider"] = m.ID, m.Name, m.Provider
 		row["efforts"], row["free"], row["rate"], row["rateWas"] = provider.EffortsOf(m), m.Free, m.Rate, m.RateWas
 		row["context"], row["listed"], row["output"], row["max"] = p.WindowOf(m), provider.ListedWindow(m), p.ReplyLimit(m), m.MaxContext
+		row["inputModalities"], row["outputModalities"] = m.InputModalities, m.OutputModalities
+		kind := ""
+		if m.Draws {
+			kind = provider.KindImage
+		} else if m.Films {
+			kind = provider.KindVideo
+		}
+		row["kind"], row["ownKind"] = kind, kind
+		if kind := p.ModelKind(m.ID); kind != "" {
+			row["kind"], row["kindOverride"] = kind, kind
+		}
 		row["canFast"] = provider.CanFast(p, m.ID)
 		ownImages := m.Images || catalog.SeesImages(m.ID)
 		if m.ImageInput != nil {
@@ -142,18 +160,22 @@ func supplierInfo(p provider.Provider) map[string]any {
 		"chat": p.Chat, "responses": p.Responses, "anthropic": p.Anthropic, "gemini": p.Gemini, "vertex": p.Vertex, "decide": p.Decide, "baseAPI": p.BaseAPI,
 		"catalog": p.Catalog, "family": p.Family, "website": p.Website, "keysUrl": p.KeysURL,
 		"headerNames": headers, "keySet": p.Key != "", "keyMasked": provider.Mask(p.Key), "keyList": keys,
-		"models": p.Models, "chosen": p.Models, "available": available, "modelCount": len(p.Exposed()),
+		"models": p.Models, "chosen": p.Picks(), "noModels": p.NoModels, "pickedFrom": p.PickedFrom, "marksKinds": p.MarksKinds(), "available": available, "modelCount": len(p.Exposed()),
 		"defaultModels": defaultModels,
 		"modelPrefs":    prefs, "modelPrices": prices, "modelNames": p.ModelNames(), "modelEfforts": p.ModelEfforts(),
 		"contexts": p.Contexts, "outputs": provider.OutputsOf(p.ID), "compacts": provider.CompactsOf(p.ID),
 		"ready": p.Ready(), "off": p.Off, "unlisted": p.Unlisted, "searches": p.Searches, "unredacted": p.Unredacted,
 		"routing": p.Routing, "affinity": p.Affinity, "sink": p.Sink, "proxy": p.Proxy, "fallback": p.Fallback,
 		"maxConcurrency": p.MaxConcurrency, "pluginConcurrency": p.PluginConcurrency(), "accountConcurrency": p.AccountConcurrency,
-		"queueLimit": p.QueueLimit, "queueWait": p.QueueWait, "priceRate": p.PriceRate,
+		"queueLimit": p.QueueLimit, "queueWait": p.QueueWait, "priceRate": p.PriceRate, "maxRPM": p.MaxRPM, "quotaRest": p.QuotaRest,
+		"extraBody": p.ExtraBody, "ownClient": p.OwnClient(), "passUserAgent": p.PassUserAgent, "authHeader": p.AuthHeader, "codexAsSent": p.CodexAsSent,
 		"cline": p.ClinePinnable(), "pinUpstream": p.PinUpstream, "balanceURL": p.BalanceURL, "balancePath": p.BalancePath,
 		"modelsURL": p.ModelsURL, "balanceTokenSet": p.BalanceToken != "", "balanceTokenTakes": provider.TakesBalanceToken(p),
-		"account": p.Account != nil, "accountProxies": p.AccountProxies, "accountModels": p.AccountModels, "accountCaps": p.AccountCaps,
+		"account": p.Account != nil, "accountProxies": p.AccountProxies, "accountModels": p.AccountModels, "accountCaps": p.AccountCaps, "accountWindowCaps": p.AccountWindowCaps, "accountNames": p.AccountNames,
 		"modelTest": p.ModelTest(), "decideTest": p.AsksDecideModels(), "listError": p.ListError(),
+	}
+	if vendor := provider.AccessKeyVendor(p); vendor != "" || p.AccessKeyID != "" || p.SecretAccessKey != "" {
+		out["accessKey"] = map[string]any{"vendor": vendor, "id": p.AccessKeyID, "secretSet": p.SecretAccessKey != ""}
 	}
 	if p.Account != nil {
 		out["accountAgent"], out["accountUser"] = p.Account.Agent, p.Account.User
@@ -213,7 +235,7 @@ func bodyValue[T any](in map[string]json.RawMessage, name string) (T, error) {
 // patchProvider preserves every field omitted by the editor. The initial
 // DTO carries only header names; a null header value removes that header.
 func patchProvider(p provider.Provider, in map[string]json.RawMessage) (provider.Provider, error) {
-	allowed := strings.Fields("id name icon iconUrl preset keyName keyProtocol keyWeight keys chat responses anthropic gemini vertex decide baseAPI catalog website keysUrl family models unlisted off contexts fallback routing affinity sink searches pinUpstream unredacted proxy accountProxies accountModels accountCaps accountConcurrency balanceURL balancePath modelsURL zhipuTeam maxConcurrency queueLimit queueWait priceRate")
+	allowed := strings.Fields("id name icon iconUrl preset keyName keyProtocol keyWeight keys chat responses anthropic gemini vertex decide baseAPI catalog website keysUrl family models noModels pickedFrom unlisted off contexts fallback routing affinity sink searches pinUpstream unredacted proxy accountProxies accountModels accountCaps accountWindowCaps accountNames accountConcurrency balanceURL balancePath modelsURL zhipuTeam maxConcurrency queueLimit queueWait priceRate maxRPM quotaRest extraBody passUserAgent authHeader codexAsSent")
 	patch := map[string]json.RawMessage{}
 	for _, k := range allowed {
 		if v, ok := in[k]; ok {
@@ -224,7 +246,7 @@ func patchProvider(p provider.Provider, in map[string]json.RawMessage) (provider
 	if err := json.Unmarshal(data, &p); err != nil {
 		return p, err
 	}
-	for key, dst := range map[string]*int{"queueLimit": &p.QueueLimit, "queueWait": &p.QueueWait} {
+	for key, dst := range map[string]*int{"queueLimit": &p.QueueLimit, "queueWait": &p.QueueWait, "maxRPM": &p.MaxRPM, "quotaRest": &p.QuotaRest} {
 		if string(in[key]) == "null" {
 			*dst = 0
 		}
@@ -271,11 +293,38 @@ func patchProvider(p provider.Provider, in map[string]json.RawMessage) (provider
 	} else if b {
 		p.BalanceToken = ""
 	}
+	if id, err := bodyValue[string](in, "accessKeyID"); err != nil {
+		return p, err
+	} else if strings.TrimSpace(id) != "" {
+		p.AccessKeyID = strings.TrimSpace(id)
+	}
+	if secret, err := bodyValue[string](in, "secretAccessKey"); err != nil {
+		return p, err
+	} else if strings.TrimSpace(secret) != "" {
+		p.SecretAccessKey = strings.TrimSpace(secret)
+	}
+	if clear, err := bodyValue[bool](in, "clearAccessKey"); err != nil {
+		return p, err
+	} else if clear {
+		p.AccessKeyID, p.SecretAccessKey = "", ""
+	}
 	if p.MaxConcurrency != nil && (*p.MaxConcurrency < 0 || *p.MaxConcurrency > provider.MaxLimit) {
 		return p, fmt.Errorf("并发上限必须为 0 到 %d", provider.MaxLimit)
 	}
 	if err := provider.CheckQueue(p.QueueLimit, p.QueueWait); err != nil {
 		return p, err
+	}
+	if err := provider.CheckRPM(p.MaxRPM); err != nil {
+		return p, err
+	}
+	if p.QuotaRest < 0 || p.QuotaRest > provider.MaxQuotaRest {
+		return p, fmt.Errorf("额度冷却时间必须为 0 到 %d 分钟", provider.MaxQuotaRest)
+	}
+	if !slices.Contains(provider.AuthChoices, p.AuthHeader) {
+		return p, fmt.Errorf("认证 Header 只能是自动、x-api-key 或 bearer")
+	}
+	if bad := provider.ExtraBodyOK(p.ExtraBody); bad != "" {
+		return p, fmt.Errorf("%s", bad)
 	}
 	if bad := provider.PriceRateOK(p.PriceRate); bad != "" {
 		return p, fmt.Errorf("%s", bad)
@@ -640,6 +689,7 @@ func providerRoutes(mux *http.ServeMux, server *gateway.Server) {
 			q := url.Values{"id": {p.ID}, "name": {p.Name}, "chat": {p.Chat}, "responses": {p.Responses}, "anthropic": {p.Anthropic}, "catalog": {p.Catalog}, "website": {p.Website}, "keys": {p.KeysURL}, "models": {strings.Join(p.Models, ",")}}
 			clean := *p
 			clean.Key, clean.BalanceToken, clean.Keys, clean.Headers, clean.Account = "", "", nil, nil, nil
+			clean.AccessKeyID, clean.SecretAccessKey = "", ""
 			data, _ := json.Marshal(clean)
 			exported := map[string]any{}
 			_ = json.Unmarshal(data, &exported)
@@ -737,8 +787,10 @@ func providerRoutes(mux *http.ServeMux, server *gateway.Server) {
 					}
 					added = append(added, imported)
 				}
-				if err := syncDSH(); err != nil {
-					http.Error(w, "供应商已导入，但 DSH 渠道同步失败: "+err.Error(), 500)
+				syncErr := syncDSH()
+				syncManagedAgents()
+				if syncErr != nil {
+					http.Error(w, "供应商已导入，但 DSH 渠道同步失败: "+syncErr.Error(), 500)
 					return
 				}
 				writeJSON(w, map[string]any{"ok": true, "added": added})
@@ -854,6 +906,26 @@ func providerRoutes(mux *http.ServeMux, server *gateway.Server) {
 					err = provider.SetAccountCap(id, ref, cap)
 				}
 			}
+		case "accountname", "windowcap":
+			var ref string
+			ref, err = bodyValue[string](in, "account")
+			if err == nil && action == "accountname" {
+				var alias string
+				alias, err = bodyValue[string](in, "alias")
+				if err == nil {
+					err = provider.SetAccountName(id, ref, alias)
+				}
+			} else if err == nil {
+				var window string
+				var cap int
+				window, err = bodyValue[string](in, "window")
+				if err == nil {
+					cap, err = bodyValue[int](in, "cap")
+				}
+				if err == nil {
+					err = provider.SetWindowCap(id, ref, window, cap)
+				}
+			}
 		case "accountconcurrency":
 			var ref string
 			ref, err = bodyValue[string](in, "account")
@@ -864,7 +936,7 @@ func providerRoutes(mux *http.ServeMux, server *gateway.Server) {
 					err = provider.SetAccountConcurrency(id, ref, limit)
 				}
 			}
-		case "prefs", "name", "efforts", "images", "api", "same", "price", "reset":
+		case "prefs", "name", "efforts", "images", "api", "same", "kind", "price", "reset":
 			model, e := bodyValue[string](in, "model")
 			err = e
 			if err != nil {
@@ -908,6 +980,12 @@ func providerRoutes(mux *http.ServeMux, server *gateway.Server) {
 				if err == nil {
 					err = provider.SetModelSame(ref, same)
 				}
+			case "kind":
+				var kind string
+				kind, err = bodyValue[string](in, "kind")
+				if err == nil {
+					err = provider.SetModelKind(ref, kind)
+				}
 			case "price":
 				var price *catalog.Price
 				price, err = bodyValue[*catalog.Price](in, "price")
@@ -915,9 +993,9 @@ func providerRoutes(mux *http.ServeMux, server *gateway.Server) {
 					err = provider.SetModelPrice(ref, price)
 				}
 			case "reset":
-				name, api, same := "", "", ""
+				name, api, same, kind := "", "", "", ""
 				levels := []string{}
-				err = provider.SetModelPrefs(id, map[string]provider.ModelPref{model: {Name: &name, Efforts: &levels, OwnImages: true, API: &api, Same: &same}})
+				err = provider.SetModelPrefs(id, map[string]provider.ModelPref{model: {Name: &name, Efforts: &levels, OwnImages: true, API: &api, Same: &same, Kind: &kind}})
 				if err == nil {
 					err = provider.SetModelPrice(ref, nil)
 				}
@@ -946,8 +1024,10 @@ func providerRoutes(mux *http.ServeMux, server *gateway.Server) {
 			fail(err)
 			return
 		}
-		if err := syncDSH(); err != nil {
-			http.Error(w, "配置已保存，但 DSH 渠道同步失败: "+err.Error(), 500)
+		syncErr := syncDSH()
+		syncManagedAgents()
+		if syncErr != nil {
+			http.Error(w, "配置已保存，但 DSH 渠道同步失败: "+syncErr.Error(), 500)
 			return
 		}
 		writeJSON(w, out)

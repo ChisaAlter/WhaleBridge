@@ -155,6 +155,9 @@ func TestDriftUnwiredEveryAgent(t *testing.T) {
 	// OpenHanako gives the model to an agent of its own
 	os.MkdirAll(filepath.Join(home, ".hanako", "agents", "hana"), 0o755)
 	os.WriteFile(filepath.Join(home, ".hanako", "agents", "hana", "config.yaml"), []byte("agent:\n  name: Hana\n"), 0o644)
+	// AstrBot is connected once it has written its settings
+	os.MkdirAll(filepath.Join(home, ".astrbot", "data"), 0o755)
+	os.WriteFile(filepath.Join(home, ".astrbot", "data", "cmd_config.json"), []byte(astrbotConfig), 0o644)
 	for _, a := range All() {
 		// agy's gateway is in the command that starts it, in no file (its
 		// Check is TestAgy's)

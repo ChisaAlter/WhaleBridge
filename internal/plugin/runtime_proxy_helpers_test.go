@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"net"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"testing"
@@ -9,7 +10,11 @@ import (
 
 func sandbox(t *testing.T) {
 	t.Helper()
-	bun, err := exec.LookPath("bun")
+	bun := os.Getenv("MAGPIE_BUN")
+	var err error
+	if bun == "" {
+		bun, err = exec.LookPath("bun")
+	}
 	if err != nil {
 		t.Skip("no bun on PATH")
 	}

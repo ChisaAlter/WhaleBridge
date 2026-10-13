@@ -43,12 +43,19 @@ func devinCredentialsAt(home string) string {
 }
 
 // devinCommand runs the devin CLI for an account: the CLI's own for home
-// "", else with magpie's home as its data folder.
+// "", else with magpie's home as its data folder. It goes through the
+// proxy ctx names (a sign-in's), else the account's own (devinProxy), as
+// the account's requests do, never always the global one (#1663).
 func devinCommand(ctx context.Context, home, path string, args ...string) *exec.Cmd {
-	if home == "" {
-		return agentCommand(ctx, path, args...)
-	}
 	cmd := proc.CommandContext(ctx, path, args...)
+	proxy := netproxy.Choice(ctx)
+	if proxy == "" {
+		proxy = devinProxy(home)
+	}
+	if home == "" {
+		cmd.Env = netproxy.EnvWith(proxy, nil)
+		return cmd
+	}
 	var env []string
 	for _, e := range os.Environ() {
 		k, _, _ := strings.Cut(e, "=")
@@ -58,8 +65,21 @@ func devinCommand(ctx context.Context, home, path string, args ...string) *exec.
 		}
 		env = append(env, e)
 	}
-	cmd.Env = netproxy.Env(append(env, "XDG_DATA_HOME="+home, "APPDATA="+home))
+	cmd.Env = netproxy.EnvWith(proxy, append(env, "XDG_DATA_HOME="+home, "APPDATA="+home))
 	return cmd
+}
+
+// devinProxy is the proxy of the account signed in in home (the CLI's own
+// for ""), as logins.json names it: that account's (ProxyOfLogin), or the
+// subscription's for a home no account is kept for yet. It reads
+// logins.json without loginsMu, which a caller may hold.
+func devinProxy(home string) string {
+	for _, l := range readLogins() {
+		if l.Agent == "devin" && l.Home == home && (home != "" || l.own()) {
+			return ProxyOfLogin("devin", l.User)
+		}
+	}
+	return ProxyOf("devin")
 }
 
 // devinLogin is a Devin account and the home it is signed in in, "" for
@@ -131,8 +151,8 @@ func removeDevinHome(home string) {
 // addDevinLogin keeps the account just signed in in home, in use beside
 // the others, once the CLI says whose it is. Signed in again, an account
 // keeps the newer home.
-func addDevinLogin(home string) (user, plan string, err error) {
-	user, plan, ok := askDevinIdentityAt(home)
+func addDevinLogin(ctx context.Context, home string) (user, plan string, err error) {
+	user, plan, ok := askDevinIdentityAt(ctx, home)
 	if !ok || user == "" {
 		return "", "", errors.New("signed in, but `devin auth status` doesn't show the account; run it in a terminal to see why")
 	}

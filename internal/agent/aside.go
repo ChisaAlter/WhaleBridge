@@ -59,16 +59,28 @@ func asideIn(at place) *Agent {
 		}
 		a.Fields = append(a.Fields, f)
 	}
+	// which of Aside's accounts magpie configures: empty follows the one
+	// Aside has active (#1499)
+	a.Fields = append(a.Fields, Field{Key: "account", Label: "account", Quiet: true,
+		Get: func() string {
+			if id, ok := asidePicked(); ok {
+				return asideAccountName(id)
+			}
+			return ""
+		},
+		Set:     c.pickAccount,
+		Options: func(cur map[string]string) []Option { return asideAccountOptions(at, cur["account"]) },
+	})
 	return a
 }
 
 var asideRoles = []string{"fast", "standard", "deep", "visual"}
 
 const asideImageKey = "imageGenerationModel"
-const asideAccount = 0
 
-func asideAccountID() string   { return "u0" }
-func asideDir(at place) string { return filepath.Join(at.home, ".aside", "u", "0") }
+// asideDir is the folder of the Aside account magpie configures
+// (asideChoice).
+func asideDir(at place) string { return asideAccountDir(at, asideChoice(at)) }
 
 var asideTimeout = 10 * time.Second
 

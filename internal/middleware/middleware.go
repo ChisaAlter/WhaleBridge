@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/Calcium-Ion/moejs"
+	"github.com/ChisaAlter/WhaleBridge/internal/jsmod"
 	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
 )
 
@@ -155,41 +156,7 @@ func compile(e plugin.Entry, file string) (*mw, error) {
 	if t := plugin.Target(e.Spec); t != file {
 		root = t
 	}
-	src, err := os.ReadFile(file)
-	if err != nil {
-		return nil, err
-	}
-	entry, err := moejs.Compile(file, string(src))
-	if err != nil {
-		return nil, err
-	}
-	mods := map[string]*moejs.Module{file: entry}
-	mod, err := moejs.Link(entry, func(ref moejs.Referrer, spec string) (*moejs.Module, error) {
-		if !strings.HasPrefix(spec, "./") && !strings.HasPrefix(spec, "../") {
-			return nil, fmt.Errorf("%q: a middleware imports only files beside it; bundle packages into it", spec)
-		}
-		from := file
-		if ref != nil {
-			from = ref.Name()
-		}
-		p := filepath.Clean(filepath.Join(filepath.Dir(from), filepath.FromSlash(spec)))
-		if rel, err := filepath.Rel(root, p); err != nil || strings.HasPrefix(rel, "..") {
-			return nil, fmt.Errorf("%q is outside the plugin", spec)
-		}
-		if m, ok := mods[p]; ok {
-			return m, nil
-		}
-		src, err := os.ReadFile(p)
-		if err != nil {
-			return nil, err
-		}
-		m, err := moejs.Compile(p, string(src))
-		if err != nil {
-			return nil, err
-		}
-		mods[p] = m
-		return m, nil
-	})
+	mod, err := jsmod.Compile(root, file, "a middleware")
 	if err != nil {
 		return nil, err
 	}

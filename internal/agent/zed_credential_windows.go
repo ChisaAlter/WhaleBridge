@@ -6,8 +6,6 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
-
-	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
 )
 
 // zedWindowsCredential matches CREDENTIALW. Zed's blob is UTF-8, not UTF-16.
@@ -32,7 +30,7 @@ func saveZedCredential(url string) error {
 		return err
 	}
 	user, _ := windows.UTF16PtrFromString("Bearer")
-	key := []byte(gateway.TokenFor("zed"))
+	key := []byte(agentKey("zed"))
 	credential := zedWindowsCredential{
 		Type: 1, TargetName: target, UserName: user, // CRED_TYPE_GENERIC
 		CredentialBlobSize: uint32(len(key)), CredentialBlob: &key[0],

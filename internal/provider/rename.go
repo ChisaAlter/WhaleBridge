@@ -91,6 +91,7 @@ func Rename(from, to string) error {
 		for k, m := range g.Off {
 			g.Off[k] = renamedRef(m, from, to)
 		}
+		g.Weights = renamedWeights(g.Weights, func(m string) string { return renamedRef(m, from, to) })
 		g.Classifier = renamedRef(g.Classifier, from, to)
 		g.Pick = renamedRef(g.Pick, from, to)
 	}
@@ -168,6 +169,7 @@ func OnAccountIDs() []string {
 func FreeID(id string) string { return freeID(id) }
 
 // hasEndpoint: a provider of the user's, not a subscription's model picks.
+// Vertex AI's has none of the four: it is asked at its project's address.
 func hasEndpoint(p Provider) bool {
 	return p.Chat != "" || p.Responses != "" || p.Anthropic != "" || p.Gemini != "" || p.Decide != "" || p.IsVertex()
 }

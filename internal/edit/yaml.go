@@ -2,6 +2,7 @@ package edit
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io"
 	"strings"
@@ -132,12 +133,45 @@ func SetYAML(path string, kvs ...KV) error {
 				return fmt.Errorf("%s: %s: not YAML: %q", path, kv.Path, string(t))
 			}
 			v = *n
+		} else if r, ok := kv.Value.(json.RawMessage); ok {
+			n, err := yamlOfJSON(r)
+			if err != nil {
+				return fmt.Errorf("%s: %s: %w", path, kv.Path, err)
+			}
+			v = *n
 		} else if err := v.Encode(kv.Value); err != nil {
 			return fmt.Errorf("%s: %w", path, err)
 		}
 		setYAML(root, strings.Split(kv.Path, "."), &v)
 	}
 	return writeYAML(path, root)
+}
+
+// yamlOfJSON is JSON text as a YAML node in block style, its object keys in
+// the order the text has them, where encoding a Go map would sort them.
+func yamlOfJSON(r json.RawMessage) (*yaml.Node, error) {
+	if !json.Valid(r) {
+		return nil, fmt.Errorf("not JSON: %q", string(r))
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(r, &doc); err != nil {
+		return nil, err
+	}
+	if doc.Kind != yaml.DocumentNode || len(doc.Content) != 1 {
+		return nil, fmt.Errorf("not one JSON value: %q", string(r))
+	}
+	var block func(n *yaml.Node)
+	block = func(n *yaml.Node) {
+		// a string keeps its tag, so the encoder still quotes one that
+		// would read as another type ("true", "1")
+		n.Style = 0
+		for _, c := range n.Content {
+			block(c)
+		}
+	}
+	n := doc.Content[0]
+	block(n)
+	return n, nil
 }
 
 // DelYAML removes key paths from a YAML file. A missing file stays missing.
@@ -169,6 +203,26 @@ func DelYAML(path string, keyPaths ...string) error {
 		return nil
 	}
 	return writeYAML(path, root)
+}
+
+// EditYAMLNode hands fn the node at a key path, nil when there is none, to
+// change in place: a list grown by one item keeps the comments on the rest,
+// where SetYAML would write the whole value anew. fn says whether it changed
+// the node, and whether the key is to go instead. The file is written only
+// on a change.
+func EditYAMLNode(path, keyPath string, fn func(n *yaml.Node) (changed, remove bool)) error {
+	root, err := loadYAMLForEdit(path)
+	if err != nil || root == nil {
+		return err
+	}
+	changed, remove := fn(lookupYAML(root, strings.Split(keyPath, ".")))
+	switch {
+	case remove:
+		return DelYAML(path, keyPath)
+	case changed:
+		return writeYAML(path, root)
+	}
+	return nil
 }
 
 // EditYAMLStrings calls fn on every string under the key paths — mapping

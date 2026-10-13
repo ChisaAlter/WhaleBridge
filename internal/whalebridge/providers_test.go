@@ -10,13 +10,18 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/testenv"
 )
+
+var componentHTTPTestOffline sync.Once
 
 type providerHTTP struct {
 	t      *testing.T
@@ -27,6 +32,10 @@ type providerHTTP struct {
 
 func newProviderHTTP(t *testing.T) providerHTTP {
 	t.Helper()
+	componentHTTPTestOffline.Do(testenv.Offline)
+	t.Setenv("MAGPIE_PLUGIN_MARKET", "off")
+	t.Setenv("MAGPIE_BUN", "")
+	t.Setenv("LAUNCHER_COMPONENT_ID", "whalebridge")
 	root := t.TempDir()
 	data, native := filepath.Join(root, "component"), filepath.Join(root, "native")
 	for _, path := range []string{data, native, filepath.Join(root, "dsh")} {
@@ -70,10 +79,216 @@ func newProviderHTTP(t *testing.T) providerHTTP {
 	providerRoutes(mux, g)
 	globalRoutes(mux, g, "http-test")
 	accountRoutes(mux)
+	agentRoutes(mux)
 	mux.HandleFunc("GET /api/state", stateHandler("http-test"))
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 	return providerHTTP{t: t, url: server.URL, vendor: vendor.URL, data: data}
+}
+
+func TestProviderAccessKeySecretContractHTTP(t *testing.T) {
+	a := newProviderHTTP(t)
+	secret := "fixture-account-access-secret-do-not-return"
+	id := a.save(map[string]any{"new": true, "id": "access-relay", "name": "Access relay", "chat": a.vendor + "/v1", "key": "fixture-api-key", "models": []string{"test-model"}, "accessKeyID": " AK-fixture ", "secretAccessKey": " " + secret + " "})
+	if p := a.provider(id); p.AccessKeyID != "AK-fixture" || p.SecretAccessKey != secret {
+		t.Fatal("account access key did not persist trimmed values")
+	}
+	a.save(map[string]any{"id": id, "name": "Edited", "accessKeyID": "", "secretAccessKey": ""})
+	if p := a.provider(id); p.AccessKeyID != "AK-fixture" || p.SecretAccessKey != secret {
+		t.Fatal("blank access-key inputs replaced the saved credentials")
+	}
+	state := a.call("GET", "state", nil, 200)
+	assertSecretsAbsent(t, state, secret)
+	var out struct {
+		Providers []struct {
+			ID        string
+			AccessKey *struct {
+				ID        string
+				SecretSet bool
+			}
+		}
+	}
+	if err := json.Unmarshal(state, &out); err != nil || len(out.Providers) != 1 || out.Providers[0].AccessKey == nil || out.Providers[0].AccessKey.ID != "AK-fixture" || !out.Providers[0].AccessKey.SecretSet || bytes.Contains(state, []byte(`"secretAccessKey"`)) {
+		t.Fatal("initial state did not provide only the safe access-key DTO")
+	}
+	assertSecretsAbsent(t, a.call("POST", "provider/export", map[string]any{"id": id}, 200), secret, "AK-fixture", "fixture-api-key")
+	a.save(map[string]any{"id": id, "accessKeyID": "AK-second"})
+	if p := a.provider(id); p.AccessKeyID != "AK-second" || p.SecretAccessKey != secret {
+		t.Fatal("editing the ID lost the retained secret")
+	}
+	a.save(map[string]any{"id": id, "clearAccessKey": true})
+	if p := a.provider(id); p.AccessKeyID != "" || p.SecretAccessKey != "" {
+		t.Fatal("explicit access-key removal did not clear both credentials")
+	}
+}
+
+func TestProviderSelectionGeminiAndKindHTTP(t *testing.T) {
+	a := newProviderHTTP(t)
+	var listed atomic.Value
+	listed.Store(`{"data":[{"id":"test-model"},{"id":"second-model"}]}`)
+	v := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, listed.Load().(string))
+	}))
+	t.Cleanup(v.Close)
+	id := a.save(map[string]any{"new": true, "id": "selection", "name": "Selection", "chat": v.URL + "/v1", "gemini": v.URL + "/v1beta", "key": "fixture-selection-key"})
+	// The editor selects from the provider's fetched directory. Its picks
+	// are saved after that directory exists, rather than invented before it.
+	a.save(map[string]any{"id": id, "models": []string{"test-model", "second-model"}})
+	if len(a.provider(id).PickedFrom) != 2 {
+		t.Fatal("saving all models did not retain the directory selection snapshot")
+	}
+	listed.Store(`{"data":[{"id":"test-model"},{"id":"second-model"},{"id":"new-model"}]}`)
+	a.call("POST", "provider/models", map[string]any{"id": id}, 200)
+	if picks := a.provider(id).Picks(); !containsContractID(picks, "new-model") {
+		t.Fatalf("a saved all-selection excluded the new directory entry: %v", picks)
+	}
+	a.save(map[string]any{"id": id, "models": []string{}, "noModels": true})
+	if p := a.provider(id); !p.NoModels || len(p.Exposed()) != 0 {
+		t.Fatal("Select none was not durable")
+	}
+	info := supplierInfo(*a.provider(id))
+	if defaults, _ := info["defaultModels"].([]string); len(defaults) == 0 {
+		t.Fatal("a Select-none provider cannot restore its defaults")
+	}
+	a.save(map[string]any{"id": id, "models": []string{"test-model"}, "noModels": false, "modelPrefs": map[string]any{"test-model": map[string]any{"api": "gemini"}}})
+	if settings.Load().ModelAPIs[id+"/test-model"] != "gemini" {
+		t.Fatal("the provider save did not persist Gemini through the core model-API contract")
+	}
+	a.call("POST", "provider/api", map[string]any{"id": id, "model": "test-model", "api": "responses"}, 400)
+	if settings.Load().ModelAPIs[id+"/test-model"] != "gemini" {
+		t.Fatal("an unavailable model API replaced the valid choice")
+	}
+	a.call("POST", "provider/kind", map[string]any{"id": id, "model": "test-model", "kind": "video"}, 200)
+	if settings.Load().ModelKinds[id+"/test-model"] != "video" {
+		t.Fatal("the explicit model-kind API did not persist")
+	}
+	a.call("POST", "provider/kind", map[string]any{"id": id, "model": "test-model", "kind": ""}, 200)
+	a.save(map[string]any{"id": id, "modelPrefs": map[string]any{"test-model": map[string]any{"kind": "image"}}})
+	if settings.Load().ModelKinds[id+"/test-model"] != "image" || supplierInfo(*a.provider(id))["marksKinds"] != true {
+		t.Fatal("the provider editor did not carry kind preferences")
+	}
+}
+
+func containsContractID(ids []string, id string) bool {
+	for _, v := range ids {
+		if v == id {
+			return true
+		}
+	}
+	return false
+}
+
+func TestProviderCompatibilityContractHTTP(t *testing.T) {
+	a := newProviderHTTP(t)
+	id := a.save(map[string]any{"new": true, "id": "compat", "name": "Compatibility", "chat": a.vendor + "/v1", "anthropic": a.vendor, "key": "fixture-compat-key", "models": []string{"test-model"}, "maxRPM": 19, "quotaRest": 30, "passUserAgent": true, "codexAsSent": true, "authHeader": "bearer", "extraBody": map[string]any{"!service_tier": "flex", "prompt_cache_key": "${sessionId}"}})
+	a.save(map[string]any{"id": id, "name": "Renamed label"})
+	p := a.provider(id)
+	if p.MaxRPM != 19 || p.QuotaRest != 30 || !p.PassUserAgent || !p.CodexAsSent || p.AuthHeader != "bearer" || len(p.ExtraBody) != 2 {
+		t.Fatal("an unrelated edit erased request compatibility or rate controls")
+	}
+	before, err := os.ReadFile(provider.Path())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, patch := range []map[string]any{{"maxRPM": -1}, {"maxRPM": 10001}, {"quotaRest": -1}, {"quotaRest": provider.MaxQuotaRest + 1}, {"authHeader": "unknown"}, {"extraBody": map[string]any{"model": "cannot-override"}}} {
+		patch["id"], patch["name"] = id, "Must not save"
+		a.call("POST", "provider/save", patch, 400)
+		after, err := os.ReadFile(provider.Path())
+		if err != nil || !bytes.Equal(before, after) {
+			t.Fatal("invalid request controls partially saved the provider")
+		}
+	}
+	a.save(map[string]any{"id": id, "maxRPM": nil, "quotaRest": nil, "passUserAgent": false, "codexAsSent": false, "authHeader": "", "extraBody": map[string]any{}})
+	p = a.provider(id)
+	if p.MaxRPM != 0 || p.QuotaRest != 0 || p.PassUserAgent || p.CodexAsSent || p.AuthHeader != "" || len(p.ExtraBody) != 0 {
+		t.Fatal("explicit reset of compatibility controls did not persist")
+	}
+}
+
+func TestProviderManualMutationsSyncManagedHTTP(t *testing.T) {
+	a := newProviderHTTP(t)
+	was := gateway.Token
+	gateway.Token = os.Getenv("WHALEBRIDGE_GATEWAY_TOKEN")
+	t.Cleanup(func() { gateway.Token = was })
+	home, _ := os.UserHomeDir()
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	config := filepath.Join(home, ".codex", "config.toml")
+	if err := os.WriteFile(config, []byte("model = \"my-original\"\napproval_policy = \"on-request\"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	unmanaged := filepath.Join(home, ".pi", "agent", "models.json")
+	if err := os.MkdirAll(filepath.Dir(unmanaged), 0700); err != nil {
+		t.Fatal(err)
+	}
+	untouched := []byte(`{"providers":{"own":{"apiKey":"unmanaged-fixture","models":[]}},"custom":"keep"}`)
+	if err := os.WriteFile(unmanaged, untouched, 0600); err != nil {
+		t.Fatal(err)
+	}
+	id := a.save(map[string]any{"new": true, "id": "base", "name": "Base", "chat": a.vendor + "/v1", "key": "fixture-base-key", "models": []string{"test-model"}})
+	a.call("POST", "agent/connect", map[string]any{"id": "codex"}, 200)
+	modelFile := func() []byte {
+		t.Helper()
+		b, err := os.ReadFile(config)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var path string
+		for _, line := range strings.Split(string(b), "\n") {
+			if strings.HasPrefix(line, "model_catalog_json = ") {
+				if err := json.Unmarshal([]byte(strings.TrimPrefix(line, "model_catalog_json = ")), &path); err != nil {
+					t.Fatal(err)
+				}
+			}
+		}
+		if path == "" {
+			t.Fatal("the explicit Agent connection did not supply a model catalog")
+		}
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(filepath.Dir(config), path)
+		}
+		out, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	a.save(map[string]any{"id": id, "models": []string{"test-model", "deepseek-v4.1-flash"}})
+	if !bytes.Contains(modelFile(), []byte("base/deepseek-v4.1-flash")) {
+		t.Fatal("provider save did not sync the managed Agent")
+	}
+	text := `{"id":"imported","name":"Imported","chat":"` + a.vendor + `/v1","key":"fixture-import-key","models":["test-model"]}`
+	a.call("POST", "provider/import", map[string]any{"text": text}, 200)
+	if !bytes.Contains(modelFile(), []byte("imported/test-model")) {
+		t.Fatal("provider import did not sync the managed Agent")
+	}
+	if err := provider.SetHiddenModels("codex", []string{"base/test-model"}); err != nil {
+		t.Fatal(err)
+	}
+	a.call("POST", "keys/add", map[string]any{"id": id, "key": "fixture-second-key"}, 200)
+	if bytes.Contains(modelFile(), []byte("base/test-model")) {
+		t.Fatal("key mutation did not sync the managed Agent's current list")
+	}
+	if err := provider.SetHiddenModels("codex", nil); err != nil {
+		t.Fatal(err)
+	}
+	a.call("POST", "subscription/adapter", map[string]any{"action": "mirror", "enabled": false}, 200)
+	if !bytes.Contains(modelFile(), []byte("base/test-model")) {
+		t.Fatal("adapter mutation did not sync the managed Agent's current list")
+	}
+	if err := provider.SetHiddenModels("codex", []string{"base/test-model"}); err != nil {
+		t.Fatal(err)
+	}
+	a.call("POST", "accounts/import", map[string]any{"agent": "claude", "files": []string{`{"type":"claude","email":"imported@example.invalid","access_token":"fixture-claude-access","refresh_token":"fixture-claude-refresh"}`}}, 200)
+	if bytes.Contains(modelFile(), []byte("base/test-model")) {
+		t.Fatal("account import did not sync the managed Agent's current list")
+	}
+	if got, err := os.ReadFile(unmanaged); err != nil || !bytes.Equal(got, untouched) {
+		t.Fatal("manual mutations changed an Agent the user did not connect")
+	}
+	if ids, err := managedAgents(); err != nil || len(ids) != 1 || ids[0] != "codex" {
+		t.Fatal("manual mutations granted a new Agent connection")
+	}
 }
 
 func (a providerHTTP) call(method, path string, body any, status int) []byte {

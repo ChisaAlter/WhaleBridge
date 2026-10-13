@@ -18,6 +18,9 @@ func (server *Server) drawingModel(request *http.Request, id string) (provider.P
 					return *matched, id, true
 				}
 			}
+			if drawsFamily(*matched, id) {
+				return *matched, id, true
+			}
 		}
 	}
 	if selected, ok := drawer(); ok {

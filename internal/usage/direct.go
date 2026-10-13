@@ -3,6 +3,8 @@ package usage
 import (
 	"sort"
 	"time"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/sessions"
 )
 
 // Direct is a period's calls the agents made on their own, which the gateway
@@ -14,23 +16,63 @@ import (
 // window's Usage tab but not in magpie usage).
 func Direct(p Period) Summary {
 	now := Clock()
-	return direct(p, now, LedgerOfAt(p, Filter{}, now).Rows)
+	return direct(p, now, directRows(p, now))
 }
 
 // Summaries is Summarize(p) and Direct(p) asked at one moment, for a page
 // that shows the two together: asked one after the other, midnight could
 // fall between them and set one day's calls through magpie beside the next
-// day's calls not through it.
+// day's calls not through it. The gateway's sessions are its top
+// summaryCacheSessions (SummarizeTop), of its SessionCount: a page lists a
+// few, and the summary of a long history is then kept rather than worked
+// out again.
 func Summaries(p Period) (Summary, Summary) {
 	now := Clock()
-	return indexedSummary(p, now), direct(p, now, LedgerOfAt(p, Filter{}, now).Rows)
+	return topSummary(p, now, summaryCacheSessions), direct(p, now, directRows(p, now))
+}
+
+// directRows are the rows of LedgerOfAt(p, Filter{}, now) that Direct sums,
+// the calls the agents' session files record that the gateway did not see,
+// worked out without the rest: the gateway's own calls are only matched
+// against them, from the blocks of the ledger's index as they are, not each
+// made into a priced row. Over a long history (Vantiboo1ean, ~750k
+// requests) those were most of the TUI's and magpie usage's wait.
+func directRows(p Period, now time.Time) []Row {
+	since, until := p.Since(now), p.Until(now)
+	reader := LogCalls
+	if reader == nil {
+		reader = func(time.Time) []sessions.Call { return nil }
+	}
+	logs, others := reader(since), sharedRecords(since)
+	matched := map[int]bool{}
+	if len(logs) > 0 {
+		local := &rowChunk{}
+		for i, c := range logs {
+			r := logRecord(c)
+			r.Agent = c.Agent
+			local.add(Row{Record: r}, c.Msg, int64(i), c.Error != "")
+		}
+		var gateways []*rowChunk
+		for _, b := range readLogSnapshot().blocks {
+			if !since.IsZero() && b.Latest.Before(since.Add(-24*time.Hour)) {
+				continue
+			}
+			if c := b.unpack(); c != nil {
+				gateways = append(gateways, c)
+			}
+		}
+		for ref := range matchedBlocks(gateways, []*rowChunk{local}, nil, since, false) {
+			matched[ref.Index] = true
+		}
+	}
+	rows, _, _, _ := ledgerMatched(since, until, Filter{}, nil, logs, others, matched)
+	return rows
 }
 
 func direct(p Period, now time.Time, rows []Row) Summary {
 	s := Summary{Period: p, Since: p.Since(now), Bucket: "day", Agents: []Group{}, Models: []Group{}, ProviderKeys: []Group{}, Accounts: []Group{}, CallerKeys: []Group{}, Sessions: []Group{}, Series: []Point{}}
-	if p != Today && p != Week && p != Month {
-		s.Period = All
-	}
+	s.Period = p.shown()
+	until := p.Until(now)
 	agents, models, accounts, sessions := map[string]*Group{}, map[string]*Group{}, map[string]*Group{}, map[string]*Group{}
 	put := func(m map[string]*Group, k string, g Group, r Row) {
 		if m[k] == nil {
@@ -39,11 +81,11 @@ func direct(p Period, now time.Time, rows []Row) Summary {
 		m[k].addRow(r)
 	}
 	for _, r := range rows {
-		if r.Source != "log" || r.IsRejected() || r.Time.Before(s.Since) {
+		if r.Source != "log" || r.IsRejected() || r.Time.Before(s.Since) || after(until, r.Time) {
 			continue
 		}
 		s.Totals.addRow(r)
-		id := AgentOf(r.Agent)
+		id := ReportedAs(r.Agent)
 		put(agents, id, Group{ID: id}, r)
 		put(models, r.Provider+"/"+r.Model, Group{ID: r.Provider + "/" + r.Model, Provider: r.Provider, Model: r.Model}, r)
 		if who := r.Account(); who != "" {
@@ -70,5 +112,6 @@ func direct(p Period, now time.Time, rows []Row) Summary {
 		return gs
 	}
 	s.Agents, s.Models, s.Accounts, s.Sessions = list(agents), list(models), list(accounts), list(sessions)
+	s.SessionCount = len(s.Sessions)
 	return s
 }

@@ -86,6 +86,54 @@ test('real WhaleBridge account UI retains connection feedback and consistent res
       agent: 'cursor', plugin: true, method: 0, inputs: { tenant: 'fixture-tenant', region: 'eu' },
     }, 'sign-in receives the accepted sequential prompt answers');
 
+    const parity = result.accountParity;
+    assert.equal(parity.initial.alias, 'Personal fixture', 'the account alias is visible on its original management row');
+    assert.ok(parity.initial.identity.includes('fixture.person@example.test'), 'an alias does not hide the original account identity');
+    for (const text of ['Fixture shared seat', '最近成功请求', '重置使用记录', '手动使用', '2 个窗口', '重置到期时间', '配置套餐访问凭据']) {
+      assert.ok(parity.initial.detail.includes(text), `the safe quota DTO exposes ${text} on the original account surface`);
+    }
+    assert.ok(parity.initial.lapsed.includes('revoked; sign in again'), 'the vendor refusal reason remains visible');
+    assert.equal(parity.initial.lapsedToggleDisabled, true, 'a revoked/lapsed sign-in cannot be misleadingly enabled');
+    assert.equal(parity.initial.canRelogin, true, 're-login remains actionable when authorization lapsed');
+    assert.equal(parity.initial.canRemove, true, 'the lapsed account retains its removal action');
+    assert.deepEqual(parity.refreshQueries, ['', '?refresh=true'], 'automatic account reads and explicit refresh retain distinct HTTP requests');
+    assert.equal(parity.accessKeyTarget.name, 'Fixture plan credential settings', 'NeedsAccessKey opens the actual linked provider editor');
+    assert.deepEqual(parity.draftReads, ['', ''], 'both delayed ordinary HTTP reads actually execute');
+    assert.deepEqual(parity.draftLate, {
+      alias: 'Draft personal name', checkin: false, cap: '88', proxy: 'http://fixture-draft-proxy.invalid:8118',
+      windows: ['5 hours 使用上限（%）', 'Weekly 使用上限（%）'],
+    }, 'late usage adds the newly reported window without overwriting the account drafts or adding unlimited/tier caps');
+    const written = path => parity.writes.filter(call => call.path === path).map(call => call.body);
+    assert.deepEqual(written('/api/accounts/name'), [{ id: 'qoder', user: 'fixture.person@example.test', alias: 'Draft personal name' }]);
+    assert.deepEqual(written('/api/accounts/checkin'), [{ key: 'fixture-checkin-account', on: false }], 'the checkbox changes only the backend-provided account check-in key');
+    assert.deepEqual(written('/api/accounts/windowcap'), [
+      { id: 'qoder', user: 'fixture.person@example.test', window: 'fiveHour', cap: 88 },
+      { id: 'qoder', user: 'fixture.person@example.test', window: 'weekly', cap: 100 },
+    ], 'window cap writes retain the reported cap IDs and the 100 no-cap value');
+    assert.ok(parity.saved.includes('Draft personal name'), 'reopening uses the alias persisted by the HTTP fixture');
+    assert.ok(parity.saved.includes('此账号不参与每日签到'), 'the saved account participation is read back');
+    assert.equal(parity.cleared, 'fixture.person@example.test', 'clearing an alias restores the original identity');
+    assert.deepEqual(parity.clearWrites.filter(c => c.path === '/api/accounts/windowcap').map(c => c.body), [
+      { id: 'qoder', user: 'fixture.person@example.test', window: 'fiveHour', cap: 0 },
+      { id: 'qoder', user: 'fixture.person@example.test', window: 'weekly', cap: 0 },
+    ], 'both an empty cap and an explicit zero return to inheritance');
+    assert.equal(parity.reloginForm.hasProxy, false, 're-login does not invent an extra proxy control');
+    assert.ok(parity.reloginForm.identity.includes('fixture.person@example.test'));
+    assert.equal(parity.relogin.user, 'fixture.person@example.test', 'explicit re-login sends the original account identity');
+    assert.equal(Object.hasOwn(parity.relogin, 'proxy'), false, 'omitted login proxy is not converted to an empty override');
+    assert.equal(parity.proxyAfterRelogin, 'http://fixture-draft-proxy.invalid:8118', 'the existing independently saved account proxy remains intact');
+    assert.equal(parity.copilotSite, 'fixture-enterprise.ghe.com', 'Copilot enterprise re-login preserves its host');
+    assert.equal(parity.copilotSignin.site, 'fixture-enterprise.ghe.com');
+    assert.equal(parity.copilotSignin.user, 'fixture-person@fixture-enterprise.ghe.com');
+    assert.equal(Object.hasOwn(parity.switchedSignin, 'user'), false, 'switching providers cannot send the previous account identity');
+    assert.equal(parity.switchedSignin.agent, 'codex');
+    assert.deepEqual(parity.pluginSignin, { agent: 'cursor', plugin: true, method: 0, inputs: {}, user: 'fixture.person@example.test' },
+      'the plugin OAuth path preserves the canonical provider and original account');
+    assert.deepEqual(parity.claudeRefresh, ['', '?refresh=true'], 'saved Claude can still request explicit refresh through the original account button');
+    assert.deepEqual(parity.staleList, { type: 'sources', scope: 'plans', open: true }, 'a late account list cannot replace an immediately reopened source picker');
+    assert.deepEqual(parity.staleQuota, { type: 'sources', scope: 'api', open: true, injectedAccountQuota: false },
+      'a completed usage read cannot inject data into a closed/replaced account editor');
+
     const assertSuccess = (success, title, provider) => {
       assert.equal(success.open, true, 'a successful connection remains in its modal until acknowledged');
       assert.equal(success.visible, true, 'success feedback has rendered geometry');
@@ -193,7 +241,7 @@ test('real WhaleBridge account UI retains connection feedback and consistent res
       assert.equal(row.regionGap, 20, 'the conditional region field is separated from credential tools');
       assert.equal(row.workspaceGap, 20, 'the workspace field is separated from its selected region');
       assert.equal(row.proxyGap, 20, 'the conditional proxy field is separated from proxy policy');
-      assert.deepEqual(row.sections.map(section => section.id), ['connection','models','allocation','limits','network','balance','headers','identity']);
+      assert.deepEqual(row.sections.map(section => section.id), ['connection','models','allocation','limits','network','compatibility','balance','headers','identity']);
       for (const section of row.sections) assertDialog(section.dialog, `provider ${section.id} ${row.scheme} ${row.dialog.width}px`);
       assertDialog(row.dialog, `provider ${row.scheme} ${row.dialog.width}px`);
     }

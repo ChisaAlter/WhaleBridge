@@ -71,8 +71,8 @@ type describeFor struct {
 	session string
 }
 
-func withDescribeFor(ctx context.Context, agent, model, session string) context.Context {
-	return context.WithValue(ctx, describeForKey{}, describeFor{&CallFor{Agent: agent, Model: model}, session})
+func withDescribeFor(ctx context.Context, agent, model, session string, unknown bool) context.Context {
+	return context.WithValue(ctx, describeForKey{}, describeFor{&CallFor{Agent: agent, Model: model, Unknown: unknown, Missing: VisionMissing()}, session})
 }
 
 func describedFor(ctx context.Context) *CallFor {
@@ -94,13 +94,17 @@ func blindTo(pid, model string, in *bool) bool {
 
 // seer is the model that describes images: the Settings' Vision while it
 // resolves, else AutoVision's. None when Vision is off or no model sees.
+// A Vision that no longer resolves (its provider removed or off, the model
+// gone) is not described with in silence by AutoVision's: VisionMissing
+// names it, the description's row in Routing and Settings › Models say it
+// is missing, and a request turned away for want of a describer says so.
 func seer() (string, bool) {
 	switch v := provider.HeldSettings().Vision; v {
 	case "off":
 		return "", false
 	case "":
 	default:
-		if _, _, ok := provider.Resolve(v); ok {
+		if pickedMissing(v) == "" {
 			return v, true
 		}
 	}
@@ -108,11 +112,74 @@ func seer() (string, bool) {
 	return m, m != ""
 }
 
+// VisionMissing is the model Settings › Models › Image recognition names
+// when magpie can't find it any more, so that AutoVision's describes in its
+// place. "" when none is named, Vision is off, or it resolves.
+func VisionMissing() string { return pickedMissing(provider.HeldSettings().Vision) }
+
+// pickedMissing is a model the user picked in Settings (v) that doesn't
+// resolve: "" for none picked, off, or one magpie finds.
+func pickedMissing(v string) string {
+	if v == "" || v == "off" {
+		return ""
+	}
+	if _, _, ok := provider.Resolve(v); ok {
+		return ""
+	}
+	return v
+}
+
+// missingSeerNote is what a request turned away, or whose image wasn't
+// described, says of a picked Image recognition model that is missing.
+func missingSeerNote() string {
+	if v := VisionMissing(); v != "" {
+		return fmt.Sprintf("; the Image recognition model picked in magpie's Settings, %q, isn't set up any more: pick another in Settings → Models → Image recognition", v)
+	}
+	return ""
+}
+
+// noSeerNote is what a request turned away for an image says of why no
+// model described it: the picked one is missing, Image recognition is
+// off, or none of the models the user enabled can see.
+func noSeerNote() string {
+	if n := missingSeerNote(); n != "" {
+		return n
+	}
+	if provider.HeldSettings().Vision == "off" {
+		return "; Image recognition is off in magpie's Settings → Models"
+	}
+	if _, ok := seer(); !ok {
+		return "; none of the models enabled in magpie can see images to describe it: enable one that can, or pick one in Settings → Models → Image recognition"
+	}
+	return ""
+}
+
+// autoSeerNote is what a request whose image wasn't described says of a
+// describer magpie picked itself, which the user may not know of.
+func autoSeerNote(see string) string {
+	if provider.HeldSettings().Vision != "" {
+		return ""
+	}
+	return fmt.Sprintf("; magpie picked %s of the models you enabled: pick another in Settings → Models → Image recognition", see)
+}
+
 // AutoVision is the model magpie picks to describe images when the
-// Settings name none: a small model that sees of the providers set up — a
+// Settings name none: a small model that sees, of the models the user
+// enabled on the providers switched on (smallModel) — a
 // Claude account's, a Codex account's, the cheapest of an API key's,
-// another account's. "" when no model sees.
+// another account's. One with allowance left goes before one whose every
+// account or key is out of it (smallReady), whatever their order: the
+// one out is picked only when every model that sees is, so that agents
+// are still told images are described (provider.Described), and
+// askVisionWith says when it is back instead of asking (#1801). "" when
+// no model sees.
 func AutoVision() string {
+	m, _ := autoVision()
+	return m
+}
+
+// autoVision is AutoVision's pick, and whether it has allowance left.
+func autoVision() (string, bool) {
 	tier := func(p provider.Provider) int {
 		switch {
 		case p.Account != nil && p.Account.Agent == "claude":
@@ -124,24 +191,59 @@ func AutoVision() string {
 		}
 		return 3
 	}
-	best, bestTier, bestCost := "", 0, 0.0
+	best, bestTier, bestCost, bestReady := "", 0, 0.0, false
 	for _, p := range provider.All() {
 		if !p.On() || p.DecideOnly() {
 			continue
 		}
 		t := tier(p)
-		if best != "" && t > bestTier {
+		if bestReady && t > bestTier {
 			continue
 		}
-		m, cost := smallModelWhere(p, sees)
+		m, cost, ready := smallModelWhere(p, sees)
 		if m == "" {
 			continue
 		}
-		if best == "" || t < bestTier || cost < bestCost {
-			best, bestTier, bestCost = p.ID+"/"+m, t, cost
+		switch {
+		case best == "", ready && !bestReady:
+		case ready != bestReady, t > bestTier:
+			continue
+		case t == bestTier && cost >= bestCost:
+			continue
 		}
+		best, bestTier, bestCost, bestReady = p.ID+"/"+m, t, cost, ready
 	}
-	return best
+	return best, bestReady
+}
+
+// autoSpent is why AutoVision's model isn't asked to describe an image:
+// it is out of its allowance, as every model that sees is (spentModel),
+// and would only be refused again. nil when it has allowance, or when
+// the Settings name the model, which is asked as the user picked it.
+func autoSpent(model string) error {
+	if !autoDescribes() {
+		return nil
+	}
+	p, m, ok := provider.Resolve(model)
+	if !ok {
+		return nil
+	}
+	back, spent := spentModel(p, m, provider.Chat, time.Now())
+	if !spent {
+		return nil
+	}
+	when := ""
+	if !back.IsZero() {
+		when = " until " + back.Local().Format("Jan 2 15:04")
+	}
+	return fmt.Errorf("%s is out of its allowance%s, as is every other model magpie could describe it with, and none is asked until one is back", model, when)
+}
+
+// autoDescribes is whether the model that describes images is
+// AutoVision's: the Settings name none, or one that is missing.
+func autoDescribes() bool {
+	v := provider.HeldSettings().Vision
+	return v == "" || pickedMissing(v) != ""
 }
 
 // sees is whether a model takes images.
@@ -160,7 +262,8 @@ type sight struct {
 // image: a request that sends it again, or sends it while it is being
 // described, is given the same description.
 func (s *Server) describe(ctx context.Context, model, src string) (string, error) {
-	sum := sha256.Sum256([]byte(model + "\x00" + src))
+	// a level picked since is asked again, not given what was said at the last
+	sum := sha256.Sum256([]byte(model + "\x00" + visionEffort(model) + "\x00" + src))
 	key := hex.EncodeToString(sum[:])
 	s.sightMu.Lock()
 	if e, ok := s.sights[key]; ok {
@@ -199,22 +302,35 @@ func (s *Server) describe(ctx context.Context, model, src string) (string, error
 // askVision asks model through the gateway itself, as a client would, what
 // the image at src shows.
 func (s *Server) askVision(ctx context.Context, model, src string) (string, error) {
+	return s.askVisionWith(ctx, model, src, visionSystem, "Describe this image.")
+}
+
+// askVisionWith asks model about the image at src: system, and the user's
+// text beside the image.
+func (s *Server) askVisionWith(ctx context.Context, model, src, system, text string) (string, error) {
+	if err := autoSpent(model); err != nil {
+		return "", err
+	}
 	ctx, cancel := context.WithTimeout(context.WithValue(ctx, describingKey{}, true), visionTimeout)
 	defer cancel()
 	req := map[string]any{
 		"model":  model,
 		"stream": false,
 		"messages": []map[string]any{
-			{"role": "system", "content": visionSystem},
+			{"role": "system", "content": system},
 			{"role": "user", "content": []map[string]any{
-				{"type": "text", "text": "Describe this image."},
+				{"type": "text", "text": text},
 				{"type": "image_url", "image_url": map[string]string{"url": src}},
 			}},
 		},
 		"max_tokens": 4096,
 	}
-	if effort := classifyEffort(model); effort != "" {
+	if effort := visionEffort(model); effort != "" {
 		req["reasoning_effort"] = effort
+		// a level picked in Settings is given room to think in
+		if picked := sideEffort(model, provider.HeldSettings().VisionEffort); picked != "" {
+			req["max_tokens"] = replyRoom(4096, picked)
+		}
 	}
 	body, _ := json.Marshal(req)
 	r, err := http.NewRequestWithContext(magpieChose(ctx), http.MethodPost, "http://magpie/v1/chat/completions", nil)
@@ -314,16 +430,17 @@ func (s *Server) seenBody(ctx context.Context, proto provider.Protocol, body []b
 }
 
 // smallModelWhere is smallModel among the provider's models that keep
-// holds, and what it costs; "" when there is none.
-func smallModelWhere(p provider.Provider, keep func(catalog.Model) bool) (string, float64) {
-	id := smallModel(p, keep)
+// holds, what it costs, and whether it has allowance left (smallReady);
+// "" when there is none.
+func smallModelWhere(p provider.Provider, keep func(catalog.Model) bool) (string, float64, bool) {
+	id, ready := smallReady(p, keep, provider.Chat)
 	if id == "" {
-		return "", 0
+		return "", 0, false
 	}
-	for _, m := range p.Available() {
+	for _, m := range p.Exposed() {
 		if m.ID == id && m.Price != nil {
-			return id, m.Price.Input + m.Price.Output
+			return id, m.Price.Input + m.Price.Output, ready
 		}
 	}
-	return id, 1e9
+	return id, 1e9, ready
 }

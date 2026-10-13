@@ -41,7 +41,7 @@ func syncDSH() error {
 	out := make([]routeModel, 0, len(models))
 	for i, m := range models {
 		row := routeModel{ID: m.ID, Name: labels[i], ContextWindow: m.Context, MaxTokens: m.Output}
-		row.CompactionThreshold = provider.CompactSetIn(modelSettings, m.ID, findGroup)
+		row.CompactionThreshold = provider.CompactFor(modelSettings, m, findGroup)
 		if row.CompactionThreshold == 0 && compactAt > 0 && row.ContextWindow > compactAt {
 			row.CompactionThreshold = compactAt
 		}

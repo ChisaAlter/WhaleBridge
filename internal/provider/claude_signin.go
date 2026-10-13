@@ -12,6 +12,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -23,6 +24,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/claudecode"
 	"github.com/ChisaAlter/WhaleBridge/internal/netproxy"
 	"github.com/ChisaAlter/WhaleBridge/internal/proc"
 	"github.com/ChisaAlter/WhaleBridge/internal/wslrun"
@@ -141,7 +143,7 @@ func (c claudeCLI) env(env []string) []string {
 func startClaudeSignIn(s *signInFlow) error {
 	cli, ok := findClaudeCLI()
 	if !ok {
-		return errors.New("install Claude Code first: magpie signs in to Claude through it")
+		return errors.New("install Claude Code first, the `claude` command line (the Claude desktop app is not it): magpie signs in to Claude through it; " + claudecode.InstallHint)
 	}
 	if err := os.MkdirAll(claudeDirsRoot(), 0o700); err != nil {
 		return err
@@ -159,7 +161,8 @@ func startClaudeSignIn(s *signInFlow) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := cli.command(ctx, "auth", "login", "--claudeai")
 	cmd.Dir = dir
-	cmd.Env = cli.env(netproxy.Env(env))
+	// through the proxy the account's requests will go through (#1663)
+	cmd.Env = cli.env(netproxy.EnvWith(s.proxy, env))
 	in, err := cmd.StdinPipe()
 	if err != nil {
 		cancel()
@@ -185,7 +188,10 @@ func startClaudeSignIn(s *signInFlow) error {
 
 	printed := make(chan string, 1)
 	exited := make(chan string, 1)
+	var said lastSaid
+	claudeLogins.Add(1)
 	go func() {
+		defer claudeLogins.Done()
 		sc := bufio.NewScanner(out)
 		var tail []string
 		for sc.Scan() {
@@ -199,6 +205,7 @@ func startClaudeSignIn(s *signInFlow) error {
 			}
 			if line = strings.TrimSpace(strings.TrimPrefix(line, "Paste code here if prompted >")); line != "" {
 				tail = append(tail, line)
+				said.set(line)
 			}
 		}
 		err := cmd.Wait()
@@ -209,7 +216,7 @@ func startClaudeSignIn(s *signInFlow) error {
 			msg = tail[n-1]
 		}
 		if err == nil {
-			l, lerr := claudeSignedIn(cli, dir)
+			l, lerr := claudeSignedIn(cli, dir, s.proxy)
 			if lerr == nil {
 				var using bool
 				if using, lerr = addLogin(l); lerr == nil {
@@ -250,7 +257,7 @@ func startClaudeSignIn(s *signInFlow) error {
 		case <-grace:
 			if link == "" {
 				cancel()
-				return errors.New("claude auth login gave no link to open")
+				return claudeNoLink(cli, said.get())
 			}
 			s.mu.Lock()
 			s.st.URL, s.st.PasteCode = link, true
@@ -259,6 +266,38 @@ func startClaudeSignIn(s *signInFlow) error {
 		case <-tick.C:
 		}
 	}
+}
+
+// claudeLogins counts the runs of `claude auth login` still going on,
+// to the end of what each does after the CLI exits (the account added, its
+// folder removed). A sign-in that gave up has killed its run, but the run
+// may still be letting go; tests wait for it before the next one starts.
+var claudeLogins sync.WaitGroup
+
+// lastSaid is the last line a login command printed, which says why
+// there's no link.
+type lastSaid struct {
+	mu   sync.Mutex
+	line string
+}
+
+func (l *lastSaid) set(s string) { l.mu.Lock(); l.line = s; l.mu.Unlock() }
+
+func (l *lastSaid) get() string { l.mu.Lock(); defer l.mu.Unlock(); return l.line }
+
+// claudeNoLink is the error of a `claude auth login` that gave no link in
+// linkWait: what it last printed, or, when it printed nothing at all, the
+// program that was run, which may be a script that never starts Claude
+// Code (deluxe on Discord: a mise wrapper running itself), and how to see
+// what it does.
+func claudeNoLink(cli claudeCLI, last string) error {
+	if last != "" {
+		return errors.New("claude auth login gave no link to open: " + last)
+	}
+	if cli.path == "" {
+		return fmt.Errorf("claude auth login gave no link to open and printed nothing in %s", linkWait)
+	}
+	return fmt.Errorf("claude auth login gave no link to open: %s printed nothing in %s; run `%s auth login` in a terminal to see what it does", cli.path, linkWait, cli.path)
 }
 
 // claudeCallbackPort is the port a Claude sign-in page sends the browser
@@ -285,8 +324,8 @@ func isLoopback(host string) bool {
 
 // claudeSignedIn is the account `claude auth login` signed in to in config
 // directory dir, as magpie keeps it: the sign-in Claude Code kept, and who
-// it says that is.
-func claudeSignedIn(cli claudeCLI, dir string) (savedLogin, error) {
+// it says that is, asked through the sign-in's proxy.
+func claudeSignedIn(cli claudeCLI, dir, proxy string) (savedLogin, error) {
 	c, ok := readClaudeDir(dir)
 	if !ok {
 		return savedLogin{}, errors.New("Claude Code signed in, but kept no sign-in magpie can read")
@@ -295,7 +334,7 @@ func claudeSignedIn(cli claudeCLI, dir string) (savedLogin, error) {
 	defer cancel()
 	cmd := cli.probe(ctx, "auth", "status", "--json")
 	cmd.Dir = dir
-	cmd.Env = cli.env(claudeSignInEnv(os.Environ(), dir))
+	cmd.Env = cli.env(netproxy.EnvWith(proxy, claudeSignInEnv(os.Environ(), dir)))
 	b, _ := cmd.Output()
 	var status struct {
 		Email            string `json:"email"`

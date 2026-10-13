@@ -59,7 +59,7 @@ const server = http.createServer(async (req,res) => {
  if(u.pathname==='/api/global')return json({settings:globalSettings,modelPrices,sync:syncSettings});
  if(u.pathname==='/api/global/settings'){Object.assign(globalSettings,body);return json({ok:true});}
  if(u.pathname==='/api/model-price'){modelPrices[body.id]=body.price;return json({ok:true});}
- if(u.pathname==='/api/sync/save'){syncSettings={...body,on:true};return json({ok:true});}
+ if(u.pathname==='/api/sync/save'){syncSettings={...body,on:true,undo:true};return json({ok:true});}
  if(u.pathname==='/api/sync/auto'){syncSettings.autoEvery=body.minutes;return json({ok:true});}
  if(u.pathname==='/api/sync/now')return json({ok:true});
  if(u.pathname==='/api/quotas')return json([{provider:'codex',name:'Fixture Codex',user:'Fixture Codex account',windows:[]}]);
@@ -211,7 +211,7 @@ async function run(){
   heldPath='/api/accounts/qa2/usage';await click('[data-action="accounts"][data-id="qa2"]');
   await wait(`editor?.type==='accounts'`);await held();
   assert.equal(await js(`document.querySelector('[data-action="accounts-refresh"]').textContent`),'刷新中');
-  assert.equal(await js(`document.querySelector('[data-account-quota]').textContent`),'');await screenshot('account-quota-busy');win.setContentSize(380,520);await wait('innerWidth===380');await screenshot('account-quota-busy-narrow');win.setContentSize(1120,780);await wait('innerWidth===1120');
+  assert.equal(await js(`document.querySelector('[data-account-quota]').textContent`),'正在读取额度…');await screenshot('account-quota-busy');win.setContentSize(380,520);await wait('innerWidth===380');await screenshot('account-quota-busy-narrow');win.setContentSize(1120,780);await wait('innerWidth===1120');
   release();await wait(`document.querySelector('[data-account-quota]').textContent==='15'&&!document.querySelector('[data-action="accounts-refresh"]').disabled`);await close();
   installed=false;await subscribe();await js(`document.querySelector('#f-agent').value='claude';document.querySelector('#f-agent').dispatchEvent(new Event('change'))`);await click('#save');
   await wait(`document.querySelector('#save').textContent==='准备中'`);assert.equal(await js(`!document.querySelector('#save').hidden&&!!document.querySelector('#save .button-spinner')`),true);await screenshot('auth-tool-busy');
@@ -280,7 +280,7 @@ async function run(){
   await section('backup');await wait(`document.querySelector('#sync-form')`);await type('#sync-form [name="url"]','https://fixture.invalid/sync');await type('#sync-form [name="user"]','submitted-sync-user');heldPath='/api/sync/save';await click('#sync-form [type="submit"]');await held();await type('#sync-form [name="user"]','edited-sync-draft');release();await wait(`!document.querySelector('#sync-form [type="submit"]').disabled`);
   assert.equal(await js(`document.querySelector('#sync-form [name="user"]').value`),'edited-sync-draft');assert.equal(calls.filter(c=>c.path==='/api/sync/save').at(-1).body.user,'submitted-sync-user');
   await section('connection');await section('backup');assert.equal(await js(`document.querySelector('#sync-form [name="user"]').value`),'edited-sync-draft','sync draft survives round trip');await screenshotPair('sync-save-new-draft','#sync-form [name="user"]');
-  }else{syncSettings={on:true,url:'https://fixture.invalid/sync',user:'edited-sync-draft',auto:3};await click('[data-tab="settings"]');await wait(`document.querySelector('[data-global-section="privacy"]')`);}
+  }else{syncSettings={on:true,url:'https://fixture.invalid/sync',user:'edited-sync-draft',auto:3,undo:true};await click('[data-tab="settings"]');await wait(`document.querySelector('[data-global-section="privacy"]')`);}
   // A real success/error message must leave the affected controls visible and clickable.
   nativeTheme.themeSource='light';
   const hitClick=selector=>js(`(()=>{const b=document.querySelector(${JSON.stringify(selector)}),r=b.getBoundingClientRect(),hit=document.elementFromPoint(r.x+r.width/2,r.y+r.height/2);if(hit!==b&&!b.contains(hit))throw Error('Target covered: '+${JSON.stringify(selector)});hit.closest('button').click();})()`);

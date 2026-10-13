@@ -38,7 +38,7 @@ const agyModels = "customModelsConfig.customModels"
 // (x-goog-api-key) alone. A command copied before, with the plain token,
 // still reaches magpie.
 func AgyLaunch(model string) string {
-	key := gateway.TokenFor("agy")
+	key := agentKey("agy")
 	if runtime.GOOS == "windows" {
 		return `$env:GEMINI_API_KEY="` + key + `"; $env:GOOGLE_GEMINI_BASE_URL="` + gateway.URL() + `"; agy --model '` + strings.ReplaceAll(model, "'", "''") + `'`
 	}
@@ -98,7 +98,7 @@ func agy(home string) *Agent {
 		return edit.SetJSON(path, edit.KV{Path: key, Value: v})
 	}
 	return &Agent{
-		ID: "agy", Name: "Antigravity CLI", Icon: "antigravity-color", Aliases: []string{"antigravity-cli"}, Spelled: prefixed,
+		ID: "agy", Name: "Antigravity CLI", Icon: "antigravity-color", Aliases: []string{"antigravity-cli"}, Spelled: prefixed, NoNames: true,
 		Bin: "agy", Dir: dir, Path: path,
 		Launch: func() string {
 			if v := get(); usesMagpie(v) {
@@ -117,7 +117,7 @@ func agy(home string) *Agent {
 			if !usesMagpie(v) {
 				return ""
 			}
-			return "agy takes magpie's gateway and model only from how it is started — start it with " + AgyLaunch(v)
+			return noticeAgy.say("command", AgyLaunch(v))
 		},
 		Check: func() string {
 			v := get()
@@ -187,3 +187,6 @@ func agy(home string) *Agent {
 		}},
 	}
 }
+
+// what agy says after a change (notice.go)
+var noticeAgy = newNotice("agy takes magpie's gateway and model only from how it is started — start it with {command}")

@@ -83,6 +83,12 @@ func (e *otelExporter) traces(records []Record) any {
 			otelInt("gen_ai.usage.input_tokens", int64(r.Input+r.CacheRead+r.CacheWrite)), otelInt("gen_ai.usage.output_tokens", int64(r.Output)),
 			otelInt("gen_ai.usage.cache_read.input_tokens", int64(r.CacheRead)), otelInt("gen_ai.usage.cache_creation.input_tokens", int64(r.CacheWrite)),
 			otelInt("gen_ai.usage.reasoning.output_tokens", int64(r.Reasoning)), otelInt("magpie.ttft_ms", r.TTFT), otelInt("magpie.first_text_ms", r.FirstText))
+		if r.FirstReasoning > 0 {
+			a = append(a, otelInt("magpie.first_reasoning_ms", r.FirstReasoning))
+		}
+		if r.ReasoningHidden {
+			a = append(a, otelInt("magpie.reasoning_hidden", 1))
+		}
 		if r.RouteID != 0 {
 			a = append(a, otelInt("magpie.route.id", r.RouteID))
 		}

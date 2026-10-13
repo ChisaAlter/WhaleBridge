@@ -27,9 +27,9 @@ var missingAfter = 6 * time.Hour
 var freshEvery = time.Hour
 
 var (
-	keeping   atomic.Bool  // KeepFresh is running: Missing may fetch
-	lastFetch atomic.Int64 // when fetch last started, Unix nanoseconds
-	fetching  atomic.Bool
+	keeping    atomic.Bool  // KeepFresh is running: Missing may fetch
+	lastFetch  atomic.Int64 // when fetch last started, Unix nanoseconds
+	fetching   atomic.Bool
 	fetchState struct {
 		sync.Mutex
 		attempted time.Time

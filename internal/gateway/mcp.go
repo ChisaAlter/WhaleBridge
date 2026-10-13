@@ -59,14 +59,10 @@ func (s *Server) mcpProxy(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "magpie isn't signed in to an MCP server called "+name+": sign in to it in magpie's Library", http.StatusNotFound)
 		return
 	}
-	var body []byte
-	if r.Body != nil {
-		b, err := io.ReadAll(io.LimitReader(r.Body, 32<<20))
-		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		body = b
+	// a body cut at the limit would go to the server as a shorter message
+	body, ok := readMCPBody(w, r, 32<<20)
+	if !ok {
+		return
 	}
 	target, err := url.Parse(rec.URL)
 	if err != nil {
@@ -116,6 +112,11 @@ func (s *Server) mcpProxy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		resp, err = send(fresh)
+		if err == nil && resp.StatusCode == http.StatusUnauthorized {
+			// a token just renewed and refused all the same: the sign-in
+			// has run out, as the Library then says (新v学员 on Discord)
+			mcpauth.Rejected(name, fresh)
+		}
 	}
 	if err != nil {
 		if r.Context().Err() == nil {

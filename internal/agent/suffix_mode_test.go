@@ -4,11 +4,18 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
+
+// tomlString quotes a path for a TOML basic string: Windows separators
+// would read as escapes otherwise.
+func tomlString(p string) string {
+	return strings.ReplaceAll(p, `\`, `\\`)
+}
 
 // The lists magpie writes into Codex's model_catalog_json and Pi's
 // models.json name models by the Provider in model names setting, and are
@@ -27,7 +34,7 @@ func TestSuffixModesReachAgentFiles(t *testing.T) {
 	writeFile(t, piModels, `{"providers":{"magpie":{"name":"magpie","models":[]}}}`)
 	codexDir := filepath.Join(home, ".codex")
 	codexCat := filepath.Join(codexDir, "magpie-models.json")
-	writeFile(t, filepath.Join(codexDir, "config.toml"), "model = \"relay/glm-4.6\"\nmodel_provider = \"magpie\"\nmodel_catalog_json = \""+codexCat+"\"\n")
+	writeFile(t, filepath.Join(codexDir, "config.toml"), "model = \"relay/glm-4.6\"\nmodel_provider = \"magpie\"\nmodel_catalog_json = \""+tomlString(codexCat)+"\"\n")
 	writeFile(t, codexCat, `{"models":[]}`)
 	catalog.Changed = SyncCatalog
 	t.Cleanup(func() { catalog.Changed = nil })

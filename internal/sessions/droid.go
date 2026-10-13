@@ -169,6 +169,9 @@ func parseDroid(f file) *state {
 			var st droidStart
 			if l.Type == "session_start" && json.Unmarshal(b, &st) == nil {
 				s.ID, s.Cwd, s.Named = st.ID, st.Cwd, title(st.Title)
+				if s.Named == "New Session" {
+					s.Named = "" // Droid's until it names one
+				}
 				if st.LastCwd != "" {
 					s.Cwd = st.LastCwd
 				}

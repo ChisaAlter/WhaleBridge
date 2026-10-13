@@ -30,6 +30,7 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/sessions"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 	"github.com/ChisaAlter/WhaleBridge/internal/usage"
+	"github.com/ChisaAlter/WhaleBridge/internal/usageapi"
 )
 
 //go:embed assets/*
@@ -88,13 +89,15 @@ func Run(version string) error {
 	netproxy.Install()
 	gateway.Version = version
 	gateway.StandIn = agent.StandIn
-	clients := []usage.Known{{ID: "dsh", Names: []string{"dsh", "deepseek-harness"}, UA: []string{"deepseek-harness"}}}
-	for _, a := range agent.Clients() {
-		if externalAgent(a) {
-			clients = append(clients, usage.Known{ID: a.ID, Names: append([]string{a.ID}, a.Aliases...), UA: a.UA})
+	usage.Agents = func() []usage.Known {
+		clients := []usage.Known{{ID: "dsh", Names: []string{"dsh", "deepseek-harness"}, UA: []string{"deepseek-harness"}}}
+		for _, a := range agent.Clients() {
+			if externalAgent(a) {
+				clients = append(clients, usage.Known{ID: a.ID, Names: append([]string{a.ID}, a.Aliases...), UA: a.UA})
+			}
 		}
+		return clients
 	}
-	usage.Agents = func() []usage.Known { return clients }
 	// Supplier accounting covers calls served by this component. Native
 	// client session discovery is outside WhaleBridge's management scope.
 	usage.LogCalls = func(time.Time) []sessions.Call { return nil }
@@ -162,15 +165,14 @@ func Run(version string) error {
 	globalRoutes(mux, server, version)
 	mux.HandleFunc("GET /api/usage", func(w http.ResponseWriter, r *http.Request) {
 		period := usage.Period(r.URL.Query().Get("period"))
-		switch period {
-		case "":
+		if period == "" {
 			period = usage.Today
-		case usage.Today, usage.Week, usage.Month, usage.All:
-		default:
+		}
+		if !period.Known() {
 			http.Error(w, "未知用量周期", http.StatusBadRequest)
 			return
 		}
-		writeJSON(w, usage.Summarize(period))
+		writeJSON(w, usageapi.Page(period))
 	})
 	mux.HandleFunc("POST /api/provider", mutate(func(w http.ResponseWriter, r *http.Request) error {
 		_, err := saveProvider(r)

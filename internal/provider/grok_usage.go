@@ -27,6 +27,10 @@ func grokSubscriptionUsage(ctx context.Context) SubscriptionQuota {
 	if c, ok := readGrokCredential(GrokHome()); ok {
 		q.User = c.Email
 	}
+	if holding(ctx) {
+		q.Error = errNotAsked.Error()
+		return q
+	}
 	c, err := grokAccessToken(GrokHome(), GrokExecutable(), false)
 	if err == nil {
 		q.Windows, err = grokWindows(ctx, c.Key)

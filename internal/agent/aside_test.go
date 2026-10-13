@@ -21,7 +21,7 @@ func asideHome(t *testing.T) (string, string) {
 	writeFile(t, settings, `{"defaultModel":{"provider":"native","modelId":"native-model","thinkingLevel":"high","fastMode":true},"modelCategories":{},"imageGenerationModel":null,"theme":"dark"}`)
 	writeFile(t, models, `{"providers":{"native":{"apiKey":"fixture","baseUrl":"https://native.invalid/v1","models":[{"id":"native-model"}]}},"keepMe":"yes"}`)
 	oldRead, oldSet := asideRead, asideSet
-	asideRead = func() (map[string]json.RawMessage, error) {
+	asideRead = func(string) (map[string]json.RawMessage, error) {
 		var s map[string]json.RawMessage
 		err := json.Unmarshal([]byte(readFile(settings)), &s)
 		return s, err
@@ -30,38 +30,44 @@ func asideHome(t *testing.T) (string, string) {
 		if account != "u0" {
 			t.Fatalf("account %q", account)
 		}
-		if strings.HasPrefix(expr, "aside.settings.set(") {
-			after := strings.TrimPrefix(expr, "aside.settings.set(")
-			key, rest, _ := strings.Cut(after, ",")
-			var k string
-			_ = json.Unmarshal([]byte(key), &k)
-			var value json.RawMessage
-			if err := json.NewDecoder(strings.NewReader(rest)).Decode(&value); err != nil {
-				return err
-			}
-			return edit.SetJSON(settings, edit.KV{Path: k, Value: value})
-		}
-		if strings.HasPrefix(expr, "const c=") {
-			after := strings.TrimPrefix(expr, "const c=aside.settings.get('modelCategories')||{};")
-			if strings.HasPrefix(after, "delete c[") {
-				k, _, _ := strings.Cut(strings.TrimPrefix(after, "delete c["), "];")
-				var role string
-				_ = json.Unmarshal([]byte(k), &role)
-				return edit.DelJSON(settings, "modelCategories."+role)
-			}
-			k, rest, _ := strings.Cut(strings.TrimPrefix(after, "c["), "]=")
-			var value json.RawMessage
-			if err := json.NewDecoder(strings.NewReader(rest)).Decode(&value); err != nil {
-				return err
-			}
-			var role string
-			_ = json.Unmarshal([]byte(k), &role)
-			return edit.SetJSON(settings, edit.KV{Path: "modelCategories." + role, Value: value})
-		}
-		return errors.New("unexpected settings expression")
+		return asideFakeSet(settings, expr)
 	}
 	t.Cleanup(func() { asideRead, asideSet = oldRead, oldSet })
 	return settings, models
+}
+
+// asideFakeSet does to settings what Aside does for magpie's repl
+// expression.
+func asideFakeSet(settings, expr string) error {
+	if strings.HasPrefix(expr, "aside.settings.set(") {
+		after := strings.TrimPrefix(expr, "aside.settings.set(")
+		key, rest, _ := strings.Cut(after, ",")
+		var k string
+		_ = json.Unmarshal([]byte(key), &k)
+		var value json.RawMessage
+		if err := json.NewDecoder(strings.NewReader(rest)).Decode(&value); err != nil {
+			return err
+		}
+		return edit.SetJSON(settings, edit.KV{Path: k, Value: value})
+	}
+	if strings.HasPrefix(expr, "const c=") {
+		after := strings.TrimPrefix(expr, "const c=aside.settings.get('modelCategories')||{};")
+		if strings.HasPrefix(after, "delete c[") {
+			k, _, _ := strings.Cut(strings.TrimPrefix(after, "delete c["), "];")
+			var role string
+			_ = json.Unmarshal([]byte(k), &role)
+			return edit.DelJSON(settings, "modelCategories."+role)
+		}
+		k, rest, _ := strings.Cut(strings.TrimPrefix(after, "c["), "]=")
+		var value json.RawMessage
+		if err := json.NewDecoder(strings.NewReader(rest)).Decode(&value); err != nil {
+			return err
+		}
+		var role string
+		_ = json.Unmarshal([]byte(k), &role)
+		return edit.SetJSON(settings, edit.KV{Path: "modelCategories." + role, Value: value})
+	}
+	return errors.New("unexpected settings expression")
 }
 
 func mustFindAside(t *testing.T) *Agent {
@@ -193,7 +199,7 @@ func TestAsideForeignProviderAndSyncAreReadOnly(t *testing.T) {
 func TestAsideUnavailableRuntimeCanRegisterProvider(t *testing.T) {
 	settings, _ := asideHome(t)
 	before := readFile(settings)
-	asideRead = func() (map[string]json.RawMessage, error) { return nil, errors.New("not running") }
+	asideRead = func(string) (map[string]json.RawMessage, error) { return nil, errors.New("not running") }
 	a := mustFindAside(t)
 	if err := a.Connect(); err != nil {
 		t.Fatal(err)
@@ -218,7 +224,7 @@ func TestAsidePreviewIsAPurePlan(t *testing.T) {
 	record := newAsideConnection(here("")).record
 	before := readFile(settings) + readFile(models) + readFile(record)
 	asideSet = func(string, string) error { t.Fatal("preview wrote runtime"); return nil }
-	asideRead = func() (map[string]json.RawMessage, error) { t.Fatal("preview invoked runtime"); return nil, nil }
+	asideRead = func(string) (map[string]json.RawMessage, error) { t.Fatal("preview invoked runtime"); return nil, nil }
 	for i := 0; i < 3; i++ {
 		changes, err := DisconnectPreview(a, "no executable needed")
 		if err != nil {

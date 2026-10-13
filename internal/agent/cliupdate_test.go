@@ -8,8 +8,10 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/testenv"
 )
@@ -208,6 +210,39 @@ func TestHowInstalled(t *testing.T) {
 	if u := howInstalled(cliSpecs["atomcode"], atomcode); u == nil || !u.cask || !reflect.DeepEqual(u.cmd, []string{brew, "upgrade", "--cask", "atomcode"}) {
 		t.Errorf("AtomCode brew cask: %+v", u)
 	}
+	// Node formulae keep the npm package in their keg, as brew's gemini-cli
+	// 0.35.3 does on this Mac: bin/gemini → ../Cellar/gemini-cli/0.35.3/
+	// bin/gemini → ../libexec/bin/gemini → ../lib/node_modules/
+	// @google/gemini-cli/bundle/gemini.js. That is brew's, not npm's: npm
+	// install -g --prefix …/libexec would change the keg behind brew's back.
+	for _, k := range []struct{ id, formula, pkg, js, name string }{
+		{"gemini", "gemini-cli", "@google/gemini-cli", "bundle/gemini.js", "gemini"},
+		{"pi", "pi-coding-agent", "@earendil-works/pi-coding-agent", "dist/cli.js", "pi"},
+		{"cline", "cline", "cline", "bin/cline.js", "cline"},
+	} {
+		keg := filepath.Join(brewDir, "Cellar", k.formula, "1.0.0")
+		file(t, filepath.Join(keg, "libexec/lib/node_modules", k.pkg, k.js), "")
+		link(t, "../lib/node_modules/"+k.pkg+"/"+k.js, filepath.Join(keg, "libexec/bin", k.name))
+		link(t, "../libexec/bin/"+k.name, filepath.Join(keg, "bin", k.name))
+		bin := link(t, "../Cellar/"+k.formula+"/1.0.0/bin/"+k.name, filepath.Join(brewDir, "bin", k.name))
+		if u := howInstalled(cliSpecs[k.id], bin); u == nil || u.via != "brew" || u.cask || !reflect.DeepEqual(u.cmd, []string{brew, "upgrade", k.formula}) {
+			t.Errorf("%s's Node formula %s: %+v", k.id, k.formula, u)
+		}
+	}
+	// npm under a keg-only node's Cellar (node@20) is still npm's
+	nodeKeg := filepath.Join(brewDir, "Cellar/node@20/20.19.0")
+	file(t, filepath.Join(nodeKeg, "lib/node_modules/@github/copilot/npm-loader.js"), "")
+	file(t, filepath.Join(nodeKeg, "bin/npm"), "#!/bin/sh\n")
+	if u := howInstalled(cliSpecs["copilot"], link(t, "../lib/node_modules/@github/copilot/npm-loader.js", filepath.Join(nodeKeg, "bin/copilot"))); u == nil || u.via != "npm" {
+		t.Errorf("npm under node@20's keg: %+v", u)
+	}
+	// Grok Build's cask: bin/grok → Caskroom/grok-build/1.0.52/grok-1.0.52-macos-aarch64
+	file(t, filepath.Join(brewDir, "Caskroom/grok-build/1.0.52/grok-1.0.52-macos-aarch64"), "")
+	grokBin := link(t, "../Caskroom/grok-build/1.0.52/grok-1.0.52-macos-aarch64", filepath.Join(brewDir, "bin/grok"))
+	if u := howInstalled(cliSpecs["grok"], grokBin); u == nil || !u.cask || !reflect.DeepEqual(u.cmd, []string{brew, "upgrade", "--cask", "grok-build"}) {
+		t.Errorf("Grok Build's cask: %+v", u)
+	}
+	os.Remove(filepath.Join(brewDir, "bin/gemini"))
 	file(t, filepath.Join(brewDir, "Cellar/something/1.0/bin/gemini"), "")
 	if u := howInstalled(cliSpecs["gemini"], link(t, "../Cellar/something/1.0/bin/gemini", filepath.Join(brewDir, "bin/gemini"))); u != nil {
 		t.Errorf("another formula: %+v", u)
@@ -227,6 +262,12 @@ func TestHowInstalled(t *testing.T) {
 	oc := file(t, filepath.Join(home, ".opencode/bin/opencode"), "")
 	if u := howInstalled(cliSpecs["opencode"], oc); u == nil || u.shown() != "opencode upgrade" {
 		t.Errorf("opencode's installer: %+v", u)
+	}
+	// DevEco Code's install: ~/.local/bin/deveco → its versions folder
+	file(t, filepath.Join(home, ".local/share/deveco/versions/0.2.3/deveco"), "")
+	deveco := link(t, filepath.Join(home, ".local/share/deveco/versions/0.2.3/deveco"), filepath.Join(home, ".local/bin/deveco"))
+	if u := howInstalled(cliSpecs["deveco"], deveco); u == nil || u.via != "self" || u.pkg != "@deveco/deveco-code" || !reflect.DeepEqual(u.cmd, []string{deveco, "upgrade"}) {
+		t.Errorf("deveco's installer: %+v", u)
 	}
 
 	// a binary that says nothing of how it got there: the version only
@@ -321,5 +362,211 @@ func TestUpdateCLI(t *testing.T) {
 	}
 	if _, ok := (&Agent{ID: "codex", Bin: "codex", WSL: "Ubuntu"}).CLI(); ok {
 		t.Error("a WSL codex has a CLI here")
+	}
+}
+
+// An agent's CLI installed with bun is updated by bun add -g, which can't
+// use a SOCKS5 proxy (#1409): it is given the bridge in front of it. npm,
+// which can, is given the proxy as it is.
+func TestUpdateWithBunBridgesSOCKS(t *testing.T) {
+	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
+	const socks = "socks5://127.0.0.1:4401"
+	names := []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"}
+	for _, k := range names {
+		t.Setenv(k, socks)
+	}
+	// the proxy URLs only: NO_PROXY's hosts or Node's NODE_USE_ENV_PROXY=1,
+	// set on the machine running the test, name no proxy
+	proxies := func(env []string) []string {
+		var out []string
+		for _, kv := range env {
+			if k, v, _ := strings.Cut(kv, "="); slices.Contains(names, k) && v != "" {
+				out = append(out, v)
+			}
+		}
+		return out
+	}
+	bun := proxies(updateEnv(&updater{via: "bun", cmd: []string{"bun", "add", "-g", "x@latest"}}))
+	if len(bun) == 0 {
+		t.Fatal("bun is given no proxy")
+	}
+	for _, v := range bun {
+		if !strings.HasPrefix(v, "http://127.0.0.1:") {
+			t.Fatalf("bun is given %s", v)
+		}
+	}
+	for _, v := range proxies(updateEnv(&updater{via: "npm", cmd: []string{"npm", "i", "-g", "x@latest"}})) {
+		if v != socks {
+			t.Fatalf("npm is given %s", v)
+		}
+	}
+}
+
+// Grok Build from xAI's installer (xiaoxiaofeixz on Discord: Grok at
+// C:\Users\<user>\.grok\bin\grok.exe showed no newest version and no
+// update): install.sh's ~/.grok/bin/grok links to
+// ../downloads/grok-<platform>, which grok update replaces with
+// ../downloads/grok-<version>-<platform>; install.ps1 copies grok.exe into
+// ~\.grok\bin, and grok update copies the new one over it. The CLI is read
+// from there, not PATH, where grok may be Homebrew's regular-expression tool.
+func TestGrokInstalled(t *testing.T) {
+	home, _ := filepath.EvalSymlinks(t.TempDir())
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("GROK_HOME", "")
+	other := t.TempDir() // another grok on PATH
+	file(t, filepath.Join(other, exe("grok")), "MZ")
+	t.Setenv("PATH", other)
+
+	a := &Agent{ID: "grok", Name: "Grok Build"} // no Bin, as grok(home)
+	if _, ok := a.CLI(); ok {
+		t.Fatal("PATH's grok taken for Grok Build")
+	}
+
+	platform := "macos-aarch64"
+	if runtime.GOOS == "windows" {
+		platform = "windows-x86_64"
+	}
+	when := time.Date(2026, 10, 2, 9, 32, 0, 0, time.UTC)
+	// install puts the release at the path the CLI is run by; the same bytes
+	// and time for every release, as nothing but the path need tell them apart
+	var bin string
+	install := func(version string) {
+		t.Helper()
+		if runtime.GOOS == "windows" {
+			bin = filepath.Join(home, `.grok\bin\grok.exe`)
+			os.Remove(bin)
+			file(t, bin, "MZ")
+			os.Chtimes(bin, when, when)
+			return
+		}
+		name := "grok-" + platform
+		if version != "" {
+			name = "grok-" + version + "-" + platform
+		}
+		os.Chtimes(file(t, filepath.Join(home, ".grok/downloads", name), "MZ"), when, when)
+		bin = filepath.Join(home, ".grok/bin/grok")
+		os.Remove(bin)
+		link(t, "../downloads/"+name, bin)
+	}
+	install("")
+
+	served := map[string]string{"/stable": "1.0.50\n", "/alpha": "1.0.51-alpha.2\n"}
+	rel := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		v, ok := served[r.URL.Path]
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		w.Write([]byte(v))
+	}))
+	defer rel.Close()
+	says := "grok 1.0.46 (2765805b9442)"
+	oldRel, oldVer, oldRun := grokReleases, runVersion, runUpdate
+	grokReleases = []string{rel.URL + "/"}
+	runVersion = func(string) string { return says }
+	versions, latests = memo{}, memo{}
+	var ran [][]string
+	runUpdate = func(_ context.Context, u *updater) ([]byte, error) {
+		ran = append(ran, u.cmd)
+		install("1.0.50")
+		says = "grok 1.0.50 (c58f321264ba)"
+		return []byte("✓ grok v1.0.50 installed successfully!"), nil
+	}
+	t.Cleanup(func() {
+		grokReleases, runVersion, runUpdate = oldRel, oldVer, oldRun
+		versions, latests = memo{}, memo{}
+	})
+
+	c, ok := a.CLI()
+	if !ok || c.Version != "1.0.46" || c.Latest != "1.0.50" || !c.Update || c.Via != "self" || c.Command != exe("grok")+" update" {
+		t.Fatalf("before: %+v %v", c, ok)
+	}
+	if c, err := a.UpdateCLI(); err != nil || c.Version != "1.0.50" || c.Update {
+		t.Fatalf("after: %+v, %v", c, err)
+	}
+	if len(ran) != 1 || !reflect.DeepEqual(ran[0], []string{bin, "update"}) {
+		t.Errorf("ran %q", ran)
+	}
+
+	// grok's own update at launch (auto_update), not through magpie: the
+	// version is asked again
+	install("1.0.51")
+	says = "grok 1.0.51 (0a1b2c3d4e5f)"
+	if runtime.GOOS == "windows" {
+		later := when.Add(time.Hour) // the copy of a new download
+		os.Chtimes(bin, later, later)
+	}
+	if v := a.InstalledVersion(); v != "1.0.51" {
+		t.Errorf("after grok's own update: %q", v)
+	}
+
+	// on the alpha channel (grok update --alpha), the newest is alpha's
+	file(t, filepath.Join(home, ".grok", "config.toml"), "[cli]\ninstaller = \"internal\"\nchannel = \"alpha\"\n")
+	if c, _ := a.CLI(); c.Latest != "1.0.51-alpha.2" {
+		t.Errorf("alpha: %+v", c)
+	}
+}
+
+// Grok Build from Homebrew's grok-build cask (Will on Discord): grok on PATH
+// leads into Caskroom/grok-build, with no ~/.grok/bin/grok. It is found,
+// detected before grok first runs, and updated with brew; Homebrew's grok
+// formula, a regular-expression tool, never is.
+func TestGrokBrewCask(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Homebrew's links")
+	}
+	home, _ := filepath.EvalSymlinks(t.TempDir())
+	t.Setenv("HOME", home)
+	t.Setenv("GROK_HOME", "")
+	brewDir := filepath.Join(home, "homebrew")
+	t.Setenv("PATH", filepath.Join(brewDir, "bin"))
+	file(t, filepath.Join(brewDir, "bin/brew"), "#!/bin/sh\n")
+
+	oldVer, oldLatest := runVersion, brewLatest
+	says := "grok 1.0.46 (2765805b9442)"
+	runVersion = func(string) string { return says }
+	brewLatest = func(u *updater) (string, error) { return "1.0.52", nil }
+	versions, latests = memo{}, memo{}
+	t.Cleanup(func() {
+		runVersion, brewLatest = oldVer, oldLatest
+		versions, latests = memo{}, memo{}
+	})
+
+	// the regular-expression tool's grok, the formula of that name
+	file(t, filepath.Join(brewDir, "Cellar/grok/0.9.2/bin/grok"), "")
+	link(t, "../Cellar/grok/0.9.2/bin/grok", filepath.Join(brewDir, "bin/grok"))
+	a := grok(home)
+	if a.Detected() {
+		t.Error("Homebrew's grok formula detected as Grok Build")
+	}
+	if c, ok := a.CLI(); ok {
+		t.Errorf("Homebrew's grok formula taken for Grok Build: %+v", c)
+	}
+
+	// the cask, as formulae.brew.sh/api/cask/grok-build.json has it: binary
+	// grok-1.0.46-macos-aarch64, target grok
+	os.Remove(filepath.Join(brewDir, "bin/grok"))
+	file(t, filepath.Join(brewDir, "Caskroom/grok-build/1.0.46/grok-1.0.46-macos-aarch64"), "")
+	bin := link(t, "../Caskroom/grok-build/1.0.46/grok-1.0.46-macos-aarch64", filepath.Join(brewDir, "bin/grok"))
+	if !a.Detected() {
+		t.Error("the grok-build cask, before grok has run, not detected")
+	}
+	c, ok := a.CLI()
+	if !ok || c.Path != bin || c.Version != "1.0.46" || c.Via != "brew" || c.Command != "brew upgrade --cask grok-build" || c.Latest != "1.0.52" || !c.Update {
+		t.Fatalf("the grok-build cask: %+v %v", c, ok)
+	}
+
+	// with an old ~/.grok/bin/grok from x.ai's installer beside it, the
+	// cask PATH runs is the one shown and updated
+	file(t, filepath.Join(home, ".grok/downloads/grok-macos-aarch64"), "")
+	link(t, "../downloads/grok-macos-aarch64", filepath.Join(home, ".grok/bin/grok"))
+	if c, _ := a.CLI(); c.Path != bin || c.Via != "brew" {
+		t.Errorf("cask and installer: %+v", c)
+	}
+	// PATH running the installer's instead: that one, updated by grok update
+	os.Remove(bin)
+	if c, _ := a.CLI(); c.Path != filepath.Join(home, ".grok/bin/grok") || c.Via != "self" {
+		t.Errorf("installer only: %+v", c)
 	}
 }

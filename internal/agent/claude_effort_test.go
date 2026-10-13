@@ -45,15 +45,26 @@ func TestClaudeEffortModelSettings(t *testing.T) {
 		t.Fatal(err)
 	}
 	if e.Get() != "low" || get("modelSettings.claude-opus-5-5.effortLevel") != "low" || get("modelSettings.claude-opus-5-5.maxEffortLevel") != "xhigh" ||
-		get("modelSettings.claude-sonnet-4-6.effortLevel") != "max" || get("effortLevel") != "high" {
+		get("modelSettings.claude-sonnet-4-6.effortLevel") != "max" || get("effortLevel") != "low" {
 		t.Fatalf("low:\n%s", readFile(path))
 	}
 	if err := e.Set(""); err != nil {
 		t.Fatal(err)
 	}
 	if e.Get() != "" || get("modelSettings.claude-opus-5-5.effortLevel") != "" || get("modelSettings.claude-opus-5-5.maxEffortLevel") != "xhigh" ||
-		get("modelSettings.claude-sonnet-4-6.effortLevel") != "max" {
+		get("modelSettings.claude-sonnet-4-6.effortLevel") != "max" || get("effortLevel") != "" {
 		t.Fatalf("reset:\n%s", readFile(path))
+	}
+	// a top level of the user's own, not the one written with Opus 5.5's,
+	// stays on a reset
+	home, path = claudeSettings(t, `{"model": "claude-opus-5-5", "effortLevel": "high",
+  "modelSettings": {"claude-opus-5-5": {"effortLevel": "low"}}}`)
+	e = claude(home).Field("effort")
+	if err := e.Set(""); err != nil {
+		t.Fatal(err)
+	}
+	if get("effortLevel") != "high" || get("modelSettings.claude-opus-5-5.effortLevel") != "" {
+		t.Fatalf("user's top on reset:\n%s", readFile(path))
 	}
 
 	// Opus 5 reads both: the top one for a Claude Code before 2.1.251, its

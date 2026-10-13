@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"fmt"
+	"log"
 	"slices"
 	"sync"
 	"time"
@@ -55,6 +56,7 @@ func antigravityPoolModels(ctx context.Context) ([]catalog.Model, error) {
 			lastErr = err
 			// A failed refresh does not erase a working account's catalog.
 			ms, _, _ = catalog.Live(key)
+			log.Printf("antigravity %s: models not refreshed: %v; keeping the %d it listed before", l.User, err, len(ms))
 		} else if err := catalog.SaveLive(key, l.acct.app.base, ms); err != nil {
 			return nil, err
 		}

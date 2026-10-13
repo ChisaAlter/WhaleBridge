@@ -96,3 +96,44 @@ func MoveOffAccountIDs() {
 		_, _ = RenameProvider(id, provider.FreeID(id))
 	}
 }
+
+// renameRef is one entry of an agent's enabledModels (StepCode's, Pi's
+// and its forks') with magpie's provider from renamed to to. A glob or a thinking level after the model stays. An entry that
+// does not name that provider is the user's and is left as it is.
+func renameRef(s, from, to string) (string, bool) {
+	rest, ok := strings.CutPrefix(s, magpieID+"/"+from+"/")
+	if !ok {
+		return s, false
+	}
+	return magpieID + "/" + to + "/" + rest, true
+}
+
+// renameRefList renames magpie/<from>/ entries. The model just set is
+// appended before the old entry is renamed onto the same text, so that
+// second copy is dropped. A list that names nothing of that provider is
+// returned unchanged, a repeated entry of the user's included.
+func renameRefList(pats []string, from, to string) ([]string, bool) {
+	if len(pats) == 0 {
+		return pats, false
+	}
+	out := make([]string, 0, len(pats))
+	seen := map[string]bool{}
+	fromRename := map[string]bool{}
+	renamed := false
+	for _, p := range pats {
+		n, hit := renameRef(p, from, to)
+		renamed = renamed || hit
+		if seen[n] && (hit || fromRename[n]) {
+			continue
+		}
+		if !seen[n] {
+			seen[n] = true
+			fromRename[n] = hit
+		}
+		out = append(out, n)
+	}
+	if !renamed {
+		return pats, false
+	}
+	return out, true
+}

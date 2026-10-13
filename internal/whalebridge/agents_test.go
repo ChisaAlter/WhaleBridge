@@ -17,11 +17,22 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
+	"github.com/ChisaAlter/WhaleBridge/internal/library"
+	"github.com/ChisaAlter/WhaleBridge/internal/profile"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"github.com/ChisaAlter/WhaleBridge/internal/testenv"
 )
 
 func TestMain(m *testing.M) {
+	if marker := os.Getenv("WHALEBRIDGE_AGENT_SPAWN_MARKER"); marker != "" {
+		f, err := os.OpenFile(marker, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0600)
+		if err != nil {
+			os.Exit(2)
+		}
+		f.WriteString(strings.Join(os.Args, " ") + "\n")
+		f.Close()
+		os.Exit(0)
+	}
 	os.Exit(testenv.RunIn(m, func(home string) {
 		// Listing clients must not invoke this computer's WSL or Aside.
 		// All executable lookups stay in testenv's stand-in directory.
@@ -29,6 +40,238 @@ func TestMain(m *testing.M) {
 			panic(err)
 		}
 	}))
+}
+
+func TestAgentHTTPDiscoveryDoesNotSpawnOrWriteStash(t *testing.T) {
+	a := newAgentHTTP(t)
+	home, _ := os.UserHomeDir()
+	bin := filepath.Join(home, "bin")
+	if err := os.MkdirAll(bin, 0700); err != nil {
+		t.Fatal(err)
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	binary, err := os.ReadFile(executable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"powershell.exe", "codex.exe"} {
+		if err := os.WriteFile(filepath.Join(bin, name), binary, 0700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	marker := filepath.Join(home, "spawned.txt")
+	t.Setenv("WHALEBRIDGE_AGENT_SPAWN_MARKER", marker)
+	t.Setenv("PATH", bin)
+	config := writeAgentFixture(t, ".codex/config.toml", "model = \"gpt-own\"\n")
+	stash := filepath.Join(appdir.Config(), "stash.json")
+	if err := os.WriteFile(stash, []byte(`{"keep":"native discovery must remain read only"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	beforeConfig, _ := os.ReadFile(config)
+	beforeStash, _ := os.ReadFile(stash)
+	readAgentRows(t, a)
+	if b, err := os.ReadFile(marker); err == nil {
+		t.Fatalf("GET agents started a native executable: %s", b)
+	} else if !os.IsNotExist(err) {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(config); !bytes.Equal(b, beforeConfig) {
+		t.Fatal("GET agents changed Codex config")
+	}
+	if b, _ := os.ReadFile(stash); !bytes.Equal(b, beforeStash) {
+		t.Fatal("GET agents recorded native config change timestamps")
+	}
+}
+
+func TestAgentHTTPClaudePrivateSignInAndRestore(t *testing.T) {
+	a := newAgentHTTP(t)
+	originalURL := a.vendor + "/original"
+	fixture, _ := json.Marshal(map[string]any{"theme": "dark", "model": "sonnet", "env": map[string]string{"ANTHROPIC_BASE_URL": originalURL, "ANTHROPIC_AUTH_TOKEN": "fixture-original-native-token"}})
+	path := writeAgentFixture(t, ".claude/settings.json", string(fixture))
+	a.call("POST", "agent/connect", map[string]string{"id": "claude"}, http.StatusOK)
+	a.call("POST", "agent/set", map[string]string{"id": "claude", "key": "login", "value": "claudeai"}, http.StatusOK)
+	check := func(wantURL, wantToken, login string) {
+		t.Helper()
+		if u, _ := edit.GetJSON(path, "env.ANTHROPIC_BASE_URL"); u != wantURL {
+			t.Fatal("Claude login mode wrote the wrong authenticated endpoint")
+		}
+		if token, has := edit.GetJSON(path, "env.ANTHROPIC_AUTH_TOKEN"); !has || token != wantToken {
+			t.Fatal("Claude login mode wrote the wrong authentication state")
+		}
+		row := findAgentRow(t, a, "claude")
+		if !row.Connected || row.SyncError != "" {
+			t.Fatalf("Claude login mode lost ownership: connected=%v error=%s", row.Connected, row.SyncError)
+		}
+		for _, field := range row.Fields {
+			if field.Key == "login" && field.Value != login {
+				t.Fatal("Claude login value did not read back")
+			}
+		}
+	}
+	check(gateway.WhaleBridgeAnthropicURL(), "", "claudeai")
+	a.call("POST", "agent/set", map[string]string{"id": "claude", "key": "model", "value": "test/second-model"}, http.StatusOK)
+	syncManagedAgents()
+	check(gateway.WhaleBridgeAnthropicURL(), "", "claudeai")
+	a.call("POST", "agent/set", map[string]string{"id": "claude", "key": "login", "value": ""}, http.StatusOK)
+	check(gateway.URL(), gateway.Token, "")
+	a.call("POST", "agent/set", map[string]string{"id": "claude", "key": "login", "value": "claudeai"}, http.StatusOK)
+	a.call("POST", "agent/disconnect", map[string]string{"id": "claude"}, http.StatusOK)
+	if u, _ := edit.GetJSON(path, "env.ANTHROPIC_BASE_URL"); u != originalURL {
+		t.Fatal("Claude original endpoint not restored")
+	}
+	if token, _ := edit.GetJSON(path, "env.ANTHROPIC_AUTH_TOKEN"); token != "fixture-original-native-token" {
+		t.Fatal("Claude original native credential not restored")
+	}
+	if model, _ := edit.GetJSON(path, "model"); model != "sonnet" {
+		t.Fatal("Claude original model not restored")
+	}
+}
+
+func TestAgentHTTPClaudePrivateSignInPreservesLaterCredentials(t *testing.T) {
+	a := newAgentHTTP(t)
+	path := writeAgentFixture(t, ".claude/settings.json", `{"model":"sonnet"}`)
+	a.call("POST", "agent/connect", map[string]string{"id": "claude"}, http.StatusOK)
+	a.call("POST", "agent/set", map[string]string{"id": "claude", "key": "login", "value": "claudeai"}, http.StatusOK)
+	laterURL := a.vendor + "/later"
+	if err := edit.SetJSON(path, edit.KV{Path: "env.ANTHROPIC_BASE_URL", Value: laterURL}, edit.KV{Path: "env.ANTHROPIC_AUTH_TOKEN", Value: "fixture-later-native-token"}); err != nil {
+		t.Fatal(err)
+	}
+	a.call("POST", "agent/set", map[string]string{"id": "claude", "key": "login", "value": ""}, http.StatusBadRequest)
+	a.call("POST", "agent/disconnect", map[string]string{"id": "claude"}, http.StatusBadRequest)
+	if u, _ := edit.GetJSON(path, "env.ANTHROPIC_BASE_URL"); u != laterURL {
+		t.Fatal("Claude private login overwrote a later endpoint")
+	}
+	if token, _ := edit.GetJSON(path, "env.ANTHROPIC_AUTH_TOKEN"); token != "fixture-later-native-token" {
+		t.Fatal("Claude private login overwrote a later native credential")
+	}
+}
+
+func TestAgentHTTPManagedProfilesIgnoreUnmanagedAndLibrary(t *testing.T) {
+	a := newAgentHTTP(t)
+	claude := writeAgentFixture(t, ".claude/settings.json", `{"model":"sonnet"}`)
+	codex := writeAgentFixture(t, ".codex/config.toml", "model = \"gpt-own\"\n")
+	instructions := writeAgentFixture(t, ".claude/CLAUDE.md", "native instructions stay\n")
+	dsh := filepath.Join(os.Getenv("WHALEBRIDGE_DSH_HOME"), "profiles", "whalebridge.json")
+	if err := os.MkdirAll(filepath.Dir(dsh), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(dsh, []byte(`{"componentManaged":true,"model":"keep-default"}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	a.call("POST", "agent/connect", map[string]string{"id": "claude"}, http.StatusOK)
+	a.call("POST", "agent-profiles/save", map[string]string{"name": "managed"}, http.StatusOK)
+	ps, err := profile.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := ps["managed"]
+	if p.Library != nil || len(p.Models) != 1 {
+		t.Fatal("profile captured library or unmanaged model lists")
+	}
+	for key := range p.Fields {
+		if !strings.HasPrefix(key, "claude.") {
+			t.Fatal("profile captured an unmanaged Agent field")
+		}
+	}
+	p.Fields["codex.model"], p.Fields["dsh.model"] = "test/second-model", "test/second-model"
+	p.Models["codex"], p.Models["dsh"] = provider.ModelList{Only: true}, provider.ModelList{Only: true}
+	p.Library = &library.Setup{Instructions: library.SetupInstructions{Shared: "must never execute", Agents: []string{"claude"}}}
+	if err := profile.Save("managed", p); err != nil {
+		t.Fatal(err)
+	}
+	a.call("POST", "agent/set", map[string]string{"id": "claude", "key": "model", "value": "test/second-model"}, http.StatusOK)
+	before := map[string][]byte{}
+	for _, path := range []string{codex, instructions, dsh} {
+		before[path], err = os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	a.call("POST", "agent-profiles/apply", map[string]string{"name": "managed"}, http.StatusOK)
+	if model, _ := edit.GetJSON(claude, "model"); model != p.Fields["claude.model"] {
+		t.Fatal("profile did not apply the currently managed field")
+	}
+	for path, want := range before {
+		got, err := os.ReadFile(path)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Fatalf("profile changed excluded file %s: %v", path, err)
+		}
+	}
+	if provider.ModelListOf("codex").Only || provider.ModelListOf("dsh").Only {
+		t.Fatal("profile changed an unmanaged/default model list")
+	}
+	a.call("GET", "agent-profiles", nil, http.StatusOK)
+	if err := edit.SetJSON(claude, edit.KV{Path: "env.ANTHROPIC_AUTH_TOKEN", Value: "fixture-later-native-token"}); err != nil {
+		t.Fatal(err)
+	}
+	changed, _ := os.ReadFile(claude)
+	a.call("POST", "agent-profiles/apply", map[string]string{"name": "managed"}, http.StatusBadRequest)
+	if got, _ := os.ReadFile(claude); !bytes.Equal(got, changed) {
+		t.Fatal("profile took over a later native credential")
+	}
+	a.call("POST", "agent-profiles/delete", map[string]string{"name": "managed"}, http.StatusOK)
+	ps, err = profile.Load()
+	if err != nil || len(ps) != 0 {
+		t.Fatal("profile delete was not persisted")
+	}
+}
+
+func TestAgentHTTPModelListsStayPerAgentAndKeepInUse(t *testing.T) {
+	a := newAgentHTTP(t)
+	writeAgentFixture(t, ".claude/settings.json", `{"model":"sonnet"}`)
+	writeAgentFixture(t, ".pi/agent/settings.json", `{"defaultProvider":"own","defaultModel":"own-model"}`)
+	a.call("POST", "agent-models/pi", map[string]any{"only": true}, http.StatusBadRequest)
+	a.call("POST", "agent/connect", map[string]string{"id": "claude"}, http.StatusOK)
+	a.call("POST", "agent-models/claude", map[string]any{"shown": []string{"test/second-model"}, "order": []string{"test/second-model", "test/test-model"}, "only": true, "ownHidden": true}, http.StatusOK)
+	l := provider.ModelListOf("claude")
+	if !l.Only || !slices.Contains(l.Picked, "test/test-model") || !slices.Contains(l.Picked, "test/second-model") || !slices.Equal(l.Order, []string{"test/second-model", "test/test-model"}) {
+		t.Fatalf("per-Agent list lost active selection/order: %+v", l)
+	}
+	if !provider.OwnModelsHidden("claude") || !provider.ModelListOf("pi").Default() || !provider.ModelListOf("dsh").Default() {
+		t.Fatal("model list visibility affected another Agent")
+	}
+	if err := provider.Save(provider.Provider{ID: "fast", Name: "Fast relay", Key: "fixture", Chat: a.vendor + "/v1", Models: []string{"gpt-6.1-sol"}}); err != nil {
+		t.Fatal(err)
+	}
+	a.call("POST", "agent-fast", map[string]any{"id": "claude", "for": "codex", "ref": "fast/gpt-6.1-sol", "fast": true}, http.StatusBadRequest)
+	a.call("POST", "agent-fast", map[string]any{"id": "claude", "for": "claude", "ref": "fast/gpt-6.1-sol", "fast": true}, http.StatusOK)
+	if !provider.IsFastPick("claude", "fast/gpt-6.1-sol") || provider.IsFastPick("codex", "fast/gpt-6.1-sol") {
+		t.Fatal("Fast choice did not stay per Agent")
+	}
+	var state struct {
+		Models    []agentModel `json:"models"`
+		OwnHidden bool         `json:"ownHidden"`
+	}
+	if err := json.Unmarshal(a.call("GET", "agent-models/claude", nil, http.StatusOK), &state); err != nil {
+		t.Fatal(err)
+	}
+	if len(state.Models) < 3 || state.Models[0].ID != "test/second-model" || !state.OwnHidden {
+		t.Fatal("model list readback lost order or own visibility")
+	}
+	a.call("POST", "agent-models/claude", map[string]any{"order": []string{}}, http.StatusOK)
+	if len(provider.ModelListOf("claude").Order) != 0 {
+		t.Fatal("default model ordering did not restore")
+	}
+}
+
+func TestAgentHTTPNewBuiltinsAreDiscoverable(t *testing.T) {
+	a := newAgentHTTP(t)
+	rows := readAgentRows(t, a)
+	if len(rows) != 58 {
+		t.Fatalf("builtin Agent count = %d, want 58", len(rows))
+	}
+	ids := make([]string, 0, len(rows))
+	for _, row := range rows {
+		ids = append(ids, row.ID)
+	}
+	for _, id := range []string{"deveco", "stepcode", "prime-agent", "copilot-jetbrains", "qwen", "ante", "astrbot", "jcode", "grok-app", "workbuddy-ai", "snow"} {
+		if !slices.Contains(ids, id) {
+			t.Fatalf("new builtin %s missing from actual Agent endpoint", id)
+		}
+	}
 }
 
 func newAgentHTTP(t *testing.T) providerHTTP {

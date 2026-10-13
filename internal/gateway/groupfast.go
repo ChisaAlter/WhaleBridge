@@ -1,6 +1,10 @@
 package gateway
 
-import "github.com/ChisaAlter/WhaleBridge/internal/provider"
+import (
+	"context"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+)
 
 // claudeFastBeta is the beta Claude's fast mode (speed "fast") is asked
 // under.
@@ -11,10 +15,17 @@ const claudeFastBeta = "fast-mode-2026-02-01"
 // in OpenAI's words, speed "fast" in Anthropic's. A request carried on in
 // another protocol keeps it (Request.Fast), and goes out with it only
 // where the vendor and model have one (buildResponses, buildChat, build,
-// cursorModelID).
+// cursorModelID). A client's own ask for Ultrafast, faster than priority,
+// is kept: sent fast, it isn't sent slower than it asked (#1784,
+// zhenghaowen0967: OMP with fastPicks asked Ultrafast and went as
+// priority). An account that doesn't offer it is asked for priority in
+// its place, as any is (tierMate).
 func withFast(proto provider.Protocol, body []byte) []byte {
 	switch proto {
 	case provider.Chat, provider.Responses:
+		if askedTier(body) == "ultrafast" {
+			return body
+		}
 		return withFields(body, map[string]any{"service_tier": "priority"})
 	case provider.Anthropic:
 		return withFields(body, map[string]any{"speed": "fast"})
@@ -37,4 +48,20 @@ func fastPick(cands []candidate, pl planned, providerID, model string) {
 			}
 		}
 	}
+}
+
+// ownFastKey marks a try of a member or pick the user sent fast on a
+// provider they added by its address (provider.OwnFast, #1615): it is asked for service_tier
+// "priority" on its OpenAI API (forwardTranslated) whatever API the agent
+// spoke. An agent on Chat or Responses says it in its own body as well
+// (withFast), which a relayed request carries as it is.
+type ownFastKey struct{}
+
+func withOwnFast(ctx context.Context) context.Context {
+	return context.WithValue(ctx, ownFastKey{}, true)
+}
+
+func isOwnFast(ctx context.Context) bool {
+	v, _ := ctx.Value(ownFastKey{}).(bool)
+	return v
 }

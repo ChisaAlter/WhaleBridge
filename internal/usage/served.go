@@ -3,6 +3,7 @@ package usage
 import (
 	"regexp"
 	"strings"
+	"unicode"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
@@ -20,17 +21,24 @@ import (
 var versionTail = regexp.MustCompile(`(?:[-_@:](?:\d{4}-\d{2}-\d{2}|\d{2}-\d{2}|\d{6,8}|\d{3,4}|v\d+:\d+|latest|preview|exp))+$`)
 
 // vendorDot is Bedrock's region and maker before a model's name
-// (us.anthropic.claude-…).
-var vendorDot = regexp.MustCompile(`^(?:[a-z]{2,4}\.)?(?:anthropic|amazon|meta|mistral|cohere|ai21|deepseek|qwen|openai|google|moonshotai|minimax|zai)\.`)
+// (us.anthropic.claude-…), the geography of an inference profile as
+// catalog's bedrockGeos has them: global. and us-gov. among them.
+var vendorDot = regexp.MustCompile(`^(?:(?:global|us-gov|[a-z]{2,4})\.)?(?:anthropic|amazon|meta|mistral|cohere|ai21|deepseek|qwen|openai|google|moonshotai|minimax|zai)\.`)
 
 // contextTail is what Claude Code writes after a model's name for the size of
 // its context: claude-opus-5[1m].
 var contextTail = regexp.MustCompile(`\[[^\]]*\]$`)
 
+// windowTail is the window magpie offers a model at beside its default
+// (grok-4.7@500k, Cursor's grok-4.7@256k): the vendor answers under the
+// plain name, which is the same model (#1645).
+var windowTail = regexp.MustCompile(`@\d+[km]?$`)
+
 // bareModel is a model's name without its maker or path, its version, the
 // size of its context or its case.
 func bareModel(m string) string {
 	m = contextTail.ReplaceAllString(strings.ToLower(strings.TrimSpace(m)), "")
+	m = windowTail.ReplaceAllString(m, "")
 	if i := strings.LastIndexByte(m, '/'); i >= 0 {
 		m = m[i+1:]
 	}
@@ -48,10 +56,76 @@ func bareModel(m string) string {
 // reply names the family, not the variant (#462). Another level is another
 // model, as AntigravitySentID has it. A vendor's "auto" (Copilot's,
 // Cursor's) asked it to pick, so whichever answers wasn't swapped in, nor
-// is the member another magpie's routing group sent it to (GroupRouted).
+// is the member another magpie's routing group sent it to (GroupRouted),
+// nor a vendor's own name for the deployment serving the model
+// (ServingName), nor the model a relay sold under a name of its own
+// (RelayRenamed).
 func Swapped(sent, served string) bool {
 	a, b := bareModel(sent), bareModel(served)
-	return a != "" && b != "" && squash(a) != squash(b) && a != "auto" && squash(bareModel(provider.EffortFamily(a))) != squash(b) && !GroupRouted(sent, served)
+	return a != "" && b != "" && squash(a) != squash(b) && a != "auto" && squash(bareModel(provider.EffortFamily(a))) != squash(b) && !GroupRouted(sent, served) && !ServingName(sent, served) && !RelayRenamed(sent, served)
+}
+
+// RelayRenamed reports whether sent is served's own name with a relay's
+// word in front of it: a relay that sells kimi-k3 as moonshot-kimi-k3 is
+// answered as kimi-k3 (#1498, liuweifeng), one that sells
+// deepseek-v4.1-flash as claude-deepseek-v4.1-flash (#1383) as
+// deepseek-v4.1-flash. What is left must name a version, so a bare word
+// (flash, mini) is never taken for the model sent.
+func RelayRenamed(sent, served string) bool {
+	a, b := bareModel(sent), squash(bareModel(served))
+	if b == "" || !strings.ContainsAny(b, "0123456789") || !strings.ContainsFunc(b, unicode.IsLetter) {
+		return false
+	}
+	for i := 1; i < len(a); i++ {
+		if a[i-1] == '-' && squash(a[i:]) == b {
+			return true
+		}
+	}
+	return false
+}
+
+// ServingName reports whether served is the vendor's own name for the
+// deployment serving the model sent, which no request asks for by: Google's
+// for a Gemini model (GeminiServing), xAI's for a Grok one (GrokServing).
+func ServingName(sent, served string) bool {
+	return GeminiServing(sent, served) || GrokServing(sent, served)
+}
+
+// GrokServing reports whether served is xAI's name for the build serving
+// the Grok model sent: the model's own name with "-build" after its
+// version. xAI answers grok-4.7 as grok-4.7-build, and grok-4.6 as
+// grok-4.6-build (#1455, cybershape; two relays' logs say the same), and
+// its own list (SuperGrok's, 2026-10-02) offers grok-4.7 and its fast
+// variant grok-4.7-build-fast, never a grok-4.7-build to ask for. It holds
+// for Grok models only, and for the same variant: grok-4.7 answered as
+// grok-4.7-build-fast (the fast one), grok-4.6-build or grok-4.7-mini is
+// still a swap, as is gpt-5 answered as gpt-5-build.
+func GrokServing(sent, served string) bool {
+	a := squash(bareModel(provider.EffortFamily(bareModel(sent))))
+	b := bareModel(served)
+	m := grokBuild.FindStringSubmatchIndex(b)
+	if m == nil || !strings.HasPrefix(a, "grok") {
+		return false
+	}
+	return squash(b[:m[2]]+b[m[3]:]) == a
+}
+
+// grokBuild is the "-build" after a Grok model's version (grok-4.7-build,
+// grok-4.7-build-fast), the part GrokServing reads past.
+var grokBuild = regexp.MustCompile(`^grok-[0-9][0-9.]*(-build)(?:-|$)`)
+
+// GeminiServing reports whether served is the name Google's backend gives
+// the deployment that serves the Gemini model sent: the model's own name
+// with "-n" after it. Antigravity answers every level of gemini-3.8-flash
+// (-low, -medium, -high) with modelVersion gemini-3.8-flash-n, an id no
+// request can ask for (404) and fetchAvailableModels never lists, so it is
+// that model, not another one swapped in (dumplings on Discord). It holds
+// for Gemini models only: gpt-5 answered as gpt-5-n is still a swap, as is
+// gemini-3.8-flash answered as gemini-3.8-flash-lite or gemini-3.7-flash-n.
+func GeminiServing(sent, served string) bool {
+	a := squash(bareModel(provider.EffortFamily(bareModel(sent))))
+	b, ok := strings.CutSuffix(bareModel(served), "-n")
+	return ok && strings.HasPrefix(a, "gemini") && squash(b) == a
 }
 
 // squash is a bare name without its separators, so a vendor that writes

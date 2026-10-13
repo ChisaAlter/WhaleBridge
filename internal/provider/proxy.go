@@ -2,7 +2,10 @@ package provider
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"maps"
+	"slices"
 	"strings"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/netproxy"
@@ -17,12 +20,16 @@ func (p Provider) Via(ctx context.Context) context.Context {
 
 // ProxyChoice is the proxy requests made on the provider's behalf go
 // through, as netproxy.With takes it: for one account of a subscription
-// that holds several, that account's own (AccountProxies), else the
-// provider's (Proxy); "" follows the global one. An account in use beside
-// the agent's own is made afresh by some agents (AlsoOn), without the
-// provider's settings: those are read from providers.json.
+// that holds several, or one key of a provider that holds several
+// (Beyfish_Wang on X: 不同 key 走不同的代理), its own (AccountProxies),
+// else the provider's (Proxy); "" follows the global one. An account in
+// use beside the agent's own is made afresh by some agents (AlsoOn),
+// without the provider's settings: those are read from providers.json.
 func (p Provider) ProxyChoice() string {
 	if p.Account == nil {
+		if v := p.AccountProxies[keyID(p.Key)]; p.Key != "" && v != "" {
+			return v
+		}
 		return p.Proxy
 	}
 	own, prov := p.AccountProxies, p.Proxy
@@ -111,6 +118,72 @@ func normalAccountProxies(m map[string]string) map[string]string {
 		out[u] = v
 	}
 	return out
+}
+
+// keyProxies is a provider of keys' AccountProxies as it is kept: those
+// of the keys it still holds, by their KeyID; nil for none.
+func keyProxies(p Provider) map[string]string {
+	var out map[string]string
+	for _, k := range p.KeyList() {
+		if v := p.AccountProxies[k.ID]; v != "" {
+			if out == nil {
+				out = map[string]string{}
+			}
+			out[k.ID] = v
+		}
+	}
+	return out
+}
+
+// keepSignInProxy keeps the proxy an account of the subscription id was
+// signed in through, picked for that sign-in, as the one its requests go
+// through (#1663): the subscription's when the account is its only one,
+// as the editor shows one account's proxy, else the account's own.
+func keepSignInProxy(id, user, proxy string) error {
+	proxy = strings.TrimSpace(proxy)
+	if err := settings.CheckProxy(proxy); err != nil {
+		return err
+	}
+	if ProxyOfLogin(id, user) == proxy {
+		return nil
+	}
+	alone := true
+	for _, l := range Logins(id) {
+		if user == "" || accountKey(l.User) != accountKey(user) {
+			alone = false
+		}
+	}
+	f, err := read()
+	if err != nil {
+		return err
+	}
+	i := slices.IndexFunc(f.Providers, func(p Provider) bool { return p.ID == id })
+	if i < 0 {
+		f.Providers = append(f.Providers, Provider{ID: id})
+		i = len(f.Providers) - 1
+	}
+	p := &f.Providers[i]
+	own := maps.Clone(p.AccountProxies)
+	if own == nil {
+		own = map[string]string{}
+	}
+	switch {
+	case alone:
+		p.Proxy = proxy
+		delete(own, accountKey(user))
+	case user == "":
+		return errors.New("the account it signed in to isn't known")
+	case proxy == p.Proxy:
+		delete(own, accountKey(user))
+	case proxy == "":
+		// an account's own can't say "the global one": "" follows the
+		// subscription's
+		return errors.New("an account can't follow the global proxy while its subscription has a proxy of its own")
+	default:
+		own[accountKey(user)] = proxy
+	}
+	p.AccountProxies = normalAccountProxies(own)
+	return store(f)
 }
 
 // checkAccountProxies refuses an account's proxy Settings would refuse.

@@ -26,7 +26,7 @@ import (
 )
 
 func startFactorySignIn(s *signInFlow) error {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(s.via(context.Background()))
 	dctx, dcancel := context.WithTimeout(ctx, 30*time.Second)
 	var dc struct {
 		DeviceCode string `json:"device_code"`

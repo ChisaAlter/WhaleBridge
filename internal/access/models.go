@@ -5,6 +5,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 )
 
 // CleanModels is a key's model list as kept (#882): each pattern trimmed,
@@ -68,7 +69,34 @@ func ModelAllowed(patterns []string, id string) bool {
 	return false
 }
 
+// globs keeps each pattern's expression compiled, as a model list asks
+// for every model of it (#1762): a pattern is its expression whatever key
+// holds it, so none is ever stale. It is let go of whole past maxGlobs.
+var globs struct {
+	sync.Mutex
+	m map[string]*regexp.Regexp
+}
+
+const maxGlobs = 4096
+
 func globRe(p string) *regexp.Regexp {
+	globs.Lock()
+	re, ok := globs.m[p]
+	globs.Unlock()
+	if ok {
+		return re
+	}
+	re = compileGlob(p)
+	globs.Lock()
+	if globs.m == nil || len(globs.m) >= maxGlobs {
+		globs.m = map[string]*regexp.Regexp{}
+	}
+	globs.m[p] = re
+	globs.Unlock()
+	return re
+}
+
+func compileGlob(p string) *regexp.Regexp {
 	parts := strings.Split(p, "*")
 	for i, s := range parts {
 		parts[i] = regexp.QuoteMeta(s)

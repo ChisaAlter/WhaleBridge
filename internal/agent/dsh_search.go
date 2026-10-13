@@ -6,9 +6,11 @@ package agent
 // its apiKeyEnv names (DEEPSEEK_API_KEY). A dsh that reaches its models
 // through magpie alone has no such key, and every search failed asking for
 // one (Packing1 on Discord). While dsh starts on a model of magpie's, magpie
-// points the row at the gateway, with its own key and that model: the
-// gateway answers the server tool as Anthropic does, by the model's own
-// search or magpie's (web_search_tool_result blocks either way). A row of
+// points the row at the gateway, with its own key and that model, or the
+// searcher Settings › Web search names when the user named one
+// (dshSearchModel): the gateway answers the server tool as Anthropic does,
+// by the model's own search or magpie's (web_search_tool_result blocks
+// either way). A row of
 // the user's, or a DeepSeek key dsh has of its own, is left to search as it
 // does.
 
@@ -17,6 +19,7 @@ import (
 	"strings"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
+	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
 )
 
 // dshSearchRow is dsh's DeepSeek web search row, and its plugin.
@@ -25,6 +28,20 @@ const (
 	dshSearchPlugin = "@deepseek-ai/dsh-web-search-deepseek"
 	dshSearchKeyRef = "DEEPSEEK_API_KEY"
 )
+
+// dshSearchModel is the model magpie's search row asks, for a dsh that
+// starts on start (a model of magpie's, without its prefix): the searcher
+// Settings › Web search names, when the user named one, else start. Asking
+// start sent every search to the model dsh works on, which, unable to
+// search by itself, asked the named searcher in turn: two requests a
+// search, and a model that takes one call at a time timed out (我只会玩单机
+// on Discord).
+func dshSearchModel(start string) string {
+	if m := gateway.NamedSearchModel(); m != "" {
+		return m
+	}
+	return start
+}
 
 // dshSearchLines is magpie's web-search-deepseek entry: the gateway's
 // Messages API (the plugin adds /messages to the base) on its key, asking
@@ -82,18 +99,23 @@ func dshPutSearch(items []dshItem, dir, model, gw string) []dshItem {
 	return items
 }
 
-// dshSearchAgain writes magpie's search entry again for the gateway at gw,
-// the model it asks kept: the gateway's address may have moved since.
+// dshSearchAgain writes magpie's search entry again for the gateway at gw:
+// the gateway's address may have moved since, and the searcher Settings
+// names may have been picked or cleared. With none named, the entry asks
+// the magpie model dsh starts on, else keeps the model it asks.
 func dshSearchAgain(items []dshItem, dir, gw string) []dshItem {
 	i := dshFindLast(items, dshSearchRow)
 	if i < 0 || !items[i].magpie {
 		return items
 	}
 	model := dshConfig(items[i])["model"]
+	if start, ok := strings.CutPrefix(dshStart(dir, items), magpieID+"/"); ok {
+		model = start
+	}
 	if model == "" {
 		return items
 	}
-	return dshPutSearch(items, dir, model, gw)
+	return dshPutSearch(items, dir, dshSearchModel(model), gw)
 }
 
 // dshSearchesHere reports whether dsh's web search goes through magpie: its

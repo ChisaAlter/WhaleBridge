@@ -36,3 +36,6 @@ func Reexec(exe string, args, env []string) error {
 	proc.EndProbes() // the new version doesn't know them, nor waits on them
 	return syscall.Exec(exe, append([]string{exe}, args...), env)
 }
+
+// trialStart: nothing here refuses a build that downloaded whole.
+func trialStart(string) error { return nil }

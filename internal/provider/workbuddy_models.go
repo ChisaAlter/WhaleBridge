@@ -24,6 +24,7 @@ import (
 	"io"
 	"math"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -85,7 +86,7 @@ func wbFetchModels(ctx context.Context, w *wbSite, sign func(context.Context, *h
 	if env.Code != 0 {
 		return nil, fmt.Errorf("WorkBuddy's config: %s (%d)", env.Msg, env.Code)
 	}
-	ms := env.Data.cliModels()
+	ms := w.textOnly(env.Data.cliModels())
 	if len(ms) == 0 {
 		return nil, fmt.Errorf("WorkBuddy's config lists no models for its CLI agent")
 	}
@@ -128,6 +129,32 @@ func (c wbProductConfig) cliModels() []catalog.Model {
 		}
 	}
 	return wbDistinctNames(out)
+}
+
+// textOnly marks the models of ms whose images w drops as taking none,
+// whatever WorkBuddy's config says: WorkBuddy AI's GLM models. On
+// 2026-10-13, with a real WorkBuddy AI account (Yirasumi on Discord),
+// www.workbuddy.ai's /v3/config marked every model supportsImages: true,
+// but a chat to glm-5.3-flash, glm-5.3 or glm-5.2 came back saying
+// "[System reminder: the current model does not support images. Content
+// filtered. ...]": the server had taken the image out. Its other models
+// (deepseek-v4.1-flash, kimi, gemini, grok, gpt) read them, and WorkBuddy
+// (China)'s glm-5.3-flash does too, so this is WorkBuddy AI's GLM family
+// alone. Said text-only, magpie's image-describing model reads the image
+// for them; a user's own answer (settings' ModelImages) still wins over
+// this, in entryFor. ms is not changed; the result is a copy.
+func (w *wbSite) textOnly(ms []catalog.Model) []catalog.Model {
+	if w.id != WorkBuddyAIID {
+		return ms
+	}
+	out := slices.Clone(ms)
+	for i := range out {
+		if strings.HasPrefix(out[i].ID, "glm-") {
+			no := false
+			out[i].Images, out[i].ImageInput = false, &no
+		}
+	}
+	return out
 }
 
 // wbCredits reads a model's credits, the multiple WorkBuddy's picker shows

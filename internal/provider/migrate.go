@@ -26,6 +26,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log"
 	"maps"
 	"net/http"
@@ -40,7 +41,9 @@ import (
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/filememo"
+	"github.com/ChisaAlter/WhaleBridge/internal/lastgood"
 	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 	"github.com/ChisaAlter/WhaleBridge/internal/update"
 )
 
@@ -266,6 +269,9 @@ type MoveCandidate struct {
 // MoveCandidates are the built-ins not on their plugins that have accounts
 // to move, by name.
 func MoveCandidates() []MoveCandidate {
+	if settings.AccountDiscoveryOff() {
+		return nil
+	}
 	out := []MoveCandidate{}
 	for id, mv := range movers {
 		if Moved(id) {
@@ -296,12 +302,29 @@ var migrationsMu sync.Mutex
 func readMigrations() map[string]Migration { return heldOf("migrations", readMigrationsFile) }
 
 func readMigrationsFile() map[string]Migration {
-	m, _ := filememo.Read("migrations", migrationsPath(), func(b []byte) (map[string]Migration, error) {
-		var m map[string]Migration
-		_ = json.Unmarshal(b, &m)
-		return m, nil
-	})
+	m, err := filememo.Read("migrations", migrationsPath(), parseMigrations)
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		// one that doesn't read (all zero after a crash, #1505) is not
+		// "nothing moved": a moved subscription would come back as its
+		// built-in, and the next move write that over every other's
+		if b, ferr := lastgood.Fallback(migrationsPath(), unreadBytes(migrationsPath()), validMigrations); ferr == nil {
+			m, _ = parseMigrations(b)
+		} else {
+			log.Printf("migrations.json: %v", ferr)
+		}
+	}
 	return m
+}
+
+func parseMigrations(b []byte) (map[string]Migration, error) {
+	var m map[string]Migration
+	err := json.Unmarshal(b, &m)
+	return m, err
+}
+
+func validMigrations(b []byte) bool {
+	_, err := parseMigrations(b)
+	return err == nil
 }
 
 // MigrationOf is where the built-in id's move stands.
@@ -351,7 +374,14 @@ func setMigration(id string, f func(m *Migration)) error {
 	for k, v := range readMigrationsFile() {
 		all[k] = v
 	}
+	// f changes its own copy: the lists read are shared with every reader
+	// (filememo), and a write that fails leaves them as the file has them
 	m := all[id]
+	m.Accounts = slices.Clone(m.Accounts)
+	for i := range m.Accounts {
+		m.Accounts[i].Was = maps.Clone(m.Accounts[i].Was)
+	}
+	m.Backup = slices.Clone(m.Backup)
 	f(&m)
 	all[id] = m
 	b, err := json.MarshalIndent(all, "", "  ")
@@ -359,6 +389,9 @@ func setMigration(id string, f func(m *Migration)) error {
 		return err
 	}
 	defer Changed()
+	if err := lastgood.Keep(migrationsPath(), validMigrations, 0o600); err != nil {
+		return err
+	}
 	return writePrivate(migrationsPath(), append(b, '\n'))
 }
 
@@ -396,6 +429,10 @@ func lockMoves() (func(), error) {
 // Hooks the tests stand in for.
 var (
 	installPlugin = func(ctx context.Context, pkg, min string) error {
+		// what the user has is theirs: a version they pinned stays, and
+		// a git one is reinstalled from its own repository, where a bare
+		// name would replace either with <pkg>@latest
+		found, older := pkg, false
 		for _, e := range plugin.Load().Plugins {
 			if plugin.PackageName(e.Spec) != pkg {
 				continue
@@ -410,9 +447,21 @@ var (
 			if plugin.IsPath(e.Spec) {
 				return fmt.Errorf("%s at %s is %s; moving needs %s or newer", pkg, e.Spec, v, min)
 			}
+			if plugin.Pinned(e.Spec) {
+				return fmt.Errorf("%s is pinned at %s; moving needs %s or newer", pkg, e.Spec, min)
+			}
+			found, older = e.Spec, !plugin.IsGit(e.Spec)
 			break
 		}
-		_, err := plugin.Add(ctx, pkg)
+		var err error
+		if older {
+			// npm's newest, which bun says why it won't install (a
+			// minimumReleaseAge), where bun's own latest is an older
+			// version without a word (sweanng424 on Discord)
+			err = upgradePlugin(ctx, pkg)
+		} else {
+			_, err = addPlugin(ctx, found)
+		}
 		if err == nil && min != "" {
 			if v := plugin.Version(pkg); update.Newer(min, v) {
 				return fmt.Errorf("%s %s is installed; moving needs %s or newer", pkg, v, min)
@@ -422,6 +471,10 @@ var (
 	}
 	pluginProviders = plugin.Providers
 	removePlugin    = plugin.Remove
+	// addPlugin and upgradePlugin install what installPlugin decided: vars
+	// so a test can read what it is handed
+	addPlugin     = plugin.Add
+	upgradePlugin = plugin.Upgrade
 )
 
 // modelsInUse are the models the built-in id serves now: the ones agents,
@@ -442,6 +495,9 @@ var modelsInUse = func(id string) []string {
 // Move puts the built-in id's accounts onto its plugin (see above). An
 // error leaves the built-in as it was.
 func Move(ctx context.Context, id string) error {
+	if settings.AccountDiscoveryOff() {
+		return errAccountDiscoveryOff
+	}
 	mv := movers[id]
 	if mv == nil {
 		return fmt.Errorf("%s has no plugin to move to", id)
@@ -473,6 +529,9 @@ func Move(ctx context.Context, id string) error {
 // signed in: the plugin installed, and the subscription signs in through
 // it from now on, as a moved one does. One with accounts is moved instead.
 func Adopt(ctx context.Context, id string) error {
+	if settings.AccountDiscoveryOff() {
+		return errAccountDiscoveryOff
+	}
 	mv := movers[id]
 	if mv == nil {
 		return fmt.Errorf("%s has no plugin to move to", id)
@@ -914,6 +973,9 @@ func MoveBack(ctx context.Context, id string) error {
 // serves nothing else now, which releasePlugin, about to remove or turn
 // off the plugin itself, leaves to its caller.
 func moveBack(ctx context.Context, id string, tidy bool) error {
+	if settings.AccountDiscoveryOff() {
+		return errAccountDiscoveryOff
+	}
 	mv := movers[id]
 	if mv == nil {
 		return fmt.Errorf("%s isn't a built-in subscription", id)
@@ -1084,6 +1146,9 @@ func MoveRetiring(ctx context.Context) map[string]error {
 }
 
 func moveRetiring(ctx context.Context, accept func(string, []Moving) bool) map[string]error {
+	if settings.AccountDiscoveryOff() {
+		return nil
+	}
 	out := map[string]error{}
 	for _, id := range Retiring {
 		m, ok := MigrationOf(id)
@@ -1118,10 +1183,13 @@ func moveRetiring(ctx context.Context, accept func(string, []Moving) bool) map[s
 // user moved back stays built-in, and a failed move waits moveRetry. No
 // plugin is installed for it: the user's own install is what says to.
 func HandOver(ctx context.Context, accounts bool) map[string]error {
-	return handOver(ctx, accounts, nil)
+	return handOverAccounts(ctx, accounts, nil)
 }
 
-func handOver(ctx context.Context, accounts bool, accept func(string, []Moving) bool) map[string]error {
+func handOverAccounts(ctx context.Context, accounts bool, accept func(string, []Moving) bool) map[string]error {
+	if settings.AccountDiscoveryOff() {
+		return nil
+	}
 	out := map[string]error{}
 	var pps []plugin.Provider
 	asked := false
@@ -1199,6 +1267,10 @@ func KeepRetiringMoved(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		}
+		if settings.AccountDiscoveryOff() {
+			t.Reset(time.Hour)
+			continue
 		}
 		keepMovedCurrent(ctx)
 		moves := MoveRetiring(ctx)

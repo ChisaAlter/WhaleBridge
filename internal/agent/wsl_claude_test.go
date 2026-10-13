@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -164,6 +165,9 @@ func TestWSLClaudePick(t *testing.T) {
 		nat := t.TempDir()
 		os.MkdirAll(filepath.Join(nat, ".claude"), 0o755)
 		os.WriteFile(filepath.Join(nat, ".claude", "settings.json"), []byte(before), 0o644)
+		// syncHome's CLAUDE_CONFIG_DIR names the sandbox's own ~/.claude,
+		// which native Claude Code now reads (#1482): this one's is nat's
+		t.Setenv("CLAUDE_CONFIG_DIR", filepath.Join(nat, ".claude"))
 		n := claude(nat)
 		n.Field("model").Set("relay/glm-4.6")
 		n.Field("effort").Set("max")
@@ -248,6 +252,11 @@ func TestWSLClaudeStopped(t *testing.T) {
 	}
 	if v := a.Values(); v["model"] != "relay/glm-4.6" || v["effort"] != "low" {
 		t.Fatalf("values %v", v)
+	}
+	// magpie claude@wsl:Stopped opus is its model, as on a running distro,
+	// not its opus tier shown
+	if !slices.Equal(a.ModelAliases, claudeAliases) {
+		t.Fatalf("model aliases %v", a.ModelAliases)
 	}
 	opts := a.Field("model").Options(a.Values())
 	if len(opts) == 0 {
@@ -359,4 +368,32 @@ func TestWSLClaudeNotFolded(t *testing.T) {
 			t.Errorf("Claude Code in WSL Debian, running %v: %d folded", running, n)
 		}
 	}
+}
+
+// A WSL agent is found by its id however it is spelt — the distro's own
+// case, lower, upper — and by a prefix of it: an id in lowercase comes up
+// wherever a typed name is lowercased before it is looked for.
+func TestWSLAgentIDFound(t *testing.T) {
+	// wslAgents() is Windows-only and the suite runs on macOS and Linux:
+	// turned on, the fake distro's agent is in All() and Find here too
+	on := wslOn
+	wslOn = true
+	t.Cleanup(func() { wslOn = on })
+	root, _ := claudeDistroHome(t, `{"model": "claude-opus-5-5"}`)
+	fakeWSL(t, "Debian\r\n", "Debian\r\n", map[string]string{
+		"Debian": "home:/home/me\ndir:.claude\n",
+	}, map[string]string{"Debian": root})
+	if ds := wslDistros(); len(ds) != 1 || ds[0].Name != "Debian" {
+		t.Fatalf("%+v", ds)
+	}
+	for _, q := range []string{"claude@wsl:Debian", "claude@wsl:debian", "CLAUDE@WSL:DEBIAN", "claude@wsl"} {
+		a, err := Find(q)
+		if err != nil || a.ID != "claude@wsl:Debian" {
+			t.Errorf("%q: %v, %+v", q, err, a)
+		}
+	}
+	if _, err := Find("codex@wsl:Debian"); err == nil {
+		t.Error("codex@wsl:Debian found though the distro has none")
+	}
+	noOwnClaude(t)
 }

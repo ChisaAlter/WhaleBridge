@@ -14,6 +14,10 @@ import (
 // ErrCanceled is the administrator's password prompt dismissed.
 var ErrCanceled = errors.New("the update was canceled")
 
+// ErrNoAdmin is no administrator to be had: the system has no prompt for
+// one, or it couldn't be shown. What was to run as one didn't run.
+var ErrNoAdmin = errors.New("no administrator prompt")
+
 // NeedsAdmin reports whether err is magpie not being allowed to change the
 // folder it lives in, which the administrator's password gets past.
 func NeedsAdmin(err error) bool {

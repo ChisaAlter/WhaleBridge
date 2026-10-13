@@ -26,17 +26,66 @@ let scenario = 'normal', installed = false;
 const calls = [], catalogs = [];
 const providers = [{ id: 'cursor', name: 'Cursor', account: true, modelCount: 0 }];
 const flows = new Map();
+const accountUser = 'fixture.person@example.test', lapsedUser = 'fixture.revoked@example.test';
+const copilotUser = 'fixture-person@fixture-enterprise.ghe.com';
+const accountProvider = { id: 'qoder', name: 'Fixture Qoder', account: { agent: 'qoder' }, models: ['fixture-model'],
+  available: [{ id: 'fixture-model', name: 'Fixture model' }], accountNames: { [accountUser]: 'Personal fixture' },
+  accountWindowCaps: { [accountUser]: { fiveHour: 70 } }, accountCaps: { [accountUser]: 90 },
+  accountProxies: { [accountUser]: 'http://fixture-original-proxy.invalid:8123' } };
+const parityProviders = [accountProvider,
+  { id: 'claude', name: 'Claude', account: { agent: 'claude' }, models: ['fixture-model'] },
+  { id: 'copilot', name: 'Copilot enterprise fixture', account: { agent: 'copilot' }, models: ['fixture-model'] },
+  { id: 'cursor', name: 'Cursor', account: { agent: 'cursor' }, models: ['fixture-model'] },
+  { id: 'fixture-access-plan', name: 'Fixture plan credential settings', preset: 'fixture-access-plan', models: ['fixture-model'] },
+];
+let accountCheckinOff = false;
+const parityQuota = () => ({ provider: 'fixture-access-plan', alias: accountProvider.accountNames[accountUser],
+  seat: 'Fixture shared seat', lastServedAt: '2026-10-13T09:00:00Z', readAt: '2026-10-13T09:30:00Z',
+  checkins: true, checkinOff: accountCheckinOff, checkin: { day: '2026-10-14', outcome: 'done', credit: 4 },
+  windows: [{ name: '5 hours', capId: 'fiveHour', used: 35, resetsAt: '2026-10-14T11:00:00Z' },
+    { name: 'Weekly', capId: 'weekly', used: 40 }, { name: 'Unlimited', unlimited: true },
+    { name: 'Tier window', capId: 'tiers', tiers: true, used: 10 }],
+  resets: { count: 2, until: '2026-10-15T11:00:00Z', each: [{ until: '2026-10-15T11:00:00Z' }, {}] },
+  resetsUsed: [{ at: '2026-10-13T08:00:00Z', why: 'hand', windows: 2 }], needsAccessKey: true });
+const pendingUsage = [], pendingAccountLists = [];
 
 // Only this loopback fixture receives writes; static content is the production UI.
 const server = http.createServer(async (req, res) => {
   try {
-    const pathname = new URL(req.url, 'http://127.0.0.1').pathname;
+    const requested = new URL(req.url, 'http://127.0.0.1'), pathname = requested.pathname;
     const json = value => { res.writeHead(200, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(value)); };
     if (pathname.startsWith('/api/')) {
       let bytes = '';
       for await (const chunk of req) bytes += chunk;
       const body = bytes ? JSON.parse(bytes) : undefined;
-      calls.push({ scenario, path: pathname, body });
+      calls.push({ scenario, path: pathname, body, method: req.method, query: requested.search });
+      if (scenario.startsWith('account-parity') && /^\/api\/accounts\/(qoder|claude|copilot|cursor)$/.test(pathname)) {
+        const id = pathname.split('/').pop();
+        const result = id === 'qoder' ? [
+          { user: accountUser, plan: 'Fixture account plan', on: true, alias: accountProvider.accountNames[accountUser],
+            checkinKey: 'fixture-checkin-account', checkinOff: accountCheckinOff },
+          { user: lapsedUser, plan: 'Fixture account plan', on: true, lapsed: "The vendor's sign-in was revoked; sign in again" },
+        ] : [{ user: id === 'copilot' ? copilotUser : accountUser, on: true }];
+        if (scenario === 'account-parity-list-delay') pendingAccountLists.push(() => json(result));
+        else json(result);
+        return;
+      }
+      if (scenario.startsWith('account-parity') && /^\/api\/accounts\/[^/]+\/usage$/.test(pathname)) {
+        const result = { [accountUser]: parityQuota() };
+        if (scenario === 'account-parity-delay' || scenario === 'account-parity-close') pendingUsage.push(() => json(result));
+        else json(result);
+        return;
+      }
+      if (scenario.startsWith('account-parity') && req.method === 'POST' && pathname.startsWith('/api/accounts/')) {
+        if (pathname === '/api/accounts/name') accountProvider.accountNames[body.user] = body.alias;
+        if (pathname === '/api/accounts/checkin') accountCheckinOff = !body.on;
+        if (pathname === '/api/accounts/windowcap') {
+          const caps = accountProvider.accountWindowCaps[body.user] ||= {};
+          if (body.cap) caps[body.window] = body.cap; else delete caps[body.window];
+        }
+        if (pathname === '/api/accounts/proxy') accountProvider.accountProxies[body.user] = body.proxy;
+        return json({ ok: true });
+      }
       if (pathname === '/api/state') return json({
         version: 'fixture', gateway: 'http://127.0.0.1',
         presets: scenario === 'layout' ? [{ id: 'layout-preset', name: 'Fixture region provider', regions: [
@@ -47,7 +96,7 @@ const server = http.createServer(async (req, res) => {
           name: 'Fixture route with a longer readable name', routing: 'rotate',
           members: ['fixture-api/fixture-model', 'fixture-provider/long-model-identifier-that-must-wrap-without-overflow'],
         }] : [],
-        providers: scenario === 'layout' ? [...providers, { id: 'fixture-layout-provider',
+        providers: scenario.startsWith('account-parity') ? parityProviders : scenario === 'layout' ? [...providers, { id: 'fixture-layout-provider',
           name: 'Fixture provider with a longer readable name', chat: 'https://fixture.example/long-provider-endpoint/v1',
           modelCount: 20, routing: 'rotate', off: true }] : providers,
         models: [...providers.flatMap(provider => (provider.models || []).map(id => ({ id: `${provider.id}/${id}` }))),
@@ -60,7 +109,9 @@ const server = http.createServer(async (req, res) => {
         return json({ ok: true });
       }
       if (pathname === '/api/subscriptions') {
-        const rows = !installed ? builtins : scenario === 'migrated'
+        const rows = scenario.startsWith('account-parity') ? [...builtins.filter(row => row.id !== 'cursor'),
+          { id: 'qoder', name: 'Qoder', plugin: false }, { id: 'copilot', name: 'Copilot', plugin: false }, adapter('cursor')]
+          : !installed ? builtins : scenario === 'migrated'
           ? [...builtins.filter(row => row.id !== 'cursor'), adapter('cursor')]
           : [...builtins, adapter('cursor-plugin')];
         catalogs.push({ scenario, installed, ids: rows.map(row => row.id) });
@@ -355,6 +406,152 @@ async function run() {
       await new Promise(resolve => setTimeout(resolve, 20));
     }
 
+    // The new account settings run against the same production DOM and explicit HTTP DTOs.
+    scenario = 'account-parity';
+    await js(`load()`);
+    await js(`document.querySelector('#content [data-action="accounts"][data-id="qoder"]').click()`);
+    await waitFor(`document.querySelector('[data-account-quota]')?.textContent.includes('Fixture shared seat')`);
+    const accountParity = { initial: await js(`(() => {
+      const rows = [...document.querySelectorAll('#fields tbody tr')], gone = rows[1];
+      return { alias: rows[0].querySelector('.table-primary').textContent,
+        identity: rows[0].textContent, detail: rows[0].querySelector('[data-account-quota]').textContent,
+        lapsed: gone.textContent, lapsedToggleDisabled: gone.querySelector('[data-action="account-on"]').disabled,
+        canRelogin: !gone.querySelector('[data-action="account-relogin"]').disabled,
+        canRemove: !gone.querySelector('[data-action="account-remove"]').disabled };
+    })()`) };
+    await js(`document.querySelector('#fields [data-action="accounts-refresh"]').click()`);
+    await waitFor(`!document.querySelector('#fields [data-action="accounts-refresh"]').disabled`);
+    accountParity.refreshQueries = calls.filter(c => c.scenario === 'account-parity' && c.path === '/api/accounts/qoder/usage').map(c => c.query);
+    await js(`document.querySelector('[data-action="account-access-key"]').click()`);
+    accountParity.accessKeyTarget = await js(`({title: document.querySelector('#editor-title').textContent, name: document.querySelector('#f-name').value})`);
+    await closeEditor();
+
+    scenario = 'account-parity-delay';
+    await js(`openAccounts('qoder')`);
+    await waitFor(`editor.type === 'accounts'`);
+    await js(`document.querySelector('#fields [data-action="account-edit"]').click()`);
+    await js(`(() => {
+      activateEditorSection('account-identity'); document.querySelector('#f-alias').value = 'Draft personal name';
+      document.querySelector('#f-checkin').checked = false;
+      activateEditorSection('account-models'); document.querySelector('#f-windowCap0').value = '88';
+      activateEditorSection('account-proxy'); document.querySelector('#f-proxyMode').value = 'custom';
+      document.querySelector('#f-proxyMode').dispatchEvent(new Event('change', {bubbles:true}));
+      document.querySelector('#f-proxy').value = 'http://fixture-draft-proxy.invalid:8118';
+    })()`);
+    const delayedDeadline = Date.now() + 5000;
+    // Chromium serializes identical in-flight GET URLs through its cache lock.
+    // Release the two real reads in order after the draft has already changed.
+    for(let read=0;read<2;read++){
+      while(!pendingUsage.length){
+        if (Date.now() > delayedDeadline) throw new Error('the delayed account and settings allowance reads did not arrive: '+JSON.stringify({pending:pendingUsage.length,
+          calls:calls.filter(c=>c.scenario==='account-parity-delay'), dom:await js(`({type:editor.type, quotaLoaded:editor.quotas!==undefined, closed:editor.closed, error:document.querySelector('#form-error').textContent})`)}));
+        await new Promise(resolve => setTimeout(resolve, 20));
+      }
+      pendingUsage.shift()();
+    }
+    await waitFor(`document.querySelector('#f-windowCap1')`);
+    accountParity.draftReads=calls.filter(c=>c.scenario==='account-parity-delay'&&c.path==='/api/accounts/qoder/usage').map(c=>c.query);
+    accountParity.draftLate = await js(`({alias: document.querySelector('#f-alias').value,
+      checkin: document.querySelector('#f-checkin').checked, cap: document.querySelector('#f-windowCap0').value,
+      proxy: document.querySelector('#f-proxy').value, windows: [...document.querySelectorAll('#account-window-caps label')].map(n => n.textContent)})`);
+    scenario = 'account-parity-save';
+    await js(`activateEditorSection('account-models'); document.querySelector('#f-windowCap1').value = '100'; document.querySelector('#save').click()`);
+    await waitFor(`editor.type === 'accounts' && document.querySelector('[data-account-quota]')?.textContent.includes('Fixture shared seat')`);
+    accountParity.saved = await js(`document.querySelector('#fields tbody tr').textContent`);
+    accountParity.writes = calls.filter(c => c.scenario === 'account-parity-save' && c.method === 'POST');
+    await js(`document.querySelector('#fields [data-action="account-edit"]').click()`);
+    scenario = 'account-parity-clear';
+    await js(`(() => {
+      activateEditorSection('account-identity'); document.querySelector('#f-alias').value = ''; document.querySelector('#f-checkin').checked = true;
+      activateEditorSection('account-models'); document.querySelector('#f-windowCap0').value = ''; document.querySelector('#f-windowCap1').value = '0';
+      document.querySelector('#save').click();
+    })()`);
+    await waitFor(`editor.type === 'accounts' && !document.querySelector('#fields [data-action="accounts-refresh"]').disabled`);
+    accountParity.cleared = await js(`document.querySelector('#fields tbody tr .table-primary').textContent`);
+    accountParity.clearWrites = calls.filter(c => c.scenario === 'account-parity-clear' && c.method === 'POST');
+    await closeEditor();
+
+    scenario = 'account-parity-relogin';
+    await js(`openAccounts('qoder')`);
+    await js(`document.querySelector('#fields [data-action="account-relogin"]').click()`);
+    await waitFor(`document.querySelector('#f-agent')?.value === 'qoder'`);
+    accountParity.reloginForm = await js(`({hasProxy:!!document.querySelector('#f-proxy'), identity:document.querySelector('#signin-options').textContent})`);
+    await js(`document.querySelector('#save').click()`); await waitForSuccess();
+    accountParity.relogin = calls.find(c => c.scenario === 'account-parity-relogin' && c.path === '/api/signin').body;
+    accountParity.proxyAfterRelogin = accountProvider.accountProxies[accountUser];
+    await closeEditor();
+
+    scenario = 'account-parity-copilot';
+    await js(`openAccounts('copilot')`);
+    await js(`document.querySelector('#fields [data-action="account-relogin"]').click()`);
+    await waitFor(`document.querySelector('#f-site')`);
+    accountParity.copilotSite = await js(`document.querySelector('#f-site').value`);
+    await js(`document.querySelector('#save').click()`); await waitForSuccess();
+    accountParity.copilotSignin = calls.find(c => c.scenario === 'account-parity-copilot' && c.path === '/api/signin').body;
+    await closeEditor();
+
+    scenario = 'account-parity-switched';
+    await js(`openAccounts('copilot')`);
+    await js(`document.querySelector('#fields [data-action="account-relogin"]').click()`);
+    await waitFor(`document.querySelector('#f-site')`);
+    await chooseSubscription('codex'); await js(`document.querySelector('#save').click()`); await waitForSuccess();
+    accountParity.switchedSignin = calls.find(c => c.scenario === 'account-parity-switched' && c.path === '/api/signin').body;
+    await closeEditor();
+
+    scenario = 'account-parity-plugin';
+    await js(`openAccounts('cursor')`);
+    await js(`document.querySelector('#fields [data-action="account-relogin"]').click()`);
+    await waitFor(`document.querySelector('#f-method')`);
+    await js(`document.querySelector('#save').click()`); await waitForSuccess();
+    accountParity.pluginSignin = calls.find(c => c.scenario === 'account-parity-plugin' && c.path === '/api/signin').body;
+    await closeEditor();
+
+    scenario = 'account-parity-claude-refresh';
+    await js(`openAccounts('claude')`);
+    await waitFor(`!document.querySelector('#fields [data-action="accounts-refresh"]').disabled`);
+    await js(`document.querySelector('#fields [data-action="accounts-refresh"]').click()`);
+    await waitFor(`!document.querySelector('#fields [data-action="accounts-refresh"]').disabled`);
+    accountParity.claudeRefresh = calls.filter(c => c.scenario === 'account-parity-claude-refresh' && c.path === '/api/accounts/claude/usage').map(c => c.query);
+    await closeEditor();
+
+    scenario = 'account-parity-list-delay';
+    await js(`openSourcePicker('api')`);
+    await js(`window.pendingAccountOpen = openAccounts('qoder'); true`);
+    const listDeadline = Date.now() + 5000;
+    while (!pendingAccountLists.length) {
+      if (Date.now() > listDeadline) throw new Error('delayed account list never arrived');
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    // Reopen immediately: beforetoggle must invalidate the old list before close fires.
+    await js(`document.querySelector('#editor').close(); openSourcePicker('plans')`);
+    pendingAccountLists.splice(0).forEach(release => release());
+    await js(`window.pendingAccountOpen`);
+    accountParity.staleList = await js(`({type:editor.type, scope:document.querySelector('#source-scope').value, open:document.querySelector('#editor').open})`);
+    await closeEditor();
+
+    scenario = 'account-parity-close';
+    await js(`(() => {
+      const fetchOriginal = window.fetch;
+      window.accountReadFinished = 0;
+      window.fetch = async (...args) => { const response = await fetchOriginal(...args);
+        if (String(args[0]).includes('/accounts/qoder/usage')) { await response.clone().json(); window.accountReadFinished++; }
+        return response;
+      };
+    })()`);
+    await js(`openAccounts('qoder')`);
+    const closeDeadline = Date.now() + 5000;
+    while (!pendingUsage.length) {
+      if (Date.now() > closeDeadline) throw new Error('closing allowance read never arrived');
+      await new Promise(resolve => setTimeout(resolve, 20));
+    }
+    await js(`document.querySelector('#editor').close(); openSourcePicker('api')`);
+    pendingUsage.splice(0).forEach(release => release());
+    await waitFor(`window.accountReadFinished === 1`);
+    await js(`new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)))`);
+    accountParity.staleQuota = await js(`({type:editor.type, scope:document.querySelector('#source-scope').value, open:document.querySelector('#editor').open,
+      injectedAccountQuota:!!document.querySelector('[data-account-quota]')})`);
+    await closeEditor();
+
     // Layout scenarios use the same production surface and only fixture reads.
     scenario = 'layout'; installed = true;
     await js(`load()`);
@@ -552,7 +749,7 @@ async function run() {
 
     return { initial, beforeInstall, installed: installedForm, signin, migrated, failureDefault, failed, failureRefreshes, addAccount, catalogs,
       promptValidationError, promptSignin, immediateSuccess, promptSuccess, providerSuccess, providerCompletion,
-      desktopAdapterGap, narrowAdapterGap, polled, unsuccessful, layout, screenshots,
+      desktopAdapterGap, narrowAdapterGap, polled, unsuccessful, accountParity, layout, screenshots,
       installs: calls.filter(call => call.path === '/api/subscription/adapter'),
       prompts: calls.filter(call => call.path === '/api/subscription/prompt'),
       cancellations: calls.filter(call => call.path.endsWith('/cancel')),

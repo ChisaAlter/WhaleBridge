@@ -59,8 +59,8 @@ func TestGlobalAuxiliaryChoicesUseSafeJSON(t *testing.T) {
 	if len(got.Searchers) == 0 || got.Searchers[0]["id"] == nil || got.Searchers[0]["provider"] != nil {
 		t.Fatalf("search candidates are absent or not a safe DTO: %s", raw)
 	}
-	if len(got.Searchers) != 1 || string(got.Searchers[0]["id"]) != `"search-relay"` || len(got.Searchers[0]) != 4 || got.Searchers[0]["name"] == nil || got.Searchers[0]["small"] == nil || got.Searchers[0]["models"] == nil {
-		t.Fatalf("search candidate JSON must contain only id, name, small and models: %s", raw)
+	if len(got.Searchers) != 1 || string(got.Searchers[0]["id"]) != `"search-relay"` || len(got.Searchers[0]) != 5 || got.Searchers[0]["name"] == nil || got.Searchers[0]["small"] == nil || got.Searchers[0]["models"] == nil || got.Searchers[0]["manualOnly"] == nil {
+		t.Fatalf("search candidate JSON must contain only id, name, small, models and manualOnly: %s", raw)
 	}
 	visionFound := false
 	for _, m := range got.VisionModels {

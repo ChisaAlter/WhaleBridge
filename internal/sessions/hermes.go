@@ -22,11 +22,7 @@ import (
 // multiple billing routes; sessions supplies only unattributed main-loop usage.
 // These tables contain aggregates, not individual API request usage.
 func HermesDir() string {
-	if home := appdir.Getenv("HERMES_HOME"); home != "" {
-		return filepath.Clean(home)
-	}
-	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".hermes")
+	return filepath.Clean(appdir.HermesHome())
 }
 
 // HermesDirs includes the default store and live named profiles. A selected

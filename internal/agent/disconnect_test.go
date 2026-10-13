@@ -219,3 +219,34 @@ func TestDisconnectUnwiredLeavesConfig(t *testing.T) {
 		t.Fatalf("changed:\n%s\nwant\n%s", got, was)
 	}
 }
+
+// An auth Gemini CLI doesn't know, set on its provider field, is refused
+// before magpie is taken out. `magpie gemini <a model it has no option
+// for>` sets that field (it is the first), and took Gemini CLI off magpie,
+// its sign-in and key put back, before saying the auth was unknown: the
+// sibling of `magpie snow --help` (#1457).
+func TestGeminiUnknownAuthChangesNothing(t *testing.T) {
+	home, _ := codexHome(t, "", "")
+	dir := filepath.Join(home, ".gemini")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "settings.json"), []byte(`{"security":{"auth":{"selectedType":"gemini-api-key"}},"model":{"name":"gemini-2.5-pro"}}`), 0o644)
+	os.WriteFile(filepath.Join(dir, ".env"), []byte("GEMINI_API_KEY=mine\n"), 0o600)
+	g := gemini(home)
+	if err := g.Apply("model", "fake/m1"); err != nil {
+		t.Fatal(err)
+	}
+	read := func() string {
+		s, _ := os.ReadFile(filepath.Join(dir, "settings.json"))
+		e, _ := os.ReadFile(filepath.Join(dir, ".env"))
+		return string(s) + "\n" + string(e)
+	}
+	was, vals := read(), g.Values()
+	for _, v := range []string{"nonsense-model", "--help"} {
+		if err := g.Field("provider").Set(v); err == nil {
+			t.Errorf("%q taken", v)
+		}
+		if got := read(); got != was || !g.Wired() || !reflect.DeepEqual(g.Values(), vals) {
+			t.Fatalf("%q changed Gemini CLI:\n%s\nwas\n%s", v, got, was)
+		}
+	}
+}

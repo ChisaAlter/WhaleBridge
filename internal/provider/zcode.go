@@ -53,6 +53,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 )
 
@@ -97,7 +98,8 @@ type zcodeKey struct {
 
 func zcodeCredentialsPath() string {
 	home, _ := os.UserHomeDir()
-	return filepath.Join(home, ".zcode", "v2", "credentials.json")
+	// under the folder ZCode's data was moved to, when it was
+	return filepath.Join(appdir.ZCodeDataIn(home), ".zcode", "v2", "credentials.json")
 }
 
 // zcodeSecret is the key ZCode encrypts its credentials with.
@@ -391,7 +393,10 @@ func zcodeQuota(ctx context.Context, l Login, k zcodeKey) SubscriptionQuota {
 		q.Plan = "GLM Coding " + strings.ToUpper(data.Level[:1]) + data.Level[1:]
 	}
 	q.Windows = data.windows()
+	resets := make(chan *ResetCredits, 1)
+	go func() { resets <- zhipuPersonalResets(ctx, zcodeRoot(k.Base), k.Key) }()
 	q.Until, q.Renew = zhipuTerm(ctx, zcodeRoot(k.Base), k.Key)
+	q.Resets = <-resets
 	return q
 }
 
@@ -414,10 +419,12 @@ type zhipuLimits struct {
 
 // windows are the limits as windows: what is used of the whole when both
 // are told (the whole less what remains, or the current value), else the
-// percentage the vendor gives. TIME_LIMIT is the month's MCP tool calls,
-// which ZCode shows but never stops the models on, so it is set aside, as
-// is a limit whose whole is told as 0: no cap (an older plan's), which
-// the vendor may still give as 100% used.
+// percentage the vendor gives. A window whose whole is told carries the
+// count itself, as amount of limit, for a card that says it as used or as
+// left, as it says the share beside it (#659). TIME_LIMIT is the month's
+// MCP tool calls, which ZCode shows but never stops the models on, so it is
+// set aside, as is a limit whose whole is told as 0: no cap (an older
+// plan's), which the vendor may still give as 100% used.
 func (d zhipuLimits) windows() []QuotaWindow {
 	out := []QuotaWindow{}
 	for _, x := range d.Limits {
@@ -438,11 +445,13 @@ func (d zhipuLimits) windows() []QuotaWindow {
 			case x.Remaining != nil:
 				used := total - *x.Remaining
 				w.Used = 100 * used / total
+				w.Amount, w.Limit = used, total
 				w.Display = fmt.Sprintf("%s / %s", compactNumber(used), compactNumber(total))
 			case x.Current != nil:
 				if x.Percent == nil {
 					w.Used = 100 * *x.Current / total
 				}
+				w.Amount, w.Limit = *x.Current, total
 				w.Display = fmt.Sprintf("%s / %s", compactNumber(*x.Current), compactNumber(total))
 			}
 		}
@@ -710,7 +719,7 @@ func startZCodeSignIn(s *signInFlow, site string) error {
 	if site != "bigmodel" {
 		site = "zai"
 	}
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(s.via(context.Background()))
 	b := make([]byte, 32)
 	_, _ = rand.Read(b)
 	poll := "Bearer " + hex.EncodeToString(b)

@@ -43,12 +43,12 @@ func commandCodeIn(at place) *Agent {
 		UA:  []string{"command-code", "commandcode"},
 		Bin: "command-code", Dir: dir, Path: path,
 		Sync: func() error {
-			return syncJSON(providers, "provider."+magpieID, func() any { return ccProviderJSON() })
+			return syncJSON(providers, "provider."+magpieID, theirsKept(providers, "provider."+magpieID, ccProviderJSON, "models"))
 		},
 		Notice: func() string {
-			notes := []string{"Command Code wants its own sign-in (cmd login) even for models through magpie."}
+			notes := []string{noticeCommandcode1.String()}
 			if Running(`(^|/)(cmd|cmdc|command-code|commandcode)( |$)`) {
-				notes = append(notes, "It reads its settings at start-up — restart open Command Code sessions to use this.")
+				notes = append(notes, noticeCommandcode2.String())
 			}
 			return strings.Join(notes, " ")
 		},
@@ -77,7 +77,7 @@ func commandCodeIn(at place) *Agent {
 					return dropMagpie()
 				}
 				if ref, ok := strings.CutPrefix(v, magpieID+"/"); ok && isMagpie(ref) {
-					if err := edit.SetJSON(providers, edit.KV{Path: "provider." + magpieID, Value: ccProviderJSON()}); err != nil {
+					if err := edit.SetJSON(providers, edit.KV{Path: "provider." + magpieID, Value: theirsKept(providers, "provider."+magpieID, ccProviderJSON, "models")()}); err != nil {
 						return err
 					}
 					return edit.SetJSON(path, edit.KV{Path: "model", Value: v}, edit.KV{Path: "modelProvider", Value: magpieID})
@@ -186,3 +186,9 @@ func ccEffortMap(path string) map[string]string {
 	}
 	return out
 }
+
+// what commandcode says after a change (notice.go)
+var (
+	noticeCommandcode1 = newNotice("Command Code wants its own sign-in (cmd login) even for models through magpie.")
+	noticeCommandcode2 = newNotice("It reads its settings at start-up — restart open Command Code sessions to use this.")
+)

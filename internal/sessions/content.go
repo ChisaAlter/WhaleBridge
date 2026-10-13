@@ -71,7 +71,7 @@ func keep(p Part) (Part, bool) {
 	}
 	if n := utf8.RuneCountInString(p.Text); n > partMax {
 		r := []rune(p.Text)
-		p.Text, p.Cut = string(r[:partMax]), n-partMax
+		p.Text, p.Cut = string(r[:partMax]), p.Cut+n-partMax
 	}
 	return p, true
 }
@@ -126,9 +126,18 @@ type ccBlock struct {
 // lines of its own message what it said. add is told each part, and says
 // whether to read on.
 func claudeContent(c Call, add func(input bool, p Part) bool) error {
+	return claudeContentOf(c, nil, add)
+}
+
+// claudeContentOf is claudeContent reading only the lines keep (when given)
+// says yes to: a search's cheap test of a line's bytes before it is decoded.
+func claudeContentOf(c Call, keep func([]byte) bool, add func(input bool, p Part) bool) error {
 	_, err := scanAt(c.File, c.From, nil, func(b []byte, start, end int64) bool {
 		if start >= c.To {
 			return false
+		}
+		if keep != nil && !keep(b) {
+			return true
 		}
 		user := bytes.Contains(b, ccUserLine)
 		asst := bytes.Contains(b, ccAssistant)
@@ -247,6 +256,12 @@ var cxItem = []byte(`"type":"response_item"`)
 // unpacked) since the call was read is read in its new form: its lines and
 // their places are the same. add is as claudeContent's.
 func codexContent(c Call, add func(input bool, p Part) bool) error {
+	return codexContentOf(c, nil, add)
+}
+
+// codexContentOf is codexContent reading only the lines keep (when given)
+// says yes to, as claudeContentOf.
+func codexContentOf(c Call, keep func([]byte) bool, add func(input bool, p Part) bool) error {
 	path := c.File
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		if _, err := os.Stat(rolloutTwin(path)); err == nil {
@@ -258,6 +273,9 @@ func codexContent(c Call, add func(input bool, p Part) bool) error {
 			return false
 		}
 		if !bytes.Contains(b, cxItem) {
+			return true
+		}
+		if keep != nil && !keep(b) {
 			return true
 		}
 		var l struct {

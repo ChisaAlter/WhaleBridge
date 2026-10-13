@@ -215,3 +215,34 @@ func TestCursorLocalEffort(t *testing.T) {
 		t.Fatalf("offered %q while not connected", got)
 	}
 }
+
+// TestCursorLocalFoundWhereInstalled: the build installed outside the apps
+// folders (a folder picked in its Windows installer, which Windows' list
+// of installed programs names) and its Linux AppImage, as downloaded, are
+// found; regular Cursor's AppImage isn't (#1254).
+func TestCursorLocalFoundWhereInstalled(t *testing.T) {
+	root, elsewhere := t.TempDir(), filepath.Join(t.TempDir(), "D", "Cursor PI")
+	// the Windows install's layout, as its 3.24.9 user setup leaves it
+	res := filepath.Join(elsewhere, "resources", "app")
+	if err := os.MkdirAll(res, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(res, "product.json"), []byte(`{"nameShort":"Cursor Private Inference","nameLong":"Cursor Private Inference","applicationName":"cursor","dataFolderName":".cursor","win32DirName":"cursor"}`), 0o644)
+	os.WriteFile(filepath.Join(elsewhere, "Cursor Private Inference.exe"), nil, 0o755)
+	if got := findCursorLocal([]string{root}); got != "" {
+		t.Fatalf("found %q with nothing in the apps folder", got)
+	}
+	if got := findCursorLocal([]string{root}, filepath.Join(root, "gone"), elsewhere); filepath.Dir(got) != elsewhere {
+		t.Fatalf("installed in a folder of the user's: found %q, want a program in %q", got, elsewhere)
+	}
+
+	os.WriteFile(filepath.Join(root, "Cursor-3.24.9-x86_64.AppImage"), nil, 0o755)
+	if got := findCursorLocal([]string{root}); got != "" {
+		t.Fatalf("regular Cursor's AppImage found as it: %q", got)
+	}
+	img := filepath.Join(root, "Cursor_Private_Inference-3.24.9-x86_64.AppImage")
+	os.WriteFile(img, nil, 0o755)
+	if got := findCursorLocal([]string{root}); got != img {
+		t.Fatalf("its AppImage: found %q, want %q", got, img)
+	}
+}

@@ -89,14 +89,14 @@ func morphIn(at place) *Agent {
 		return 0
 	}
 	return &Agent{
-		ID: "morph", Name: "Mister Morph", Icon: "mistermorph-color", Aliases: []string{"mistermorph", "mister-morph"}, Spelled: prefixed,
+		ID: "morph", Name: "Mister Morph", Icon: "mistermorph-color", Aliases: []string{"mistermorph", "mister-morph"}, Spelled: prefixed, NoNames: true,
 		UA: []string{morphUA},
 		// no Bin: morph is other tools' name too; ~/.morph is made by its
 		// first run, `morph install` or the desktop app's setup
 		Dir: dir, Path: path,
 		Notice: func() string {
 			if Running(`(^|/)morph( |$)`, `(^|/)mistermorph( |$)`) {
-				return "Mister Morph's Console uses this for new tasks; restart open morph chats to use it there."
+				return noticeMorph.String()
 			}
 			return ""
 		},
@@ -171,3 +171,8 @@ func morphIn(at place) *Agent {
 		}},
 	}
 }
+
+// what morph says after a change (notice.go)
+var (
+	noticeMorph = newNotice("Mister Morph's Console uses this for new tasks; restart open morph chats to use it there.")
+)

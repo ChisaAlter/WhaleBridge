@@ -29,9 +29,11 @@ type cxLine struct {
 		ID          string   `json:"id"`
 		Cwd         string   `json:"cwd"`
 		Model       string   `json:"model"`
-		Role        string   `json:"role"`
-		Message     string   `json:"message"`
-		Content     []struct {
+		// session_meta's
+		ModelProvider string `json:"model_provider"`
+		Role          string `json:"role"`
+		Message       string `json:"message"`
+		Content       []struct {
 			Type string `json:"type"`
 			Text string `json:"text"`
 		} `json:"content"`
@@ -220,6 +222,9 @@ func codexBody(s *state, b []byte, main bool) {
 		codexState(s).beginSnapshot(at, p.ID, p.cxHistorySnapshot)
 		if s.ID == "" {
 			s.ID = p.ID
+			if s.Provider = p.ModelProvider; s.Provider == "" {
+				s.Provider = "openai"
+			}
 		}
 		if s.Cwd == "" {
 			s.Cwd = p.Cwd

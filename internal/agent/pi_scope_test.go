@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 func TestPiTakes(t *testing.T) {
@@ -138,4 +139,65 @@ func mustGet(t *testing.T, path, key string) string {
 		t.Fatalf("%s: no %s in %s", path, key, readFile(path))
 	}
 	return v
+}
+
+// A provider renamed moves the magpie/<id>/ entries in Pi's enabledModels
+// onto the new id, in Pi and in its forks that keep the same settings.json
+// (OmO, Prime Agent): the model it is on, kept at its place and not listed
+// twice, another of that provider's with a thinking level, and a glob. The
+// user's own entries stay, and so does a name that only shares a prefix
+// (#1919, #1828).
+func TestPiEnabledModelsFollowRename(t *testing.T) {
+	for _, c := range []struct {
+		id  string
+		dir []string
+		a   func(string) *Agent
+	}{
+		{"pi", []string{".pi", "agent"}, pi},
+		{"omo", []string{".omo", "agent"}, omo},
+		{"prime-agent", []string{".prime", "agent"}, primeAgent},
+	} {
+		t.Run(c.id, func(t *testing.T) {
+			home := syncHome(t)
+			if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Chat: "https://api.deepseek.com/v1", Key: "k", Models: []string{"pro", "flash"}}); err != nil {
+				t.Fatal(err)
+			}
+			settings := filepath.Join(append([]string{home}, append(c.dir, "settings.json")...)...)
+			os.MkdirAll(filepath.Dir(settings), 0o755)
+			os.WriteFile(settings, []byte(`{
+  // the user's own
+  "enabledModels": ["xai/grok-4.6:high", "magpie/deepseek/flash:low", "magpie/deepseek/*", "magpie/deepseekx/flash", "magpie/deepseek/pro"],
+  "defaultProvider": "xai",
+  "defaultModel": "grok-4.6"
+}
+`), 0o644)
+			a := c.a(home)
+			if err := a.Apply("model", "magpie/deepseek/pro"); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := RenameProvider("deepseek", "ds"); err != nil {
+				t.Fatal(err)
+			}
+			want := `["xai/grok-4.6:high","magpie/ds/flash:low","magpie/ds/*","magpie/deepseekx/flash","magpie/ds/pro"]`
+			if got := strings.Join(strings.Fields(mustGet(t, settings, "enabledModels")), ""); got != want {
+				t.Errorf("enabledModels = %s, want %s", got, want)
+			}
+			if !strings.Contains(readFile(settings), "// the user's own") {
+				t.Errorf("comment lost: %s", readFile(settings))
+			}
+			if got := a.Field("model").Get(); got != "magpie/ds/pro" {
+				t.Errorf("model = %q", got)
+			}
+
+			// a list naming none of the provider's models is left byte for byte
+			const mine = `{"enabledModels": ["xai/grok-4.6", "xai/grok-4.6"]}` + "\n"
+			os.WriteFile(settings, []byte(mine), 0o644)
+			if _, err := RenameProvider("ds", "deepseek"); err != nil {
+				t.Fatal(err)
+			}
+			if got := readFile(settings); got != mine {
+				t.Errorf("user list rewritten: %s", got)
+			}
+		})
+	}
 }

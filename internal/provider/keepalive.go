@@ -18,6 +18,8 @@ import (
 	"log"
 	"strings"
 	"time"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // keepAliveEvery is how long a saved sign-in goes before it is renewed.
@@ -38,6 +40,9 @@ type Renewal struct {
 // agent's hands that have gone every or longer without it; every 0 renews
 // all of them.
 func RenewLogins(ctx context.Context, every time.Duration) []Renewal {
+	if settings.AccountDiscoveryOff() {
+		return nil
+	}
 	rememberLogins(false)
 	loginsMu.Lock()
 	active := map[string]string{}

@@ -14,9 +14,10 @@ package sessions
 
 import (
 	"os"
-	"os/exec"
 	"runtime"
 	"strings"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/proc"
 )
 
 // Carry is another agent a session can be carried on in, and the shell
@@ -29,7 +30,7 @@ type Carry struct {
 // ompThere says whether oh-my-pi is installed: its command, or its folder.
 // A var so tests can say.
 var ompThere = func() bool {
-	if _, err := exec.LookPath("omp"); err == nil {
+	if _, err := proc.Look("omp"); err == nil {
 		return true
 	}
 	_, err := os.Stat(OmpDir())

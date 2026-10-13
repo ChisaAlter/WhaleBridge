@@ -58,7 +58,10 @@ func TestAsideStageNativeThenMagpieRestoresNativeChoice(t *testing.T) {
 
 func TestAsideStatePassesNeverReadRuntime(t *testing.T) {
 	asideHome(t)
-	asideRead = func() (map[string]json.RawMessage, error) { t.Fatal("state read invoked daemon"); return nil, nil }
+	asideRead = func(string) (map[string]json.RawMessage, error) {
+		t.Fatal("state read invoked daemon")
+		return nil, nil
+	}
 	for i := 0; i < 3; i++ {
 		a := mustFindAside(t)
 		a.Values()
@@ -77,7 +80,7 @@ func TestAsideRewireWithoutDaemonOnlyMovesProvider(t *testing.T) {
 	}
 	before := readFile(settings)
 	setPort(t, 3592)
-	asideRead = func() (map[string]json.RawMessage, error) {
+	asideRead = func(string) (map[string]json.RawMessage, error) {
 		t.Fatal("rewire read runtime")
 		return nil, errors.New("offline")
 	}

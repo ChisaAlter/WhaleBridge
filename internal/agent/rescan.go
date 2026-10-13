@@ -1,6 +1,10 @@
 package agent
 
-import "time"
+import (
+	"time"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/proc"
+)
 
 // Rescan forgets what was found of the agents on this machine a while ago,
 // so the next read of them looks again at once: the reader asked for it with
@@ -8,8 +12,10 @@ import "time"
 // removed one, or changed its settings outside magpie. What is read from an
 // agent's files every time needs nothing forgotten; these are the answers
 // kept for a while because asking was slow (the apps folder, wsl.exe, Alma's
-// server).
+// server), and where each command was found on PATH (proc.LookPath).
 func Rescan() {
+	proc.Forget()
+
 	cursorLocalSeen.Lock()
 	cursorLocalSeen.at = time.Time{}
 	cursorLocalSeen.Unlock()

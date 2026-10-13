@@ -110,20 +110,6 @@ func vertexEffort(req *Request, levels []string) *Request {
 // away as one it didn't give: "Invalid thought signature.".
 var vertexSignatureRefused = regexp.MustCompile(`(?i)invalid thought signature`)
 
-// Gemini names the thinking level it refuses in either of these API forms.
-var geminiLevelRefused = regexp.MustCompile(`(?i)thinking[ _]level\W+(?:(minimal|low|medium|high)\W+is not supported|is unsupported\W+thinking_level_(minimal|low|medium|high))`)
-
-func geminiRefusedLevel(body []byte) string {
-	m := geminiLevelRefused.FindSubmatch(body)
-	if len(m) != 3 {
-		return ""
-	}
-	if len(m[1]) > 0 {
-		return strings.ToLower(string(m[1]))
-	}
-	return strings.ToLower(string(m[2]))
-}
-
 // withoutSignatures is req with no thought signature on its calls, each of
 // which then goes to Vertex AI waved through (skipSignature); false when it
 // had none.

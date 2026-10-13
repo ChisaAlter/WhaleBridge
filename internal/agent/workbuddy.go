@@ -18,6 +18,14 @@ package agent
 // task in WorkBuddy's window, not in a file, so what magpie sets is whether
 // its models are in that picker. Its requests say "CLI/<ver> WorkBuddy/<ver>",
 // so they are told apart by their key.
+//
+// WorkBuddy AI, the international build (www.workbuddy.ai, bundle
+// com.workbuddy.workbuddy-ai), is the same app with its data in
+// ~/.workbuddy-ai: its cli/product.json sets dataFolderName ".workbuddy-ai",
+// which resolveWorkbuddyConfigDir (5.6.2's app.asar) takes when
+// WORKBUDDY_CONFIG_DIR isn't set. magpie wires it as its own agent, its
+// models under its own key, so each build's picker is written in its own
+// folder (#1494).
 
 import (
 	"bytes"
@@ -36,18 +44,33 @@ func workbuddy(home string) *Agent {
 	if dir == "" {
 		dir = filepath.Join(home, ".workbuddy")
 	}
+	return workbuddyBuild("workbuddy", "WorkBuddy", dir, []string{"work-buddy"})
+}
+
+// workbuddyAI is WorkBuddy AI, the international build, in ~/.workbuddy-ai.
+// WORKBUDDY_CONFIG_DIR is WorkBuddy's (workbuddy above): both builds would
+// read a folder it names, which that agent writes already.
+func workbuddyAI(home string) *Agent {
+	return workbuddyBuild("workbuddy-ai", "WorkBuddy AI", filepath.Join(home, ".workbuddy-ai"), []string{"workbuddy-intl", "workbuddyai"})
+}
+
+// workbuddyBuild is one of WorkBuddy's builds, its models.json in dir.
+func workbuddyBuild(id, name, dir string, aliases []string) *Agent {
 	path := filepath.Join(dir, "models.json")
+	write := func(on bool) error { return buddyWrite(path, id, on) }
 	return &Agent{
-		ID: "workbuddy", Name: "WorkBuddy", Icon: "workbuddy-color", Aliases: []string{"work-buddy"},
-		UA:  []string{"workbuddy"},
+		ID: id, Name: name, Icon: "workbuddy-color", Aliases: aliases,
+		UA:  []string{id},
 		Dir: dir, Path: path,
-		Check: func() string { return buddyWiringOff(path, "workbuddy", gateway.URL()) },
+		Check: func() string { return buddyWiringOff(path, id, gateway.URL()) },
 		Sync: func() error {
 			if !workbuddyWired(path) {
 				return nil
 			}
-			return workbuddyWrite(path, true)
+			return write(true)
 		},
+		// its picker lists the models picked for it (#1508)
+		ListsModels: true,
 		Fields: []Field{{
 			Key: "provider", Label: "provider",
 			Get: func() string {
@@ -56,9 +79,9 @@ func workbuddy(home string) *Agent {
 				}
 				return ""
 			},
-			Set: func(v string) error { return workbuddyWrite(path, v != "") },
+			Set: func(v string) error { return write(v != "") },
 			Options: func(map[string]string) []Option {
-				return []Option{{Value: magpieID, Label: "magpie", Icon: "magpie", Note: "every magpie model in WorkBuddy's picker"}}
+				return []Option{{Value: magpieID, Label: "magpie", Icon: "magpie", Note: "every magpie model in " + name + "'s picker"}}
 			},
 		}},
 	}
@@ -128,7 +151,8 @@ func buddyWiringOff(path, agent, gw string) string {
 		if !mine && e.APIKey != key {
 			continue
 		}
-		if e.URL != gw+"/v1/chat/completions" || e.APIKey != key {
+		want := gw + "/v1/chat/completions"
+		if e.APIKey != key || e.URL != want && !surelyMagpie(e.URL, want) {
 			return "The model list's gateway address or API key was changed outside WhaleBridge"
 		}
 	}
@@ -159,12 +183,12 @@ func buddyWriteAt(path, agent string, on bool, where place) error {
 	if err != nil {
 		return err
 	}
-	if d.rest == nil && d.models == nil && agent != "workbuddy" {
+	if d.rest == nil && d.models == nil && agent != "workbuddy" && agent != "workbuddy-ai" {
 		d.rest = map[string]json.RawMessage{}
 	}
 	// the keys magpie's models are asked with: the gateway's, or that of a
 	// magpie on another machine the user pointed them at
-	keys := map[string]bool{gateway.TokenFor(agent): true}
+	keys := map[string]bool{gateway.TokenFor(agent): true, agentKey(agent): true}
 	if away {
 		keys[agentKeyAt(agent, where.gw())] = true
 	}
@@ -286,7 +310,7 @@ func buddyModel(agent, id, name string, context, output int, images bool, effort
 	}
 	e := map[string]any{
 		"id": id, "name": name, "vendor": magpieID,
-		"apiKey": gateway.TokenFor(agent), "url": gatewayV1() + "/chat/completions",
+		"apiKey": agentKey(agent), "url": gatewayV1() + "/chat/completions",
 		"maxInputTokens":   context,
 		"supportsToolCall": true, "supportsImages": images, "supportsReasoning": false,
 	}

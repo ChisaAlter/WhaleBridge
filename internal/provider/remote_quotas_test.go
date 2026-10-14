@@ -12,7 +12,8 @@ import (
 )
 
 // fakePeer is another magpie's gateway as RemoteCards asks it: its kept
-// cards at RemoteCardsPath, a card read again at RemoteRefreshPath.
+// cards at RemoteCardsPath, a card read again at RemoteRefreshPath. It
+// predates RemoteKeyLimitPath, so the key's card reports that limitation.
 type fakePeer struct {
 	sync.Mutex
 	cards     []SubscriptionQuota
@@ -130,8 +131,11 @@ func TestRemoteMagpieCardRefresh(t *testing.T) {
 	remoteQuotaHome(t, peer)
 	ctx := context.Background()
 	cs := RemoteCards(ctx)
-	if len(cs) != 1 || cs[0].Provider != "office" || cs[0].Error != errRemoteNothingRead || cs[0].Icon != "magpie" {
+	if len(cs) != 2 || cs[0].Provider != "office" || cs[0].Error != errRemoteNothingRead || cs[0].Icon != "magpie" {
 		t.Fatalf("nothing read there: %+v", cs)
+	}
+	if cs[1].Provider != "office/~keys" || cs[1].Kind != "plan" || cs[1].From != "Office" || cs[1].Error != errRemoteNoKeyLimit || cs[1].GatewayKey != nil {
+		t.Fatalf("old peer's key limit must be unknown, not unlimited: %+v", cs[1])
 	}
 	peer.Lock()
 	peer.cards = []SubscriptionQuota{{Provider: "codex", Name: "Codex", User: "a@x.com", Windows: []QuotaWindow{{Name: "5h", Used: 70}}}}
@@ -142,8 +146,11 @@ func TestRemoteMagpieCardRefresh(t *testing.T) {
 		t.Errorf("refreshes asked: %q", got)
 	}
 	cs = RemoteCards(ctx)
-	if len(cs) != 1 || cs[0].Provider != "office/codex" || cs[0].Windows[0].Used != 70 {
+	if len(cs) != 2 || cs[0].Provider != "office/codex" || len(cs[0].Windows) != 1 || cs[0].Windows[0].Used != 70 {
 		t.Errorf("after refresh: %+v", cs)
+	}
+	if len(cs) == 2 && (cs[1].Provider != "office/~keys" || cs[1].Error != errRemoteNoKeyLimit || cs[1].GatewayKey != nil) {
+		t.Errorf("refresh lost the old peer's key-limit diagnostic: %+v", cs[1])
 	}
 	if peer.gets != 3 {
 		t.Errorf("cards asked %d times, want 3 (once, then after each refresh)", peer.gets)
@@ -173,8 +180,8 @@ func TestRemoteMagpieUnreachable(t *testing.T) {
 	peer.Lock()
 	peer.status = http.StatusNotFound
 	peer.Unlock()
-	if cs := RemoteCards(ctx); len(cs) != 1 || cs[0].Error != errRemoteNoShare {
-		t.Errorf("an old magpie: %+v", cs)
+	if cs := RemoteCards(ctx); len(cs) != 2 || cs[0].Provider != "office" || cs[0].Error != errRemoteNoShare || cs[1].Provider != "office/~keys" || cs[1].Error != errRemoteNoKeyLimit || cs[1].GatewayKey != nil {
+		t.Errorf("an old magpie must retain both quota and key-limit diagnostics: %+v", cs)
 	}
 }
 

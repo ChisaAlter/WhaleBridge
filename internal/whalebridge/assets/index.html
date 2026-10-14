@@ -26,7 +26,6 @@
     </aside>
     <div class="workspace">
         <div class="toolbar"><div class="breadcrumb">鲸桥<span>/</span><strong id="page-label">接入概览</strong></div><div class="toolbar-actions"><span class="connection" id="connection" data-state="loading">正在连接…</span><button class="icon-button" id="refresh" aria-label="刷新当前页面" title="刷新当前页面"><svg class="icon" aria-hidden="true"><use href="/icons.svg#refresh"></use></svg></button></div></div>
-      <div id="message" role="status" hidden><svg class="icon" aria-hidden="true"><use href="/icons.svg#info"></use></svg><span id="message-text" tabindex="0"></span><button class="icon-button" id="dismiss-message" aria-label="关闭提示"><svg class="icon" aria-hidden="true"><use href="/icons.svg#close"></use></svg></button></div>
       <main id="main" tabindex="-1"><div class="content-wrap">
         <section id="content" aria-live="polite" aria-busy="true"><div class="loading"><img src="/whale-head.png" alt="" width="48" height="48"><p>正在读取鲸桥配置…</p></div></section>
         <footer><span>鲸屿出品 · 基于 Magpie</span><button class="text-button" data-action="go-help">了解鲸桥</button></footer>
@@ -40,4 +39,5 @@
     <div class="dialog-actions editor-footer"><span class="dialog-note" id="editor-note">保存后同步模型与路由</span><button type="button" id="cancel-editor">取消</button><button class="primary" id="save" type="submit">保存</button></div>
   </form></dialog>
   <dialog id="confirmation" class="confirmation" aria-labelledby="confirm-title"><form id="confirm-form"><div class="dialog-head"><h2 id="confirm-title"></h2><button type="button" class="icon-button" id="close-confirm" aria-label="关闭"><svg class="icon" aria-hidden="true"><use href="/icons.svg#close"></use></svg></button></div><div class="dialog-body"><p id="confirm-body"></p><div id="confirm-input"></div></div><div class="dialog-actions"><button type="button" id="cancel-confirm">取消</button><button class="primary" type="submit" id="accept-confirm">确认</button></div></form></dialog>
+<div id="message" popover="manual" role="status" hidden><svg class="icon" aria-hidden="true"><use href="/icons.svg#info"></use></svg><span id="message-text" tabindex="0"></span><button type="button" class="icon-button" id="dismiss-message" aria-label="关闭提示"><svg class="icon" aria-hidden="true"><use href="/icons.svg#close"></use></svg></button></div>
 </body></html>

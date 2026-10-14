@@ -11,7 +11,7 @@ let providerQuery='',providerFilter='all',groupQuery='',selectedGroups=new Set()
 let visibilityWrites = Promise.resolve();
 const visibilityPending = new Map();
 const foldedChannels = new Set();
-let messageTimer;
+let messageHoldTimer, messageCloseTimer;
 let quotaRows=[],subscriptionSettings={},providerLiveTimer,healthTimer,quotaReadSequence=0;
 const pageNames = {overview:'接入概览',agents:'Agent 接入',providers:'供应商与账号',models:'模型管理',routing:'路由组',usage:'用量统计',help:'使用说明',settings:'全局设置'};
  const routes = {'':'智能','order':'按顺序','rotate':'轮换','usage':'最少用量','pace':'按剩余额度','weight':'权重','manual':'固定模型'};
@@ -21,12 +21,28 @@ async function api(path, body, headersCallback) {
  if (!response.ok) throw new Error(await response.text());
  return response.json();
 }
-function message(text, error = false) {
- $('#message-text').textContent = text; $('#message').hidden = !text;
- $('#message').dataset.error = String(error);
- clearTimeout(messageTimer);
- if(text&&!error)messageTimer=setTimeout(()=>message(''),3200);
+function positionMessage() {
+ const notice=$('#message'), sidebar=$('.sidebar');
+ const stacked=notice.parentElement===document.body&&sidebar&&sidebar.getBoundingClientRect().width>=innerWidth-24;
+ const top=stacked?Math.max(120,sidebar.getBoundingClientRect().height+8):120;
+ notice.style.setProperty('--message-top',`${top}px`);
 }
+function message(text, error = false) {
+ clearTimeout(messageHoldTimer);clearTimeout(messageCloseTimer);
+ const notice=$('#message');
+ if(notice.matches(':popover-open'))notice.hidePopover();
+ notice.classList.remove('leaving');notice.hidden=!text;
+ notice.dataset.error=String(error);notice.setAttribute('role',error?'alert':'status');
+ $('#message-text').textContent=text;
+ if(!text)return;
+ // Keep toast actions inside the active modal's interactive subtree.
+ const host=$('#confirmation').open?$('#confirmation'):$('#editor').open?$('#editor'):document.body;
+ host.append(notice);
+ positionMessage();
+ notice.showPopover();
+ if(!error)messageHoldTimer=setTimeout(()=>{notice.classList.add('leaving');messageCloseTimer=setTimeout(()=>message(''),1000);},3000);
+}
+addEventListener('resize',positionMessage);
 // Keep native select behavior, but use the shared icon and theme for its arrow.
 function decorateSelects(){
  for(const select of document.querySelectorAll('select:not([multiple])')){
@@ -72,7 +88,7 @@ async function installAdapter(data,busy){
   consume(buffer);if(!done)throw new Error('未收到适配器安装结果');
  }finally{reader.releaseLock();}
 }
-async function load() {
+async function load(confirmed = '') {
  const busy=startButtonBusy($('#refresh'),'刷新中');
  try {
   state = await api('state');
@@ -82,11 +98,14 @@ async function load() {
   $('#provider-count').textContent = state.providers.length || '';
   $('#model-count').textContent = state.models?.length || '';
   await render();
+  if(confirmed)message(confirmed);
+  return true;
  } catch(e) {
   $('#connection').textContent = '连接异常'; $('#connection').dataset.state = 'error';
   $('#content').setAttribute('aria-busy','false');
   if(!state) $('#content').innerHTML = empty('暂时无法读取配置','请确认鲸桥正在运行，然后点击右上角刷新。','','info');
-  message(e.message,true);
+  message(confirmed?`${confirmed}；页面刷新失败：${e.message}`:e.message,true);
+  return false;
  } finally { busy.finish(); }
 }
 function heading(title, description, action = '') { return `<div class="top"><div><h1>${title}</h1><p>${description}</p></div>${action}</div>`; }
@@ -179,7 +198,7 @@ async function setModelVisibility(ids,hidden) {
    state.models=rows.filter(m=>!(changed.has(m.id)?hidden:wasHidden.has(m.id)));
    state.hidden=rows.filter(m=>changed.has(m.id)?hidden:wasHidden.has(m.id));
    $('#model-count').textContent=state.models.length || '';
-   if(ids.length>1)message(`已${hidden?'隐藏':'显示'} ${ids.length} 个模型，已同步到鲸屿`);
+   message(ids.length>1?`已${hidden?'隐藏':'显示'} ${ids.length} 个模型，已同步到鲸屿`:'模型显示已更新，已同步到鲸屿');
   }finally{
    for(const id of ids)visibilityPending.delete(id);
    if($('#model-list')){if(modelFilter==='all')syncModelControls();else modelList();}
@@ -625,6 +644,7 @@ function checkEditorValidity(){
  invalid.reportValidity();return false;
 }
 function showEditor(){
+ if($('#message').dataset.error==='true')message('');
  $('#form-error').hidden=true;$('#adapter-progress').hidden=true;$('#save').hidden=false;buttonBusy.delete($('#save'));$('#save').removeAttribute('aria-label');$('#save').removeAttribute('aria-busy');$('#save').style.minWidth='';$('#save').textContent='保存';$('#save').disabled=false;
  $('#cancel-editor').textContent=['sources','accounts','keys','adapters','health'].includes(editor.type)?'关闭':'取消';
  $('#editor-note').textContent=editor.type==='sources'?'选择来源后配置认证，保存后接入':'保存后同步模型与路由';
@@ -644,28 +664,28 @@ async function showConnectionSuccess(title,detail,source){
 const lines=value=>value.split(/\r?\n/).map(s=>s.trim()).filter(Boolean);
 $('#edit-form').addEventListener('invalid',e=>{const details=e.target.closest('details');if(details)details.open=true;},true);
 $('#edit-form').addEventListener('submit',async e=>{
-  e.preventDefault();const current=editor;if(!checkEditorValidity())return;
+  e.preventDefault();if($('#save').disabled)return;const current=editor;if(!checkEditorValidity())return;
  if(current.type==='connection-success'){$('#editor').close();await go('providers');return;}
  if(['sources','accounts','adapters','health','quota-history','export','import-result'].includes(current.type))return;
- const busy=startButtonBusy($('#save'),current.type==='subscription'?'登录中':current.type==='provider-import'?(current.preview?'导入中':'预览中'):'保存中');$('#form-error').hidden=true;const data=Object.fromEntries(new FormData(e.target));
+ const busy=startButtonBusy($('#save'),current.type==='subscription'?'登录中':current.type==='provider-import'?(current.preview?'导入中':'预览中'):'保存中');$('#form-error').hidden=true;message('');const data=Object.fromEntries(new FormData(e.target));let confirmed='';
  try {
   if(current.type==='subscription'){await beginSubscription(data);return;}
   if(current.type==='subscription-settings'){const payload={};for(const key of ['codexWarmup','claudeWarmup'])payload[key]=data[key];payload.codexWarmAts=readWarmTimes('codexWarmAts');payload.claudeWarmAts=readWarmTimes('claudeWarmAts');const checkinOff=new Set(subscriptionSettings.checkinOff || []);for(const input of $('#fields').querySelectorAll('[data-account-checkin]')){if(input.checked)checkinOff.delete(input.dataset.accountCheckin);else checkinOff.add(input.dataset.accountCheckin);}payload.checkinOff=[...checkinOff];payload.quotaLeft=$('#f-quotaLeft').checked;payload.chinaMirror=$('#f-chinaMirror').checked;for(const key of ['usageAlert','balanceAlert','resetReminder'])payload[key]=Number(data[key] || 0);payload.proxy=data.proxyMode==='direct'?'direct':data.proxyMode==='custom'?data.proxy:'';for(const key of ['workbuddyCheckin','traeCheckin','minimaxCheckin','qoderCheckin'])payload[key]=!!$(`#f-${key}`).checked;payload.pluginCheckins={...subscriptionSettings.pluginCheckins,...Object.fromEntries([...$('#fields').querySelectorAll('[data-plugin-checkin]')].map(c=>[c.dataset.pluginCheckin,c.checked]))};await api('subscription/settings',payload);if(current!==editor||current.closed)return;$('#editor').close();message('订阅维护设置已保存');state.quotaLeft=payload.quotaLeft;if(tab==='usage')await loadQuotas(renderEpoch);return;}
   if(current.type==='quota-account'){await api('accounts/settings',{id:current.data.provider,user:current.data.user,codexAutoReset:$('#f-codexAutoReset').checked,codexCredits:$('#f-codexCredits').checked,codexWarmAt:data.warmMode==='custom'?data.codexWarmAt:data.warmMode==='off'?'off':''});if(current!==editor||current.closed)return;$('#editor').close();message('账号维护设置已保存');await loadQuotas(renderEpoch);return;}
-  if(current.type==='keys'){await api('keys',{id:current.data.id,action:'add',name:data.name,key:data.key,protocol:data.protocol});if(current!==editor||current.closed)return;await openKeys(current.data.id);message('密钥已添加');await load();return;}
+  if(current.type==='keys'){await api('keys',{id:current.data.id,action:'add',name:data.name,key:data.key,protocol:data.protocol});confirmed='密钥已添加，已同步到鲸屿';if(current!==editor||current.closed)return;await openKeys(current.data.id);await load(confirmed);return;}
   if(['key-edit','account-edit','key-import','auth-import','adapter-options'].includes(current.type)){await saveAccountEditor(data,current);return;}
   if(current.type==='provider-import'){
    if(!current.preview){const r=await api('provider/import',{text:data.source,preview:true});if(current!==editor||current.closed)return;const missing=r.providers.filter(p=>!p.keyOptional&&!p.keySet);current.source=data.source;current.preview=r.providers;$('#fields').innerHTML=`<p class="form-hint">将新增 ${r.providers.length} 个供应商。已有供应商和密钥保持原样；请核对来源和接口地址后导入。</p><div class="panel">${r.providers.map(p=>`<div class="row"><div class="text"><strong>${escape(p.name || p.id)}</strong><p class="caption">${escape(p.chat || p.responses || p.anthropic || p.gemini || '')}</p><p class="caption">${p.models?.length || 0} 个已选模型 · ${p.keySet?'包含密钥':p.keyOptional?'无需 API 密钥':'需要补充密钥'}</p></div></div>`).join('')}</div>`;if(missing.length&&r.providers.length===1){$('#fields').insertAdjacentHTML('beforeend',field('importKey','此供应商的 API 密钥','','password','导入前需要提供凭据'));$('#f-importKey').required=true;}else if(missing.length){current.preview=null;$('#fields').insertAdjacentHTML('beforeend',`<p class="inline-error">${escape(missing.map(p=>p.name || p.id).join('、'))} 需要密钥。请分别在各供应商 JSON 中填写 key，再重新预览。</p>`+text('source','补充凭据后的来源',data.source));$('#f-source').required=true;}$('#save').textContent=current.preview?'导入这些供应商':'重新预览';return;}
    const r=await api('provider/import',{text:current.source,...(data.importKey?{key:data.importKey}:{})});if(current!==editor||current.closed)return;$('#editor').close();message(`已新增 ${r.added?.length || current.preview.length} 个供应商，模型已同步`);await load();return;
   }
-  if(current.type==='project'){await api('accounts/project',{id:current.data.id,user:current.data.user,project:data.project});if(current!==editor||current.closed)return;await openAccounts(current.data.id);message('Cloud project 已保存');await load();return;}
+  if(current.type==='project'){await api('accounts/project',{id:current.data.id,user:current.data.user,project:data.project});confirmed='Cloud project 已保存，已同步到鲸屿';if(current!==editor||current.closed)return;await openAccounts(current.data.id);await load(confirmed);return;}
   if(current.type==='provider'){
    await api('provider',providerInput(data));
    }else{await api('group',groupInput(data));}
   if(current!==editor||current.closed)return;
   if(current.type==='provider'&&!current.data.id){await showConnectionSuccess('供应商添加成功',`${data.name} 已添加，模型已同步到鲸屿。`,{name:data.name,kind:'API 供应商'});return;}
-  $('#editor').close();message('已保存，模型已同步到鲸屿');await load();
- }catch(e){if(current===editor&&!current.closed){$('#form-error').textContent=e.message;$('#form-error').hidden=false;}}finally{if(current===editor&&!current.closed)busy.finish();}
+  $('#editor').close();await load('已保存，模型已同步到鲸屿');
+ }catch(e){if(current===editor&&!current.closed)message(confirmed?`${confirmed}；页面刷新失败：${e.message}`:e.message,true);}finally{if(current===editor&&!current.closed)busy.finish();}
 });
 $('#close-editor').onclick=$('#cancel-editor').onclick=()=>$('#editor').close();
 function ask(title,body,accept='确认',number){
@@ -678,7 +698,7 @@ function ask(title,body,accept='确认',number){
 $('#confirm-form').onsubmit=e=>{e.preventDefault();$('#confirmation').close('accept');};
 $('#close-confirm').onclick=$('#cancel-confirm').onclick=()=>$('#confirmation').close();
 $('#dismiss-message').onclick=()=>message('');
-$('#refresh').addEventListener('click',load);
+$('#refresh').addEventListener('click',()=>load());
 $('#narrow-page').addEventListener('change',event=>go(event.target.value).catch(error=>message(error.message,true)));
 for(const b of document.querySelectorAll('[data-tab]'))b.addEventListener('click',()=>go(b.dataset.tab).catch(e=>message(e.message,true)));
 // All navigational actions share one delegated handler, including footer help.
@@ -717,7 +737,8 @@ $('.workspace').addEventListener('click',async e=>{
   if(action==='delete-provider'){if(!await ask('删除供应商？','对应的模型会从鲸屿的「鲸桥」渠道中移除。其他供应商和对话记录不受影响。','删除供应商'))return;begin('删除中');await api('provider/delete',{id});}
   if(action==='delete-group'){if(!await ask('删除路由组？','这个组会从鲸屿的模型列表中移除，成员模型和供应商配置仍保留。','删除路由组'))return;begin('删除中');await api('group/delete',{id});}
   if(action==='toggle-provider'){const p=state.providers.find(p=>p.id===id);await api('provider',{...p,off:!p.off});}
-  message(action==='sync'?'模型已重新同步到鲸屿':'已更新，模型已同步到鲸屿');await load();
+  const result={sync:'模型已重新同步到鲸屿','refresh-catalog':'模型目录已更新，已同步到鲸屿','fetch-provider':'供应商模型已刷新，已同步到鲸屿','delete-provider':'供应商已删除，已同步到鲸屿','delete-group':'路由组已删除，已同步到鲸屿','toggle-provider':'供应商状态已更新，已同步到鲸屿'}[action] || '已更新，模型已同步到鲸屿';
+  await load(result);
  }catch(e){message(e.message,true);}finally{busy?.finish();if(!['hide-model','model-scope','fold-channel'].includes(action))b.disabled=false;}
 });
 $('#fields').addEventListener('click',e=>{
@@ -728,7 +749,7 @@ $('#fields').addEventListener('click',e=>{
  $('#f-members').value=[...members].join('\n');
  syncMemberSelection();
 });
-function formError(error){if($('#editor').open){$('#form-error').textContent=error.message || String(error);$('#form-error').hidden=false;}else message(error.message || String(error),true);}
+function formError(error){message(error.message || String(error),true);}
 function dateText(value){const d=new Date(value);return Number.isNaN(d.getTime())?String(value):d.toLocaleString('zh-CN',{hour12:false});}
 function externalLink(url,label){return /^https?:\/\//i.test(url || '')?`<a class="link" href="${escape(url)}" target="_blank" rel="noreferrer">${escape(label)} ↗</a>`:'';}
 async function copyText(value){await navigator.clipboard.writeText(String(value));message('已复制');}

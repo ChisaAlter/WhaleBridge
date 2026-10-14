@@ -124,14 +124,14 @@ function pollLogin(){
  loginTimer=setTimeout(async()=>{
   try{const st=await api(`signin/${encodeURIComponent(id)}`);if(loginFlow!==id||current!==editor||current.closed)return;
    if(st.state==='done'){await completeSubscription(st);return;}
-   if(st.state==='failed'||st.state==='canceled'){loginFlow=null;editor.loginBusy?.finish();editor.loginBusy=null;$('#form-error').textContent=st.error || '登录已取消';$('#form-error').hidden=false;return;}
+   if(st.state==='failed'||st.state==='canceled'){loginFlow=null;editor.loginBusy?.finish();editor.loginBusy=null;message(st.error || '登录已取消',true);return;}
    // Do not replace an input while the user is pasting a callback.
    if(!$('#f-callback') || st.url!==$('#fields a')?.getAttribute('href'))showLogin(st);
    pollLogin();
-  }catch(e){if(loginFlow!==id||current!==editor||current.closed)return;loginFlow=null;editor.loginBusy?.finish();editor.loginBusy=null;$('#form-error').textContent=e.message;$('#form-error').hidden=false;}
+  }catch(e){if(loginFlow!==id||current!==editor||current.closed)return;loginFlow=null;editor.loginBusy?.finish();editor.loginBusy=null;message(e.message,true);}
  },1500);
 }
-$('#editor').addEventListener('beforetoggle',event=>{if(event.newState!=='closed')return;accountViewSequence++;if(editor){editor.closed=true;editor.loginBusy?.finish();editor.loginBusy=null;}clearTimeout(loginTimer);if(loginFlow){const id=loginFlow;loginFlow=null;api(`signin/${encodeURIComponent(id)}/cancel`,{}).catch(e=>message(e.message));}});
+$('#editor').addEventListener('beforetoggle',event=>{if(event.newState!=='closed')return;accountViewSequence++;if(editor){editor.closed=true;editor.loginBusy?.finish();editor.loginBusy=null;}clearTimeout(loginTimer);if(loginFlow){const id=loginFlow;loginFlow=null;api(`signin/${encodeURIComponent(id)}/cancel`,{}).catch(e=>message(e.message,true));}});
 
 let accountViewSequence=0;
 async function openAccounts(id,expected=editor){
@@ -260,10 +260,10 @@ async function saveAccountEditor(data,current){const{id,ref,user}=current.data;
 $('#fields').addEventListener('click',async e=>{
  const b=e.target.closest('[data-action]');if(!b||b.disabled||editor?.adapterPending)return;const{action,id}=b.dataset,current=editor;
  if(!['signin-callback','install-adapter','add-account','account-on','account-remove','account-edit','account-first','account-up','account-down','account-relogin','account-access-key','accounts-quota','accounts-refresh','auth-import','key-on','key-remove','key-weight','key-edit','key-import','key-use','key-up','key-down','key-remove-selected','key-fold','pick-account-model','gateway-unrest','removed-show','removed-quiet','removed-tuck','removed-untuck','removed-forget'].includes(action))return;
- let busy;const waiting={'signin-callback':'提交中','add-account':'加载中','account-relogin':'加载中','gateway-unrest':'恢复中','account-on':'保存中','account-first':'保存中','account-up':'保存中','account-down':'保存中','key-on':'保存中','key-use':'保存中','key-up':'保存中','key-down':'保存中','removed-show':'恢复中','removed-quiet':'保存中','removed-tuck':'保存中','removed-untuck':'保存中'};if(waiting[action])busy=startButtonBusy(b,waiting[action]);b.disabled=true;
+ let busy,confirmed='';const waiting={'signin-callback':'提交中','add-account':'加载中','account-relogin':'加载中','gateway-unrest':'恢复中','account-on':'保存中','account-first':'保存中','account-up':'保存中','account-down':'保存中','key-on':'保存中','key-use':'保存中','key-up':'保存中','key-down':'保存中','removed-show':'恢复中','removed-quiet':'保存中','removed-tuck':'保存中','removed-untuck':'保存中'};if(waiting[action])busy=startButtonBusy(b,waiting[action]);b.disabled=true;
  try{
   if(action==='key-fold'){editor.expanded=!editor.expanded;localStorage.setItem('whalebridge.keys.expanded.'+id,editor.expanded?'1':'0');syncKeyList();return;}
-  if(action==='signin-callback'){await api(`signin/${encodeURIComponent(loginFlow)}/callback`,{url:$('#f-callback').value});return;}
+  if(action==='signin-callback'){await api(`signin/${encodeURIComponent(loginFlow)}/callback`,{url:$('#f-callback').value});message('登录信息已提交，等待供应商完成登录');return;}
   if(action==='install-adapter'){
    const current=editor,progress=startAdapterBusy(b);
    try{
@@ -301,11 +301,12 @@ $('#fields').addEventListener('click',async e=>{
   if(action==='key-up'||action==='key-down'){const order=editor.rows.map(k=>k.id),at=order.indexOf(data.ref),to=at+(action==='key-up'?-1:1);if(at<0||to<0||to>=order.length)return;[order[at],order[to]]=[order[to],order[at]];await api('keys',{id:data.id,action:'arrange',order});}
   if(action==='key-remove'){if(!await ask('移除密钥？','此密钥将不再用于鲸桥请求。如需撤销密钥，请到供应商控制台操作。','移除密钥'))return;busy=startButtonBusy(b,'移除中');await api('keys',{...data,action:'remove'});}
   if(action==='key-weight'){const value=await ask('设置密钥权重','权重越高，在权重路由中分配到的请求越多。请输入正整数。','保存权重',data.weight);if(value===false)return;busy=startButtonBusy(b,'保存中');await api('keys',{...data,action:'weight',weight:value});}
+  confirmed={'account-on':'账号状态已更新，已同步到鲸屿','account-remove':'订阅账号已移除，已同步到鲸屿','key-on':'密钥状态已更新，已同步到鲸屿','key-remove':'密钥已移除，已同步到鲸屿','key-weight':'密钥权重已保存，已同步到鲸屿'}[action] || '';
   if(current!==editor||current.closed)return;
-  await load();
+  if(!await load(confirmed))return;
   if(current!==editor||current.closed)return;
   if(action.startsWith('account-'))await openAccounts(data.id,current);else await openKeys(data.id,current);
- }catch(e){if(current===editor&&!current.closed)formError(e);}finally{busy?.finish();if(b.getAttribute('aria-busy')!=='true')b.disabled=false;}
+ }catch(e){if(current===editor&&!current.closed)message(confirmed?`${confirmed}；页面刷新失败：${e.message}`:e.message,true);}finally{busy?.finish();if(b.getAttribute('aria-busy')!=='true')b.disabled=false;}
 });
 $('#fields').addEventListener('input',e=>{if(e.target.id==='f-allow')syncAccountModelChoices();if(e.target.id==='f-keySearch')syncKeyList();});
 $('#fields').addEventListener('change',e=>{if(e.target.id==='f-keyStatus')syncKeyList();});

@@ -87,6 +87,9 @@ export const FakePlugin = async ({ client }) => ({
     if (process.env.FAKE_GROK) cfg.provider[ID].models["grok-4.7"] = { name: "Grok 4.7", provider: { npm: "@ai-sdk/openai" }, limit: { context: 4000, output: 400 } }
     // $FAKE_DEEPSEEK: a DeepSeek model, as Cline's cline-pass/deepseek-v4-pro
     if (process.env.FAKE_DEEPSEEK) cfg.provider[ID].models["deepseek-v4-pro"] = { name: "DeepSeek V4 Pro", limit: { context: 1000, output: 100 } }
+    // $FAKE_SEARCHES: the provider's upstream searches by itself (#2027),
+    // as a plugin in front of Claude's API says
+    if (process.env.FAKE_SEARCHES) cfg.provider[ID].searches = true
     // $FAKE_DECIDE: the provider serves a decision API too (#1514), asked
     // at its base /systemone through the loader's fetch: fake-clef is a
     // decision model it marks, jev-9 one magpie knows by its name.
@@ -193,11 +196,14 @@ export const FakePlugin = async ({ client }) => ({
         user: full ? "Full@Fake.example" : undefined,
         until: "2030-01-02T03:04:05Z",
         renew: "auto",
-        resets: full ? { count: 3, byWindow: true, fiveHour: 2, weekly: 1 } : undefined,
+        resets: full ? { count: 3, byWindow: true, fiveHour: 2, weekly: 1, team: true, each: [{ window: "weekly" }, { until: "2031-01-02T00:00:00Z", window: "fiveHour" }, { until: 1924992000, window: "fiveHour" }] } : undefined,
         windows: [
           { name: "5 hours", used: full ? 100 : 25, resetsAt: born + 3600e3, span: 5 * 3600, models: ["fake-claude"] },
-          { name: "Week", used: 10, resetsAt: Math.floor(born / 1000) + 86400, span: 7 * 86400, amount: 120, limit: 1200, unit: "credits" },
-          { name: "Extra", used: 250, display: "$2.50", aside: true },
+          // 80 of its credits are lost in two days, after it resets (#2265)
+          { name: "Week", used: 10, resetsAt: Math.floor(born / 1000) + 86400, span: 7 * 86400, amount: 120, limit: 1200, unit: "credits",
+            runsOutAt: Math.floor(born / 1000) + 2 * 86400, runsOut: 80 },
+          // a run-out the host can't read is not told
+          { name: "Extra", used: 250, display: "$2.50", aside: true, runsOutAt: "not a date", runsOut: "12" },
         ],
       }
     },
@@ -267,6 +273,12 @@ export const FakePlugin = async ({ client }) => ({
         const sized = (id, name) => ({ ...p.models["fake-1"], id, name, api: { ...p.models["fake-1"].api, id } })
         p.models["fake-opus@300k"] = { ...sized("fake-opus@300k", "Fake Opus @ 300k"), fast: true }
         p.models["fake-opus@1m"] = sized("fake-opus@1m", "Fake Opus @ 1m")
+      }
+      // $FAKE_TIERS: fake-1 and fake-resp say the service tiers their vendor
+      // serves them at (#2514), one as an object as Codex's catalog writes it
+      if (process.env.FAKE_TIERS) {
+        p.models["fake-1"] = { ...p.models["fake-1"], serviceTiers: ["priority", { id: "ultrafast" }, "", 7, "priority"] }
+        if (p.models["fake-resp"]) p.models["fake-resp"] = { ...p.models["fake-resp"], serviceTiers: ["ultrafast"] }
       }
       // $FAKE_MODELS: the vendor's list, whose answer names one more model
       if (process.env.FAKE_MODELS && auth) {

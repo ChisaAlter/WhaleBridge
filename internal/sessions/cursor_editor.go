@@ -43,6 +43,15 @@ func openCursorEditorDB(path string) *sql.DB {
 	return db
 }
 
+// cursorComposersQuery lists the editor's chats by a range on the key's
+// index. LIKE is case-insensitive, so SQLite can't use the index for it and
+// reads the whole table: every bubble and checkpoint, often several GB. A
+// live store is read from a fresh copy whenever Cursor has written, and a
+// fresh copy (an APFS clone on macOS) isn't in the page cache, so every
+// listing read the whole store from disk again and Sessions never finished
+// loading (#1988). ';' is the character after ':'.
+const cursorComposersQuery = "SELECT value FROM cursorDiskKV WHERE key >= 'composerData:' AND key < 'composerData;'"
+
 func cursorEditorDB() string {
 	dir, err := os.UserConfigDir()
 	if err != nil {
@@ -62,7 +71,7 @@ func cursorEditorFiles(cli []file) []file {
 	p := cursorEditorDB()
 	if fileExists(p) {
 		if db := openCursorEditorDB(p); db != nil {
-			rows, err := db.Query("SELECT value FROM cursorDiskKV WHERE key LIKE 'composerData:%'")
+			rows, err := db.Query(cursorComposersQuery)
 			if err == nil {
 				for rows.Next() {
 					var b []byte

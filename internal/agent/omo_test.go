@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -132,5 +133,46 @@ func TestOmoCLI(t *testing.T) {
 	u := howInstalled(cliSpecs["omo"], "/home/me/.bun/bin/omo")
 	if u == nil || u.via != "self" || u.pkg != "omo-ai" || strings.Join(u.cmd, " ") != "/home/me/.bun/bin/omo update" {
 		t.Fatalf("%+v", u)
+	}
+}
+
+// omo update runs npm by its bare name, so it is given the npm (and node)
+// of the prefix OmO was installed in first on PATH: a system node's npm in
+// /usr/local/bin, which magpie's PATH holds before a version manager's
+// (fnm), would install into a folder only root may change (#2021, ggbdpq).
+func TestOmoUpdateTakesItsOwnNpm(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks and sh scripts")
+	}
+	tmp, _ := filepath.EvalSymlinks(t.TempDir())
+	ran := filepath.Join(tmp, "ran")
+	// the system's npm, found first on magpie's PATH
+	sys := filepath.Join(tmp, "usr/local/bin")
+	file(t, filepath.Join(sys, "npm"), "#!/bin/sh\necho system >> "+ran+"\nexit 1\n")
+	// fnm's node, where OmO is
+	prefix := filepath.Join(tmp, "fnm/node-versions/v24.21.0/installation")
+	file(t, filepath.Join(prefix, "bin/npm"), "#!/bin/sh\necho fnm >> "+ran+"\n")
+	file(t, filepath.Join(prefix, "bin/node"), "#!/bin/sh\n")
+	file(t, filepath.Join(prefix, "lib/node_modules/omo-ai/bin/omo.js"), "#!/bin/sh\n[ \"$1\" = update ] && npm i -g omo-ai@5.1.32\n")
+	omoBin := link(t, "../lib/node_modules/omo-ai/bin/omo.js", filepath.Join(prefix, "bin/omo"))
+	t.Setenv("PATH", sys+string(os.PathListSeparator)+"/usr/bin:/bin")
+
+	u := howInstalled(cliSpecs["omo"], omoBin)
+	if u == nil || u.via != "self" || u.path != filepath.Join(prefix, "bin") {
+		t.Fatalf("%+v", u)
+	}
+	if out, err := runUpdate(t.Context(), u); err != nil {
+		t.Fatalf("%v: %s", err, out)
+	}
+	if b, _ := os.ReadFile(ran); string(b) != "fnm\n" {
+		t.Fatalf("omo update ran npm of %q, want fnm's", b)
+	}
+	// bun's OmO (bun add -g) keeps bun's folder first the same way
+	bunHome := filepath.Join(tmp, ".bun")
+	file(t, filepath.Join(bunHome, "bin/bun"), "#!/bin/sh\n")
+	file(t, filepath.Join(bunHome, "install/global/node_modules/omo-ai/bin/omo.js"), "")
+	bunOmo := link(t, "../install/global/node_modules/omo-ai/bin/omo.js", filepath.Join(bunHome, "bin/omo"))
+	if u := howInstalled(cliSpecs["omo"], bunOmo); u == nil || u.via != "self" || u.path != filepath.Join(bunHome, "bin") {
+		t.Fatalf("bun: %+v", u)
 	}
 }

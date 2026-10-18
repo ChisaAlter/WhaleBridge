@@ -19,6 +19,7 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 	"github.com/ChisaAlter/WhaleBridge/internal/ghtoken"
 	"github.com/ChisaAlter/WhaleBridge/internal/source"
+	"github.com/ChisaAlter/WhaleBridge/internal/update"
 )
 
 // The plugin market: the plugins magpie suggests, from the community
@@ -41,7 +42,7 @@ type Listing struct {
 	Providers []string          `json:"providers,omitempty"` // OpenCode's ids of those it signs in to
 	Community bool              `json:"community,omitempty"` // written by magpie's community
 	Replaces  string            `json:"replaces,omitempty"`  // the built-in subscription it does the work of
-	Kind      string            `json:"kind,omitempty"`      // "middleware" for gateway middleware, "agent" for an agent; none for a provider
+	Kind      string            `json:"kind,omitempty"`      // "middleware" for gateway middleware, "agent" for an agent, "tools" for tools alone, "page" for a page alone; none for a provider
 	Summary   map[string]string `json:"summary,omitempty"`   // by language: en, zh
 }
 
@@ -434,14 +435,7 @@ func npmAsk(ctx context.Context, name string) (NPM, error) {
 			latestErr = err
 			return
 		}
-		info.Version, info.Description, info.Homepage = l.Version, l.Description, l.Homepage
-		info.License, _ = l.License.(string)
-		info.Repository = repoURL(l.Repository)
-		info.Publisher = person(l.Author)
-		info.Icon = ownIcon(l.Magpie.Icon)
-		if info.Publisher == "" {
-			info.Publisher = l.NPMUser.Name
-		}
+		info = npmOf(l)
 	}()
 	var weekly int
 	go func() {
@@ -456,11 +450,30 @@ func npmAsk(ctx context.Context, name string) (NPM, error) {
 		}
 	}()
 	wg.Wait()
+	// a @magpie-community package npm doesn't have yet, or has an older
+	// version of, is as the community repo's dist branch has it, which
+	// magpie installs it from (dist.go)
+	if d, ok := distInfo(ctx, name); ok && (latestErr != nil || update.Newer(d.Version, info.Version)) {
+		info, latestErr = d, nil
+	}
 	info.Weekly = weekly
 	if latestErr != nil {
 		return NPM{}, latestErr
 	}
 	return info, nil
+}
+
+// npmOf is what a version's package.json says, as NPM has it.
+func npmOf(l npmLatest) NPM {
+	info := NPM{Version: l.Version, Description: l.Description, Homepage: l.Homepage}
+	info.License, _ = l.License.(string)
+	info.Repository = repoURL(l.Repository)
+	info.Publisher = person(l.Author)
+	info.Icon = ownIcon(l.Magpie.Icon)
+	if info.Publisher == "" {
+		info.Publisher = l.NPMUser.Name
+	}
+	return info
 }
 
 // Hit is a package npm's search found.
@@ -590,6 +603,11 @@ func Readme(ctx context.Context, name string) (Page, error) {
 	defer cancel()
 	b, err := fetchJSON(ctx, npmRegistry+"/"+npmPath(name), 32<<20)
 	if err != nil {
+		// one npm doesn't have (yet): the README the community repo's
+		// dist branch packed with it
+		if d := distPkg(ctx, name); d != nil && d.Readme != "" {
+			return Page{Readme: d.Readme}, nil
+		}
 		return Page{}, err
 	}
 	var d struct {

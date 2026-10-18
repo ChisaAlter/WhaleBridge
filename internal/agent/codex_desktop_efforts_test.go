@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
@@ -80,4 +81,60 @@ func TestCodexDesktopEfforts(t *testing.T) {
 			t.Fatalf("config:\n%s", cfg)
 		}
 	})
+}
+
+// #2127 (cnlove7777777-art): a routing group Dash could run at High or Max
+// showed in the Codex app at High with no effort control. Its entry lists
+// high and max, but the app offers a model only the efforts in [desktop]
+// enabled-reasoning-efforts, whose default leaves max out, and magpie
+// added max only when Codex's config.toml was on one of magpie's models:
+// the group got its levels later (8c5190a20, a catalog change) while the
+// config was on Codex's own model, the app's last pick, so the catalog was
+// rewritten with high and max and the app still offered high alone.
+func TestCodexDesktopEffortsFollowTheCatalog(t *testing.T) {
+	home, read := codexHome(t, "", "")
+	os.MkdirAll(filepath.Dir(catalog.CachePath()), 0o755)
+	os.WriteFile(catalog.CachePath(), []byte(`{
+	  "zai":{"models":{"glm-5.3":{"id":"glm-5.3","reasoning_options":[{"type":"effort","values":["low","high","max"]}]},
+	                   "glm-4.5-air":{"id":"glm-4.5-air"}}},
+	  "deepseek":{"models":{"deepseek-v4":{"id":"deepseek-v4","reasoning_options":[{"type":"effort","values":["high","max"]}]}}}}`), 0o644)
+	catalog.Reset()
+	t.Cleanup(catalog.Reset)
+	if err := provider.Save(provider.Provider{ID: "volc", Name: "Volc", Key: "k", Chat: "http://127.0.0.1:1/api/v3",
+		Models: []string{"glm-4.5-air"}}); err != nil {
+		t.Fatal(err)
+	}
+	cx := codex(home)
+	if err := cx.Fields[0].Set("volc/glm-4.5-air"); err != nil {
+		t.Fatal(err)
+	}
+	if cfg := read(); strings.Contains(cfg, `"max"`) {
+		t.Fatalf("max enabled with no model taking it:\n%s", cfg)
+	}
+	// the app's own pick, written to config.toml as Codex writes it
+	path := filepath.Join(home, ".codex", "config.toml")
+	if err := edit.SetTOMLTop(path, edit.KV{Path: "model", Value: "gpt-5.5"}); err != nil {
+		t.Fatal(err)
+	}
+	// the group comes to take high and max: its members are added
+	if err := provider.Save(provider.Provider{ID: "volc", Name: "Volc", Key: "k", Chat: "http://127.0.0.1:1/api/v3",
+		Models: []string{"glm-4.5-air", "glm-5.3", "deepseek-v4"}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.SaveGroup(provider.Group{ID: "normal", Name: "普通性能", Members: []string{"volc/glm-5.3", "volc/deepseek-v4"}}); err != nil {
+		t.Fatal(err)
+	}
+	if e := catalog.Efforts(magpieModels("codex"), "group/normal"); strings.Join(e, ",") != "high,max" {
+		t.Fatalf("group levels %v", e)
+	}
+	if err := cx.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	cfg := read()
+	if !strings.Contains(cfg, "[desktop]\nenabled-reasoning-efforts = [\"low\", \"medium\", \"high\", \"xhigh\", \"ultra\", \"persistent\", \"max\"]\n") {
+		t.Fatalf("the app isn't offered max for the group:\n%s", cfg)
+	}
+	if !strings.Contains(cfg, `model = "gpt-5.5"`) {
+		t.Fatalf("the app's pick changed:\n%s", cfg)
+	}
 }

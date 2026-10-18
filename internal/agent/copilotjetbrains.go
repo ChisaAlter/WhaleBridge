@@ -232,7 +232,7 @@ func copilotJBModelsJSON(hidden map[string]bool) map[string]any {
 		if output <= 0 {
 			output = 16000
 		}
-		output = min(output, context/4)
+		output = outputOr(m, min(output, context/4))
 		out[m.ID] = map[string]any{
 			"deploymentUrl": vscodeURL(),
 			"isRegistered":  !hidden[m.ID],

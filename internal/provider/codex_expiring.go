@@ -149,12 +149,12 @@ func expiringResetSpent(until, now time.Time, stopped bool, back time.Time) time
 // it runs out does (check), for routing, which takes it for when its
 // windows start again by expiringResetSpent (Allowance.Restarts): what
 // they have left is lost then, as at their own reset (#717, #718). Zero unless agent's
-// account user is let spend its resets (AutoResets), holds one that runs
+// account user is let spend the one about to run out (autoResetsExpiring), holds one that runs
 // out, and has used its windows — as check, which spends none on windows
 // with nothing to start again. Only holding a reset, auto-use off, is
 // nothing: nobody spends it.
 func resetRunsOut(agent, user string, windows []QuotaWindow, resets *ResetCredits) time.Time {
-	if resets == nil || resets.Count <= 0 || resets.Until == nil || !windowsUsed(windows) || !AutoResets(agent, user) {
+	if resets == nil || resets.Count <= 0 || resets.Until == nil || !windowsUsed(windows) || !autoResetsExpiring(agent, user) {
 		return time.Time{}
 	}
 	return *resets.Until
@@ -181,9 +181,15 @@ func minTime(a, b time.Time) time.Time {
 // SpendExpiringCodexResets goes over the Codex accounts the user lets
 // spend their resets and spends one about to run out unused (see check).
 func SpendExpiringCodexResets(ctx context.Context) {
+	if leftAlone("codex") {
+		return // switched off or removed: its allowance isn't read nor a reset spent (#2226)
+	}
 	for _, user := range settings.Load().CodexAutoReset {
 		if ctx.Err() != nil {
 			return
+		}
+		if _, expiring := CodexAutoResetWhen(user); !expiring {
+			continue // kept to its week used up (#2078)
 		}
 		var who string
 		out, err := expiring.check(user, time.Now(), func() ([]QuotaWindow, *ResetCredits, error) {

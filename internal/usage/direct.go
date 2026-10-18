@@ -45,12 +45,14 @@ func directRows(p Period, now time.Time) []Row {
 	}
 	logs, others := reader(since), sharedRecords(since)
 	matched := map[int]bool{}
+	actors := map[int]string{}
+	_, _, compactions := duplicateCodexCalls(logs)
 	if len(logs) > 0 {
 		local := &rowChunk{}
 		for i, c := range logs {
 			r := logRecord(c)
 			r.Agent = c.Agent
-			local.add(Row{Record: r}, c.Msg, int64(i), c.Error != "")
+			local.add(Row{Record: r, Source: "log", codexActor: codexActor(c)}, c.Msg, int64(i), c.Error != "")
 		}
 		var gateways []*rowChunk
 		for _, b := range readLogSnapshot().blocks {
@@ -61,11 +63,21 @@ func directRows(p Period, now time.Time) []Row {
 				gateways = append(gateways, c)
 			}
 		}
-		for ref := range matchedBlocks(gateways, []*rowChunk{local}, nil, since, false) {
+		duplicates := foldCodexRows([]*rowChunk{local})
+		pairs := codexChunkResponsePairs(gateways, []*rowChunk{local}, duplicates)
+		for ref := range matchedBlocks(gateways, []*rowChunk{local}, duplicates, pairs, since, false) {
 			matched[ref.Index] = true
 		}
+		for ref := range duplicates {
+			matched[ref.Index] = true
+		}
+		for i, call := range logs {
+			if i < len(local.codexActors) && local.codexActors[i] != call.ThreadID {
+				actors[i] = local.codexActors[i]
+			}
+		}
 	}
-	rows, _, _, _ := ledgerMatched(since, until, Filter{}, nil, logs, others, matched)
+	rows, _, _, _ := ledgerMatched(since, until, Filter{}, nil, logs, others, matched, nil, actors, compactions)
 	return rows
 }
 

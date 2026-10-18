@@ -157,9 +157,16 @@ func ccProviderJSONAt(v1 string) any {
 				efforts = append(efforts, x)
 			}
 		}
-		if len(efforts) > 0 {
+		// a model that thinks with no levels magpie knows (Trae CN's
+		// kimi-k3-max, #2380) is marked reasoning alone, which Command
+		// Code takes for low, medium and high (its BYOK reference); the
+		// gateway fits them to the model
+		switch {
+		case len(efforts) > 0:
 			e["reasoning"] = true
 			e["reasoningEfforts"] = efforts
+		case len(m.Efforts) == 0 && m.Reasoning:
+			e["reasoning"] = true
 		}
 		ms[m.ID] = e
 	}

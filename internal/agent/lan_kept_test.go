@@ -57,7 +57,7 @@ func TestSyncKeepsAnAddressOnAnotherMachine(t *testing.T) {
 		b = []byte(strings.ReplaceAll(string(b), "127.0.0.1:3591", "192.168.50.10:3591"))
 		kvs := keyValues(b)
 		for i := len(kvs) - 1; i >= 0; i-- {
-			if kv := kvs[i]; ourToken(kv.value) {
+			if kv := kvs[i]; keeping().ours(kv.value) {
 				v := "nas-key"
 				if strings.HasPrefix(kv.value, "Bearer ") {
 					v = "Bearer nas-key"
@@ -89,7 +89,7 @@ func TestSyncKeepsAnAddressOnAnotherMachine(t *testing.T) {
 			t.Errorf("%s has the NAS's key %d times, not %d", name, n, keys[p])
 		}
 		for _, kv := range keyValues(b) {
-			if ourToken(kv.value) {
+			if keeping().ours(kv.value) {
 				t.Errorf("%s has magpie's own key back: %q", name, kv.value)
 			}
 		}
@@ -123,7 +123,7 @@ func TestKeptAwayOnlyWhatIsSure(t *testing.T) {
 		wsl.Unlock()
 		p := filepath.Join(dir, strings.ReplaceAll(c.name, " ", "-")+".json")
 		os.WriteFile(p, []byte(c.was), 0o644)
-		if got := string(keptAway(p, []byte(now))); got != c.want {
+		if got := string(keeping().away(p, []byte(now))); got != c.want {
 			t.Errorf("%s: %s, want %s", c.name, got, c.want)
 		}
 	}
@@ -131,14 +131,14 @@ func TestKeptAwayOnlyWhatIsSure(t *testing.T) {
 	// magpie here
 	p := filepath.Join(dir, "ollama.json")
 	os.WriteFile(p, []byte(`{"o":{"baseUrl":"http://localhost:11434/v1"},"p":{"baseUrl":"http://192.168.1.20:3425/v1","apiKey":"nas-key"}}`), 0o644)
-	if got, want := string(keptAway(p, []byte(`{"o":{"baseUrl":"http://localhost:11434/v1"},"p":{"baseUrl":"http://127.0.0.1:3591/v1","apiKey":"magpie"}}`))),
+	if got, want := string(keeping().away(p, []byte(`{"o":{"baseUrl":"http://localhost:11434/v1"},"p":{"baseUrl":"http://127.0.0.1:3591/v1","apiKey":"magpie"}}`))),
 		`{"o":{"baseUrl":"http://localhost:11434/v1"},"p":{"baseUrl":"http://192.168.1.20:3425/v1","apiKey":"nas-key"}}`; got != want {
 		t.Errorf("beside Ollama: %s, want %s", got, want)
 	}
 	// Qwen Code writes its key on its own, before the models
 	p = filepath.Join(dir, "qwen.json")
 	os.WriteFile(p, []byte(`{"env":{"MAGPIE_QWEN_API_KEY":"nas-key"},"m":{"baseUrl":"http://192.168.1.20:3425/v1"}}`), 0o644)
-	if got := string(keptAway(p, []byte(`{"env":{"MAGPIE_QWEN_API_KEY":"magpie"},"m":{"baseUrl":"http://192.168.1.20:3425/v1"}}`))); !strings.Contains(got, `"nas-key"`) {
+	if got := string(keeping().away(p, []byte(`{"env":{"MAGPIE_QWEN_API_KEY":"magpie"},"m":{"baseUrl":"http://192.168.1.20:3425/v1"}}`))); !strings.Contains(got, `"nas-key"`) {
 		t.Errorf("the key alone went back to magpie's: %s", got)
 	}
 	wsl.Lock()
@@ -146,7 +146,7 @@ func TestKeptAwayOnlyWhatIsSure(t *testing.T) {
 	wsl.Unlock()
 }
 
-// The keys keptAway carries over are those a file keeps what the agent
+// The keys kept.away carries over are those a file keeps what the agent
 // sends the gateway in, in each format magpie writes, and never a model's
 // token limit.
 func TestKeyValuesFormats(t *testing.T) {

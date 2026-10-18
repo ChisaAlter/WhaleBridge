@@ -38,6 +38,16 @@ type WindowHolds struct {
 // below it a percent the vendor rounds is too coarse to scale up.
 const HoldsFloor = 5.0
 
+// Why a window's whole isn't told (QuotaWindow.HoldsWhy), for the GUI to
+// say "not enough data" and why rather than leave it out (#2045).
+const (
+	HoldsLow        = "low"     // under HoldsFloor used
+	HoldsNoClock    = "clock"   // no reset clock, so no known start
+	HoldsBeforeLog  = "log"     // began before magpie's log does
+	HoldsNoneRouted = "none"    // magpie routed nothing it counts in it
+	HoldsCredits    = "credits" // a call in it may have been paid from credits
+)
+
 // Bounds is when w, read at readAt, began and ends: its reset, and that
 // less how long it runs; a month's window began on the same day a month
 // before. ok is false when either isn't known.

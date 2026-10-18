@@ -194,8 +194,14 @@ func Collect(keys bool, app string) (Bundle, error) {
 		searches = append(searches, a)
 	}
 	b.Searches = &searches
+	// a settings.json that can't be read stops it too: carried as the
+	// defaults, it would put them over the settings where it is put back,
+	// or on every other computer sync mirrors it to (#2269)
 	if _, err := os.Stat(settings.Path()); err == nil {
-		s := settings.Load()
+		s, err := settings.LoadChecked()
+		if err != nil {
+			return b, err
+		}
 		if !keys {
 			s.LANKey, s.LANKeyID = "", ""
 			s.OTel.Headers = nil

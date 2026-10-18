@@ -53,8 +53,9 @@ func TestClaudeTiers(t *testing.T) {
 	if err := a.Field("model").Set("deepseek/pro"); err != nil {
 		t.Fatal(err)
 	}
-	if env("ANTHROPIC_DEFAULT_SONNET_MODEL") != "deepseek/pro" || env("ANTHROPIC_DEFAULT_FABLE_MODEL") != "deepseek/pro" {
-		t.Fatalf("sonnet/fable should follow: %v", a.Values())
+	// fable is left unset on a model that is no Fable (#2090)
+	if env("ANTHROPIC_DEFAULT_SONNET_MODEL") != "deepseek/pro" || env("ANTHROPIC_DEFAULT_FABLE_MODEL") != "" {
+		t.Fatalf("sonnet should follow, fable be unset: %v", a.Values())
 	}
 	if err := a.Field("haiku").Set(""); err != nil {
 		t.Fatal(err)

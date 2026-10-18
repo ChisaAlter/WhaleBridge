@@ -9,6 +9,7 @@ import (
 	"slices"
 	"testing"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
@@ -326,5 +327,109 @@ func TestT3CodeEfforts(t *testing.T) {
 		if got, thinking := pick(c.id, c.efforts); !slices.Equal(got, c.want) || thinking != c.thinking {
 			t.Errorf("%s %v: %v thinking %v, want %v thinking %v", c.id, c.efforts, got, thinking, c.want, c.thinking)
 		}
+	}
+}
+
+// What the user set on magpie's instance in T3 Code's own settings stays
+// through every sync (#2030, Kanscape): its name, Auto-compact after,
+// launch arguments, a variable of their own and whether it is on, while
+// the models and the gateway's variables stay magpie's. T3's own Claude,
+// an instance beside it with a name and window of its own, neither changes
+// nor lends magpie's instance anything.
+func TestT3CodeKeepsTheUsersSettings(t *testing.T) {
+	home := syncHome(t)
+	t.Setenv("T3CODE_HOME", "")
+	path := filepath.Join(home, ".t3", "userdata", "settings.json")
+	a := t3code(home)
+	os.MkdirAll(filepath.Dir(path), 0o755)
+	const claude = `{"driver":"claudeAgent","displayName":"Claude (sub)","enabled":true,"config":{"autoCompactWindow":"200000","launchArgs":"--chrome"}}`
+	os.WriteFile(path, []byte(`{"providerInstances":{"claudeAgent":`+claude+`}}`), 0o600)
+	f := a.Field("provider")
+	if err := f.Set(magpieID); err != nil {
+		t.Fatal(err)
+	}
+	read := func() map[string]json.RawMessage {
+		var file struct {
+			ProviderInstances map[string]json.RawMessage `json:"providerInstances"`
+		}
+		if err := json.Unmarshal([]byte(readFile(path)), &file); err != nil {
+			t.Fatalf("%v\n%s", err, readFile(path))
+		}
+		return file.ProviderInstances
+	}
+	var mine map[string]any
+	json.Unmarshal(read()[magpieID], &mine)
+	if mine["displayName"] != "magpie" {
+		t.Fatalf("first written as %v", mine["displayName"])
+	}
+	cfg := mine["config"].(map[string]any)
+	if _, ok := cfg["autoCompactWindow"]; ok {
+		t.Fatalf("the Claude instance's window lent to magpie's: %v", cfg)
+	}
+
+	// the user edits magpie's instance in T3 Code, as T3 saves it
+	mine["displayName"] = "Magpie GW"
+	mine["enabled"] = false
+	mine["accentColor"] = "#ff8800"
+	cfg["autoCompactWindow"] = "300000"
+	cfg["launchArgs"] = "--verbose"
+	cfg["customModels"] = []any{map[string]any{"slug": "gone/old", "name": "old"}}
+	env := mine["environment"].([]any)
+	for _, v := range env {
+		if m := v.(map[string]any); m["name"] == "ANTHROPIC_BASE_URL" {
+			m["value"] = "http://127.0.0.1:1"
+		}
+	}
+	mine["environment"] = append(env, map[string]any{"name": "HTTPS_PROXY", "value": "http://proxy:8080", "sensitive": false})
+	if err := edit.SetJSON(path, edit.KV{Path: t3Instance, Value: mine}); err != nil {
+		t.Fatal(err)
+	}
+
+	for range 3 {
+		if err := a.Sync(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	insts := read()
+	if !sameJSON(string(insts["claudeAgent"]), json.RawMessage(claude)) {
+		t.Errorf("T3's own Claude changed: %s", insts["claudeAgent"])
+	}
+	var got struct {
+		DisplayName string `json:"displayName"`
+		Enabled     *bool  `json:"enabled"`
+		AccentColor string `json:"accentColor"`
+		Environment []struct {
+			Name, Value string
+		} `json:"environment"`
+		Config struct {
+			AutoCompactWindow string `json:"autoCompactWindow"`
+			LaunchArgs        string `json:"launchArgs"`
+			CustomModels      []struct {
+				Slug string `json:"slug"`
+			} `json:"customModels"`
+		} `json:"config"`
+	}
+	if err := json.Unmarshal(insts[magpieID], &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.DisplayName != "Magpie GW" || got.Enabled == nil || *got.Enabled || got.AccentColor != "#ff8800" {
+		t.Errorf("the user's name, switch or colour not kept: %s", insts[magpieID])
+	}
+	if got.Config.AutoCompactWindow != "300000" || got.Config.LaunchArgs != "--verbose" {
+		t.Errorf("the user's config not kept: %+v", got.Config)
+	}
+	envs := map[string]string{}
+	for _, v := range got.Environment {
+		envs[v.Name] = v.Value
+	}
+	if envs["HTTPS_PROXY"] != "http://proxy:8080" || envs["ANTHROPIC_BASE_URL"] != gateway.URL() || len(got.Environment) != len(env)+1 {
+		t.Errorf("environment: %v", got.Environment)
+	}
+	if slices.ContainsFunc(got.Config.CustomModels, func(m struct {
+		Slug string `json:"slug"`
+	}) bool {
+		return m.Slug == "gone/old"
+	}) || len(got.Config.CustomModels) == 0 {
+		t.Errorf("custom models not magpie's: %+v", got.Config.CustomModels)
 	}
 }

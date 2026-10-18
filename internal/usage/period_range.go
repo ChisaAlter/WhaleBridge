@@ -25,6 +25,36 @@ func RangeOf(from, to string) (Period, bool) {
 	return Period(a.Format(time.DateOnly) + rangeSep + b.Format(time.DateOnly)), true
 }
 
+// A period can also be hours or days long, ending now (#2075): a rolling
+// window, written "last:24h" or "last:90m", read from LastOf. Unlike the
+// presets, which begin at a local midnight, it begins that long ago —
+// what `magpie usage --last 24h` and `--days 1` ask for, where a preset
+// would give a whole calendar day or week instead.
+const lastSep = "last:"
+
+// LastOf is the rolling window of d ending now; ok is false when d is
+// not positive.
+func LastOf(d time.Duration) (Period, bool) {
+	if d <= 0 {
+		return "", false
+	}
+	return Period(lastSep + d.String()), true
+}
+
+// Last is the length of a rolling window ("last:24h"), 0 when p is not
+// one.
+func (p Period) Last() time.Duration {
+	s, ok := strings.CutPrefix(string(p), lastSep)
+	if !ok {
+		return 0
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d <= 0 {
+		return 0
+	}
+	return d
+}
+
 // days is the first and last day of a picked range, at midnight in loc.
 func (p Period) days(loc *time.Location) (first, last time.Time, ok bool) {
 	from, to, found := strings.Cut(string(p), rangeSep)
@@ -45,14 +75,14 @@ func (p Period) IsRange() bool {
 	return ok
 }
 
-// Known is whether p is a period the usage pages answer for: a preset or a
-// picked range.
+// Known is whether p is a period the usage pages answer for: a preset, a
+// picked range or a rolling window.
 func (p Period) Known() bool {
 	switch p {
 	case Today, Week, Month, All:
 		return true
 	}
-	return p.IsRange()
+	return p.IsRange() || p.Last() > 0
 }
 
 // Until is when the period ends, as of now: the midnight after a picked
@@ -70,7 +100,7 @@ func after(until, t time.Time) bool { return !until.IsZero() && !t.Before(until)
 // shown is the period a summary says it is of: the preset or range asked
 // for, and All for anything else.
 func (p Period) shown() Period {
-	if p == Today || p == Week || p == Month || p.IsRange() {
+	if p == Today || p == Week || p == Month || p.IsRange() || p.Last() > 0 {
 		return p
 	}
 	return All

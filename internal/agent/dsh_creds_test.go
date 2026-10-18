@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/access"
+	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 )
 
 // #969 (pan17): the DeepSeek Harness desktop app, wired through magpie, failed
@@ -137,5 +138,66 @@ func TestDshStoreOfTheUsersOwn(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(creds); string(b) != flat {
 		t.Fatalf("a flat store was written:\n%s", b)
+	}
+}
+
+// #1419 (DannyJRu, dsh desktop 0.2.0-rc.2): dsh's own store held a
+// MAGPIE_GATEWAY_KEY this gateway refuses. Reconnect (Apply again, which sets
+// the model) said done and the row stayed red, telling the user to go and
+// remove it in dsh. A model picked here now puts magpie's key there, the one
+// it replaced stashed for Disconnect to put back; the sync still leaves it,
+// and a key the gateway takes stays on a pick too.
+func TestDshApplyReplacesAKeyTheGatewayRefuses(t *testing.T) {
+	home, dir, web := dshRouteHome(t)
+	os.WriteFile(web, []byte("# Your patch layer for this dsh profile.\n"), 0o644)
+	a := dsh(home)
+	if err := a.Field("model").Set("magpie/deepseek/flash"); err != nil {
+		t.Fatal(err)
+	}
+	creds := filepath.Join(dir, ".credentials.yaml")
+	refused := "version: 1\nrefs:\n  DEEPSEEK_API_KEY: sk-mine\n  " + dshKeyRef + ": sk-refused\n"
+	os.WriteFile(creds, []byte(refused), 0o600)
+	if err := a.Sync(); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(creds); string(b) != refused {
+		t.Fatalf("the sync wrote over the store:\n%s", b)
+	}
+	if d := a.Check(); !strings.Contains(d, "holds another") || !strings.Contains(d, "Apply again") {
+		t.Fatalf("check: %q", d)
+	}
+
+	// Reconnect
+	if err := a.Field("model").Set("magpie/deepseek/flash"); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := edit.GetYAML(creds, "refs."+dshKeyRef); v != "magpie" {
+		t.Fatalf("the refused key is still there: %q", v)
+	}
+	if v, _ := edit.GetYAML(creds, "refs.DEEPSEEK_API_KEY"); v != "sk-mine" {
+		t.Fatalf("the user's other key: %q", v)
+	}
+	if d := a.Check(); strings.Contains(d, "holds another") {
+		t.Fatalf("still drift after Reconnect: %q", d)
+	}
+
+	if err := a.Disconnect(); err != nil {
+		t.Fatal(err)
+	}
+	if v, _ := edit.GetYAML(creds, "refs."+dshKeyRef); v != "sk-refused" {
+		t.Fatalf("Disconnect didn't put the user's key back: %q", v)
+	}
+
+	secret, err := access.Update("add-key", access.Change{Name: "dsh"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	taken := "version: 1\nrefs:\n  " + dshKeyRef + ": " + secret + "\n"
+	os.WriteFile(creds, []byte(taken), 0o600)
+	if err := a.Field("model").Set("magpie/deepseek/flash"); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(creds); string(b) != taken {
+		t.Fatalf("a caller key the gateway takes was replaced:\n%s", b)
 	}
 }

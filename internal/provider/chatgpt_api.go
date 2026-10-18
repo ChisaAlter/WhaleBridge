@@ -232,7 +232,9 @@ func siwcSignedIn(ctx context.Context, code, clientID, verifier, redirect, nonce
 	if err != nil {
 		return "", "", err
 	}
-	if err := addSideLogin(savedLogin{Agent: ChatGPTAPIID, User: user, Plan: plan, Auth: auth}, "", func(savedLogin) {}); err != nil {
+	if err := keepLogin(ctx, func() error {
+		return addSideLogin(savedLogin{Agent: ChatGPTAPIID, User: user, Plan: plan, Auth: auth}, "", func(savedLogin) {})
+	}); err != nil {
 		return "", "", err
 	}
 	// signed in again: whatever OpenAI refused before is over

@@ -43,7 +43,15 @@ func (s *Server) counted(h http.Handler) http.Handler {
 			return
 		}
 		s.inFlight.Add(1)
+		r, done := s.active.add(r)
 		defer func() {
+			// a panic is net/http's to recover, as before; the routes it
+			// left in flight end first (#2386)
+			if p := recover(); p != nil {
+				s.endBroken(inflightOf(r.Context()))
+				defer panic(p)
+			}
+			done()
 			s.lastDone.Store(time.Now().UnixNano())
 			s.inFlight.Add(-1)
 		}()
@@ -55,6 +63,7 @@ func (s *Server) counted(h http.Handler) http.Handler {
 type busyCounters struct {
 	inFlight atomic.Int64
 	lastDone atomic.Int64 // unix ns
+	active   inflights    // what each is, for /v1/magpie/concurrency
 }
 
 // parked is how many runs wait on their caller's tool results.

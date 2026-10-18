@@ -32,6 +32,8 @@ func TestWorkBuddy(t *testing.T) {
 		return ms
 	}
 
+	// found by its folder, as off a Mac (TestWorkBuddyOnMacIsItsApp)
+	notOnMac(t)
 	a := workbuddy(home)
 	if !a.Detected() {
 		t.Fatal("not detected")
@@ -115,7 +117,7 @@ func TestWorkBuddy(t *testing.T) {
 func TestWorkBuddyEfforts(t *testing.T) {
 	e := buddyModel("workbuddy", "x/y", "Y", 0, 500000, true, []string{"none", "low", "high"})
 	r, _ := e["reasoning"].(map[string]any)
-	if e["maxInputTokens"] != 200000 || e["maxOutputTokens"] != zcodeMaxOutput || e["supportsReasoning"] != true ||
+	if e["maxInputTokens"] != 200000 || e["maxOutputTokens"] != 500000 || e["supportsReasoning"] != true ||
 		r["canDisableThinking"] != true || r["defaultEffort"] != "high" || len(r["supportedEfforts"].([]string)) != 2 {
 		t.Fatalf("%v", e)
 	}
@@ -214,6 +216,7 @@ func TestWorkBuddyAIWritesItsOwnFolder(t *testing.T) {
 	os.WriteFile(filepath.Join(home, ".workbuddy-ai", "argv.json"), []byte("{}"), 0o644)
 	os.WriteFile(filepath.Join(home, ".workbuddy-ai", "device-id"), []byte("d"), 0o644)
 
+	notOnMac(t)
 	a := workbuddyAI(home)
 	if a.ID != "workbuddy-ai" || a.Path != intl {
 		t.Fatalf("agent: %s at %s", a.ID, a.Path)

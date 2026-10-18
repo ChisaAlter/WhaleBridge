@@ -36,7 +36,12 @@ func init() {
 // VisionAgent is the User-Agent of the descriptions magpie asks for.
 const VisionAgent = "magpie-vision/1"
 
-const visionTimeout = 2 * time.Minute
+// visionTimeout is how long the vendor has to describe an image, from when
+// the request went out to it (each try's own), and visionWaitMost how long
+// a description may take in all, the waits for a slot or a resting provider
+// with it (sideDeadline, #2318): a reasoning model describing a dense
+// screenshot can take more than two minutes by itself.
+var visionTimeout, visionWaitMost = 3 * time.Minute, 10 * time.Minute
 
 // visionParallel is how many images of a request are described at once.
 const visionParallel = 4
@@ -234,7 +239,7 @@ func autoSpent(model string) error {
 	}
 	when := ""
 	if !back.IsZero() {
-		when = " until " + back.Local().Format("Jan 2 15:04")
+		when = " until " + heldClock(back, time.Now())
 	}
 	return fmt.Errorf("%s is out of its allowance%s, as is every other model magpie could describe it with, and none is asked until one is back", model, when)
 }
@@ -311,7 +316,7 @@ func (s *Server) askVisionWith(ctx context.Context, model, src, system, text str
 	if err := autoSpent(model); err != nil {
 		return "", err
 	}
-	ctx, cancel := context.WithTimeout(context.WithValue(ctx, describingKey{}, true), visionTimeout)
+	ctx, cancel := sideDeadline(context.WithValue(ctx, describingKey{}, true), "image description", visionTimeout, visionWaitMost)
 	defer cancel()
 	req := map[string]any{
 		"model":  model,
@@ -345,8 +350,11 @@ func (s *Server) askVisionWith(ctx context.Context, model, src, system, text str
 	}
 	w := httptest.NewRecorder()
 	s.serve(w, r, provider.Chat, body)
+	if t, ok := sideTimeout(ctx); ok {
+		return "", t
+	}
 	if ctx.Err() != nil {
-		return "", fmt.Errorf("no answer in %s", visionTimeout)
+		return "", ctx.Err()
 	}
 	var out struct {
 		Choices []struct {

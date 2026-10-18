@@ -67,6 +67,8 @@ type Part struct {
 
 	// web_search: Text is the query
 	Hits []Hit
+
+	cache string // opted-in Claude bridge breakpoint TTL; empty for none
 }
 
 // The APIs a Part's Sealed reasoning is in.
@@ -142,6 +144,9 @@ type Tool struct {
 
 // Request is a call to a model, whichever API it arrived in.
 type Request struct {
+	// clientCache is non-nil only for the Claude bridge's explicit opt-in.
+	clientCache *clientCache
+
 	Model      string
 	System     string
 	Messages   []Message
@@ -189,6 +194,15 @@ type Request struct {
 	// them. text's format is read into Format.
 	ClientMetadata json.RawMessage
 	Text           json.RawMessage
+	// AccessPrograms is a client's access_programs, the program a request
+	// asks the model under (OpenAI's Daybreak: {"cyber":"daybreak_blue"}),
+	// which Codex CLI sends the ChatGPT backend on every turn it picked one
+	// for (codex-rs's ResponsesApiRequest.access_programs). It goes on as it
+	// was sent, null and all, when the request is built again for a
+	// Responses upstream, whose answer to a value it doesn't take
+	// (invalid_access_program) is the client's to read; no other API takes
+	// it (magpie-releases#18).
+	AccessPrograms json.RawMessage
 	// Metadata is an Anthropic client's metadata (Claude Code's user_id),
 	// which goes on as it was sent when the request is built again for an
 	// Anthropic upstream: a relay that serves only Claude Code turns a
@@ -201,6 +215,9 @@ type Request struct {
 	// output: format.go), nil for plain text. Text, a Responses client's,
 	// holds it no more: it is asked for again in the upstream's own words.
 	Format *Format
+	// FormatTold is set when Format was told in the system prompt instead
+	// (inSystem): the client still wants the answer as JSON.
+	FormatTold bool
 	// GeminiCompat is the upstream being Gemini's OpenAI-compatible API
 	// (AI Studio's, or a proxy in front of it on this machine or the LAN),
 	// which gives the model's thoughts only when asked in thinking_config.
@@ -266,6 +283,11 @@ const (
 	KSealed
 	// KTextSig: Text is Gemini's thoughtSignature on the text before it
 	KTextSig
+	// KAlive: nothing of the reply, only that its provider is still heard
+	// from (a keepalive, an event with nothing for the client) after
+	// keepaliveGap of nothing else: a reply read in rounds (searchReply)
+	// keeps its client alive with it as a translated stream does (#2316)
+	KAlive
 )
 
 // Event is one thing a streaming reply said.
@@ -293,6 +315,10 @@ type Event struct {
 	// Wait: for KError, how long the vendor said to wait before asking
 	// again, when it said; sent on as Retry-After
 	Wait time.Duration
+	// Said: for KError, the vendor's own error as {"error":{…}}, when it
+	// said the request itself is at fault; its code and param go to a
+	// client answered whole (writeVendorError)
+	Said json.RawMessage
 }
 
 // Usage counts tokens.
@@ -306,7 +332,14 @@ type Usage struct {
 	// 5-minute write is 1.25×, when its usage says so (cache_creation's
 	// ephemeral_1h_input_tokens)
 	CacheWrite1h int `json:"cache_write_1h,omitempty"`
-	Reasoning    int `json:"reasoning"`
+	// cacheCreationReported distinguishes a reported zero or pure-5m split
+	// from usage that did not report TTLs. It is wire evidence, not a counter.
+	cacheCreationReported bool
+	// cacheCreationHasCounts describes the parsed update's own split.
+	// It is never accumulated from earlier usage.
+	cacheCreationHasCounts bool
+
+	Reasoning int `json:"reasoning"`
 	// Served: the model the vendor's reply says answered, when it named
 	// one — which may not be the one it was asked for
 	Served string `json:"served,omitempty"`
@@ -331,6 +364,10 @@ type Usage struct {
 	// conversation, which their own replies couldn't (cUsage's
 	// MagpieDeferred): billed with this one, never told as its prompt
 	Deferred *Usage `json:"deferred,omitempty"`
+	// Credits is what the reply said the request cost in its plan's own
+	// credits, nil when it said none: WorkBuddy's usage.credit, the
+	// figure its app shows on each reply as "Credits Consumed" (#2512)
+	Credits *float64 `json:"credits,omitempty"`
 }
 
 // billed is what the request is billed for: its own count, and what it
@@ -371,6 +408,7 @@ func (u *Usage) add(v Usage) {
 	if v.CacheWrite1h > 0 {
 		u.CacheWrite1h = v.CacheWrite1h
 	}
+	u.cacheCreationReported = u.cacheCreationReported || v.cacheCreationReported
 	if v.Reasoning > 0 {
 		u.Reasoning = v.Reasoning
 	}
@@ -398,6 +436,9 @@ func (u *Usage) add(v Usage) {
 	if v.Deferred != nil {
 		u.Deferred = v.Deferred
 	}
+	if v.Credits != nil {
+		u.Credits = v.Credits
+	}
 }
 
 // Result is a whole reply, for non-streaming clients.
@@ -422,6 +463,7 @@ type collector struct {
 	// the error's status and kind, as its event gave them
 	errStatus int
 	errCode   string
+	errSaid   json.RawMessage
 }
 
 func (c *collector) last(k Kind) *Part {
@@ -519,7 +561,7 @@ func (c *collector) add(ev Event) {
 		c.res.Usage.add(ev.Usage)
 		c.res.Usage.add(Usage{RequestID: ev.RequestID})
 	case KError:
-		c.err, c.errStatus, c.errCode = ev.Text, ev.Status, ev.Code
+		c.err, c.errStatus, c.errCode, c.errSaid = ev.Text, ev.Status, ev.Code, ev.Said
 	case KSearch:
 		c.closeTool()
 		c.res.Parts = append(c.res.Parts, Part{Kind: Search, Text: ev.Text, Hits: ev.Hits})
@@ -528,7 +570,7 @@ func (c *collector) add(ev Event) {
 		c.res.Parts = append(c.res.Parts, Part{Kind: Image, MediaType: ev.Name, Data: ev.Text})
 	}
 	switch ev.Kind {
-	case KStart, KUsage, KError:
+	case KStart, KUsage, KError, KAlive:
 	default:
 		// what began has had its first content, or something else came
 		c.fresh = false
@@ -627,7 +669,7 @@ func stringOrText(raw json.RawMessage) string {
 				if b.Len() > 0 {
 					b.WriteString("\n")
 				}
-				b.WriteString("Tool " + x.ToolName + " is loaded and can be called now.")
+				b.WriteString(toolLoadedText(x.ToolName))
 			}
 		}
 		return b.String()

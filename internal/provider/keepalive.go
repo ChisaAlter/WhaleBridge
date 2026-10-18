@@ -55,7 +55,7 @@ func RenewLogins(ctx context.Context, every time.Duration) []Renewal {
 	loginsMu.Unlock()
 	out := []Renewal{}
 	for _, l := range ls {
-		if l.Agent != "codex" || !l.Owned && strings.EqualFold(active[l.Agent], l.User) || accountRemoved(l.Agent) {
+		if l.Agent != "codex" || !l.Owned && strings.EqualFold(active[l.Agent], l.User) || leftAlone(l.Agent) {
 			continue
 		}
 		r := Renewal{Agent: l.Agent, User: l.User}

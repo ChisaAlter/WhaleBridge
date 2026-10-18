@@ -21,7 +21,7 @@ import (
 	"strings"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
-	_ "modernc.org/sqlite"
+	_ "github.com/ChisaAlter/WhaleBridge/internal/sqlitedb"
 )
 
 // CindyScheme begins every Cindy import link.

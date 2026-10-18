@@ -11,6 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net"
 	"net/http"
@@ -23,6 +24,7 @@ import (
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/ghtoken"
+	"github.com/ChisaAlter/WhaleBridge/internal/lastgood"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 	"github.com/ChisaAlter/WhaleBridge/internal/steady"
 	"github.com/ChisaAlter/WhaleBridge/internal/update"
@@ -109,6 +111,17 @@ func readUpdates() Updates {
 		_ = json.Unmarshal(b, &u)
 	}
 	return u
+}
+
+// writeUpdates writes b as plugin-updates.json. readUpdates reads a file
+// that doesn't parse as no updates, and Updated, the plugins magpie updated
+// by itself, can't be found again: such a file is kept aside first, and
+// one that can't be isn't written over.
+func writeUpdates(b []byte) error {
+	if err := lastgood.KeepUnparsed(updatesPath(), lastgood.Into[Updates]); err != nil {
+		return err
+	}
+	return writeWhole(updatesPath(), b)
 }
 
 // PendingUpdates is what the last look found, less what has changed since:
@@ -213,7 +226,7 @@ func CheckUpdates(ctx context.Context) (Updates, error) {
 	}
 	if b, err := json.MarshalIndent(u, "", "  "); err == nil {
 		if err := os.MkdirAll(settings.Dir(), 0o700); err == nil {
-			_ = writeWhole(updatesPath(), b)
+			_ = writeUpdates(b)
 		}
 	}
 	updatesMu.Unlock()
@@ -224,6 +237,36 @@ func CheckUpdates(ctx context.Context) (Updates, error) {
 		return u, errs[0]
 	}
 	return u, nil
+}
+
+// InstallMissing installs again each plugin on the list whose package
+// isn't in plugins/ (a git one's too when package.json no longer names
+// it), as its spec says, and says how many it installed. Nothing else
+// does: an update skips a plugin with no version installed, and the host
+// says "no such plugin" for it at every start until the user takes it off
+// and adds it again (#2002, anganing: after an update every plugin
+// switched on said so, on Windows). One switched off is installed too, so
+// it loads when it is switched back on.
+func InstallMissing(ctx context.Context) (int, error) {
+	n := 0
+	var errs []error
+	for _, e := range Load().Plugins {
+		if IsPath(e.Spec) || Installed(e.Spec) != "" {
+			continue
+		}
+		if err := install(ctx, e.Spec); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", e.Spec, err))
+			continue
+		}
+		if err := ensurePi(ctx, Target(e.Spec)); err != nil {
+			errs = append(errs, fmt.Errorf("%s: %w", e.Spec, err))
+		}
+		n++
+	}
+	if n > 0 {
+		Restart()
+	}
+	return n, errors.Join(errs...)
 }
 
 // KeepUpdated looks for plugin updates a little after magpie starts, then
@@ -240,6 +283,9 @@ func KeepUpdated(ctx context.Context) {
 		}
 		if len(Load().Plugins) > 0 {
 			cctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
+			if n, err := InstallMissing(cctx); n > 0 || err != nil {
+				log.Printf("installed %d missing plugins again: %v", n, err)
+			}
 			_, _ = CheckUpdates(cctx)
 			cancel()
 		}
@@ -406,7 +452,7 @@ func CheckNow(ctx context.Context) VersionChecks {
 	u.Checked, u.Waiting = now, waiting
 	if b, err := json.MarshalIndent(u, "", "  "); err == nil {
 		if err := os.MkdirAll(settings.Dir(), 0o700); err == nil {
-			_ = writeWhole(updatesPath(), b)
+			_ = writeUpdates(b)
 		}
 	}
 	updatesMu.Unlock()

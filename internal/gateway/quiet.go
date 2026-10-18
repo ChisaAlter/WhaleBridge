@@ -43,6 +43,23 @@ func quietTo(pid, model string) bool {
 // output_config kept, and Gemini's generationConfig.thinkingConfig when it
 // asks to think. The body goes as it is when it asked for nothing.
 func withoutReasoningAsk(proto provider.Protocol, body []byte) []byte {
+	return withoutReasoningFields(proto, body, false)
+}
+
+// withoutAnyReasoning removes every field about reasoning, in the agent's own
+// protocol: withoutReasoningAsk's, and those turning it off as well —
+// Anthropic's thinking of any type, Gemini's thinkingConfig whatever it
+// says, and Chat's thinking switches (Kimi's thinking, Qwen's
+// enable_thinking), and the sealed reasoning Responses' include asks
+// for, which OpenAI refuses of a model that doesn't reason. It is what a
+// model the user said takes no reasoning ask is sent
+// (provider.SetModelReasonless; yuexian7 on Discord: the vendor answers
+// reasoning_effort with 422, and the request without it works).
+func withoutAnyReasoning(proto provider.Protocol, body []byte) []byte {
+	return withoutReasoningFields(proto, body, true)
+}
+
+func withoutReasoningFields(proto provider.Protocol, body []byte, all bool) []byte {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
 	var m map[string]any
@@ -57,17 +74,31 @@ func withoutReasoningAsk(proto provider.Protocol, body []byte) []byte {
 		}
 	}
 	switch proto {
-	case provider.Chat:
+	case provider.Chat, provider.Responses:
 		drop("reasoning_effort")
 		drop("reasoning")
-	case provider.Responses:
-		drop("reasoning")
-		drop("reasoning_effort")
+		if all {
+			drop("thinking")
+			drop("enable_thinking")
+			if inc, ok := m["include"].([]any); ok {
+				kept := inc[:0:0]
+				for _, v := range inc {
+					if v != "reasoning.encrypted_content" {
+						kept = append(kept, v)
+					}
+				}
+				if len(kept) < len(inc) {
+					m["include"], changed = kept, true
+				}
+			}
+		}
 	case provider.Anthropic:
 		if t, ok := m["thinking"].(map[string]any); ok {
-			if s, _ := t["type"].(string); s == "enabled" || s == "adaptive" {
+			if s, _ := t["type"].(string); all || s == "enabled" || s == "adaptive" {
 				drop("thinking")
 			}
+		} else if all {
+			drop("thinking")
 		}
 		if oc, ok := m["output_config"].(map[string]any); ok {
 			if _, ok := oc["effort"]; ok {
@@ -86,7 +117,7 @@ func withoutReasoningAsk(proto provider.Protocol, body []byte) []byte {
 		if gc, ok := m["generationConfig"].(map[string]any); ok {
 			if raw, err := json.Marshal(gc["thinkingConfig"]); err == nil {
 				var tc gThinking
-				if json.Unmarshal(raw, &tc) == nil && tc.effort() != "" {
+				if _, has := gc["thinkingConfig"]; has && all || json.Unmarshal(raw, &tc) == nil && tc.effort() != "" {
 					delete(gc, "thinkingConfig")
 					changed = true
 					if len(gc) == 0 {

@@ -8,6 +8,7 @@ import (
 	"slices"
 	"strings"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/access"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
@@ -19,8 +20,55 @@ import (
 // on Discord) keeps that address and its key, as ZCode's and WorkBuddy's
 // writers do on their own (zcodeAddress). Without it, every start and
 // update of magpie (SyncCatalog) put the agent back on 127.0.0.1.
+//
+// What the filter (kept.away) needs of this magpie (the gateway's address, the LAN key)
+// is read here, before the filter is on, never by the filter: every file
+// written through edit while it is on passes through it, on whichever
+// goroutine and under whichever lock wrote it. settings.Save, the window's
+// size kept after a resize, writes under the lock settings.Load takes, and
+// a filter reading the settings waited on it for good (ylorn on Discord).
 func synced(sync func() error) error {
-	return edit.Filtered(keptAway, sync)
+	return edit.Filtered(keeping().away, sync)
+}
+
+// kept is what kept.away knows of this magpie, read before a sync's writes:
+// the gateway's address (gateway.URL) and the LAN sharing key.
+type kept struct{ gateway, lan string }
+
+func keeping() kept { return kept{gateway.URL(), access.LANSecret()} }
+
+// ours says v, with any "Bearer " before it, is a key magpie gives an
+// agent: gateway.Token, one that names the agent (gateway.TokenFor), or the
+// LAN sharing key (ourKey's, as read before).
+func (k kept) ours(v string) bool {
+	v = strings.TrimPrefix(v, "Bearer ")
+	return v == gateway.Token || v != "" && v == k.lan || strings.HasPrefix(v, gateway.Token+"-")
+}
+
+// magpieFile says path, a file edit is about to write (a link's target,
+// edit.Target), is in magpie's own folder, as it is named or where its
+// links lead: with ~/.config a link into a dotfiles repo, settings.json is
+// written at the repo's path (ylorn on Discord). A file not there yet has
+// its folder's links followed.
+func magpieFile(path string) bool {
+	sep := string(filepath.Separator)
+	dir := filepath.Dir(provider.Path())
+	dirs := []string{dir}
+	if r, err := filepath.EvalSymlinks(dir); err == nil && r != dir {
+		dirs = append(dirs, r)
+	}
+	paths := []string{path}
+	if r, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+		paths = append(paths, filepath.Join(r, filepath.Base(path)))
+	}
+	for _, d := range dirs {
+		for _, p := range paths {
+			if strings.HasPrefix(p, d+sep) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // originRE is an http(s) URL's scheme and host, as it is written in a file.
@@ -38,14 +86,6 @@ var keyLineRE = regexp.MustCompile(`(["']?)([A-Za-z0-9_\-]+)(["']?)[ \t]*[:=][ \
 func keyName(name string) bool {
 	n := strings.ToLower(strings.NewReplacer("_", "", "-", "").Replace(name))
 	return n == "key" || strings.HasSuffix(n, "apikey") || strings.HasSuffix(n, "token") || strings.HasSuffix(n, "authorization")
-}
-
-// ourToken says v, with any "Bearer " before it, is a key magpie gives an
-// agent: gateway.Token, one that names the agent (gateway.TokenFor), or the
-// LAN sharing key.
-func ourToken(v string) bool {
-	v = strings.TrimPrefix(v, "Bearer ")
-	return ourKey(v) || strings.HasPrefix(v, gateway.Token+"-")
 }
 
 type keyValue struct {
@@ -71,7 +111,7 @@ func keyValues(b []byte) []keyValue {
 	return out
 }
 
-// keptAway is data, a sync's write of the file at path, with magpie kept
+// away is data, a sync's write of the file at path, with magpie kept
 // where the file had it on another machine. That is a file without the
 // gateway's own address (gateway.URL), with an address on another machine
 // and none a WSL distro was seen at (a distro's way to Windows is magpie's
@@ -84,12 +124,13 @@ func keyValues(b []byte) []keyValue {
 // for a local proxy's route, one with a path of its own where nothing but
 // magpie has answered (#1985); with more than one
 // address or key gone, which went where can't be told, and the write is
-// left as it is. magpie's own files are never the user's pointing.
-func keptAway(path string, data []byte) []byte {
-	if strings.HasPrefix(path, filepath.Dir(provider.Path())+string(filepath.Separator)) {
+// left as it is. magpie's own files are never the user's pointing
+// (magpieFile). It takes no lock a writer may hold: k is read before.
+func (k kept) away(path string, data []byte) []byte {
+	if magpieFile(path) {
 		return data
 	}
-	g := gateway.URL()
+	g := k.gateway
 	was, err := edit.Read(path)
 	if err != nil || len(was) == 0 || bytes.Contains(was, []byte(g)) {
 		return data
@@ -138,7 +179,7 @@ func keptAway(path string, data []byte) []byte {
 	// the key: the one that went with the address, in place of magpie's
 	theirs, before, after := "", keyCounts(was), keyCounts(out)
 	for v, n := range before {
-		if ourToken(v) {
+		if k.ours(v) {
 			return out
 		}
 		if after[v] < n {
@@ -154,7 +195,7 @@ func keptAway(path string, data []byte) []byte {
 	kvs := keyValues(out)
 	for i := len(kvs) - 1; i >= 0; i-- {
 		kv := kvs[i]
-		if !ourToken(kv.value) {
+		if !k.ours(kv.value) {
 			continue
 		}
 		v := theirs

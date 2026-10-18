@@ -92,7 +92,7 @@ func TestClaudeTierEffort(t *testing.T) {
 	// one of its own keeps its model
 	set("model", "v/flash")
 	if env("ANTHROPIC_DEFAULT_SONNET_MODEL") != "v/flash:medium" || env("ANTHROPIC_DEFAULT_HAIKU_MODEL") != "v/flash:low" ||
-		env("ANTHROPIC_DEFAULT_OPUS_MODEL") != "v/big:high[1m]" || env("ANTHROPIC_DEFAULT_FABLE_MODEL") != "v/flash" {
+		env("ANTHROPIC_DEFAULT_OPUS_MODEL") != "v/big:high[1m]" || env("ANTHROPIC_DEFAULT_FABLE_MODEL") != "" {
 		t.Fatalf("new main model: %v", a.Values())
 	}
 	// the tier's effort taken away: its model as before

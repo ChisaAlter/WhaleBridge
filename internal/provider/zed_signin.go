@@ -126,7 +126,9 @@ func zedSignedInWith(ctx context.Context, key *rsa.PrivateKey, uid, ciphertext, 
 	if err != nil {
 		return "", err
 	}
-	if err := addSideLogin(savedLogin{Agent: "zed", User: who, Plan: zed.PlanName(c.Plan), Auth: auth}, "", func(savedLogin) {}); err != nil {
+	if err := keepLogin(ctx, func() error {
+		return addSideLogin(savedLogin{Agent: "zed", User: who, Plan: zed.PlanName(c.Plan), Auth: auth}, "", func(savedLogin) {})
+	}); err != nil {
 		return "", err
 	}
 	// signed in again: whatever Zed refused before is over

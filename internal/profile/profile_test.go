@@ -2,6 +2,7 @@ package profile
 
 import (
 	"encoding/json"
+	"github.com/ChisaAlter/WhaleBridge/internal/testenv"
 	"os"
 	"path/filepath"
 	"slices"
@@ -21,7 +22,14 @@ func sandbox(t *testing.T) string {
 	t.Setenv("HOME", h)
 	t.Setenv("USERPROFILE", h)
 	t.Setenv("XDG_CONFIG_HOME", filepath.Join(h, ".config"))
-	t.Setenv("PATH", "")
+	// Claude Code's and Codex's CLIs are here: an agent whose CLI is gone
+	// is no Library target (#2254), and these tests carry its library
+	bin := filepath.Join(h, "bin")
+	for _, cli := range []string{"claude", "codex"} {
+		testenv.Program(t, filepath.Join(bin, cli), "#!/bin/sh\n")
+		write(t, filepath.Join(bin, cli+".exe"), "")
+	}
+	t.Setenv("PATH", bin)
 	for _, k := range agentenv.Vars {
 		t.Setenv(k, "")
 	}

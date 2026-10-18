@@ -353,7 +353,21 @@ func subscriptionRoutes(mux *http.ServeMux) {
 	for _, path := range []string{"POST /api/signin/import", "POST /api/accounts/import"} {
 		mux.HandleFunc(path, importAccounts)
 	}
-	mux.HandleFunc("POST /api/stepfun/{site}/session", func(w http.ResponseWriter, r *http.Request) {
+	// A Step Plan session belongs to its StepFun provider; two providers on
+	// one platform can be two accounts.
+	stepfunOf := func(w http.ResponseWriter, r *http.Request) (string, string, bool) {
+		p, err := provider.Find(r.PathValue("id"))
+		if err != nil || provider.StepFunSite(*p) == "" {
+			http.NotFound(w, r)
+			return "", "", false
+		}
+		return p.ID, provider.StepFunSite(*p), true
+	}
+	mux.HandleFunc("POST /api/stepfun/{id}/session", func(w http.ResponseWriter, r *http.Request) {
+		id, site, ok := stepfunOf(w, r)
+		if !ok {
+			return
+		}
 		var b struct{ Text string }
 		if err := decode(w, r, &b); err != nil {
 			http.Error(w, err.Error(), 400)
@@ -361,14 +375,18 @@ func subscriptionRoutes(mux *http.ServeMux) {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancel()
-		if err := provider.SaveStepFunPaste(ctx, r.PathValue("site"), b.Text); err != nil {
+		if err := provider.SaveStepFunPaste(ctx, id, site, b.Text); err != nil {
 			http.Error(w, err.Error(), 400)
 			return
 		}
 		writeJSON(w, map[string]bool{"ok": true})
 	})
-	mux.HandleFunc("POST /api/stepfun/{site}/signout", func(w http.ResponseWriter, r *http.Request) {
-		if err := provider.SignOutStepFun(r.PathValue("site")); err != nil {
+	mux.HandleFunc("POST /api/stepfun/{id}/signout", func(w http.ResponseWriter, r *http.Request) {
+		id, _, ok := stepfunOf(w, r)
+		if !ok {
+			return
+		}
+		if err := provider.SignOutStepFun(id); err != nil {
 			http.Error(w, err.Error(), 400)
 			return
 		}

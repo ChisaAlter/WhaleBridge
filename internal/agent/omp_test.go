@@ -710,3 +710,88 @@ func TestOmpOwnModels(t *testing.T) {
 		t.Fatalf("the subagents' picker lacks models.yml's models: %+v", sub)
 	}
 }
+
+// What the user set on magpie's provider in omp's models.yml stays through
+// every sync and pick (#2030's siblings): a model's override, discovery's
+// timeouts, strict tools turned off, a header or compat flag beside
+// magpie's. The address, API, auth and model list stay magpie's, and a key
+// magpie doesn't write goes.
+func TestOmpKeepsTheUsersSettings(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
+	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
+	for _, k := range []string{"PI_CODING_AGENT_DIR", "PI_CONFIG_DIR", "OMP_PROFILE", "PI_PROFILE"} {
+		t.Setenv(k, "")
+	}
+	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Chat: "https://api.deepseek.com/v1", Key: "k", Models: []string{"pro"}}); err != nil {
+		t.Fatal(err)
+	}
+	dir := filepath.Join(home, ".omp", "agent")
+	modelsPath := filepath.Join(dir, "models.yml")
+	os.MkdirAll(dir, 0o755)
+	os.WriteFile(filepath.Join(dir, "config.yml"), []byte("modelRoles:\n  default: anthropic/claude-opus-5\n"), 0o644)
+	a := omp(home)
+	f := a.Field("model")
+	if err := f.Set("magpie/deepseek/pro"); err != nil {
+		t.Fatal(err)
+	}
+	if err := edit.SetYAML(modelsPath,
+		edit.KV{Path: "providers.magpie.modelOverrides", Value: map[string]any{"deepseek/pro": map[string]any{"contextWindow": 64000}}},
+		edit.KV{Path: "providers.magpie.disableStrictTools", Value: true},
+		edit.KV{Path: "providers.magpie.headers.X-Mine", Value: "1"},
+		edit.KV{Path: "providers.magpie.compat.supportsStore", Value: false},
+		edit.KV{Path: "providers.magpie.baseUrl", Value: "http://127.0.0.1:1/v1"},
+		edit.KV{Path: "providers.magpie.apiKey", Value: "stale"},
+		edit.KV{Path: "providers.magpie.models", Value: []any{map[string]any{"id": "gone/old"}}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.Save(provider.Provider{ID: "kimi", Name: "Kimi", Chat: "https://api.moonshot.ai/v1", Key: "k", Models: []string{"k3"}}); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if err := a.Sync(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(when string) {
+		t.Helper()
+		var c struct {
+			Providers map[string]struct {
+				Overrides map[string]map[string]any `yaml:"modelOverrides"`
+				NoStrict  bool                      `yaml:"disableStrictTools"`
+				Headers   map[string]string         `yaml:"headers"`
+				Compat    map[string]any            `yaml:"compat"`
+				BaseURL   string                    `yaml:"baseUrl"`
+				Auth      string                    `yaml:"auth"`
+				APIKey    *string                   `yaml:"apiKey"`
+				Models    []struct {
+					ID string `yaml:"id"`
+				} `yaml:"models"`
+			} `yaml:"providers"`
+		}
+		raw := readFile(modelsPath)
+		if err := yaml.Unmarshal([]byte(raw), &c); err != nil {
+			t.Fatalf("%v\n%s", err, raw)
+		}
+		mp := c.Providers[magpieID]
+		if mp.Overrides["deepseek/pro"]["contextWindow"] != 64000 || !mp.NoStrict || mp.Headers["X-Mine"] != "1" || mp.Compat["supportsStore"] != false {
+			t.Errorf("%s: the user's settings not kept:\n%s", when, raw)
+		}
+		var ids []string
+		for _, m := range mp.Models {
+			ids = append(ids, m.ID)
+		}
+		if mp.BaseURL == "http://127.0.0.1:1/v1" || mp.Auth != "none" || mp.APIKey != nil || mp.Headers["User-Agent"] != "omp" ||
+			slices.Contains(ids, "gone/old") || !slices.Contains(ids, "kimi/k3") {
+			t.Errorf("%s: magpie's own parts not written:\n%s", when, raw)
+		}
+	}
+	check("sync")
+	if err := f.Set("magpie/kimi/k3"); err != nil {
+		t.Fatal(err)
+	}
+	check("pick")
+}

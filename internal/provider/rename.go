@@ -14,7 +14,7 @@ import (
 // Rename gives a provider another id, the one its models are picked by
 // (<id>/<model>). What magpie keeps that names it by id follows: the
 // routing groups it is in and their rules and classifiers, the other
-// providers' fallbacks, and which agents are shown it. The old id stays
+// providers' fallbacks, which agents are shown it, and its StepFun sign-in. The old id stays
 // with it (Was), so an agent still running on a config that names it the
 // old way reaches it, and its usage so far is counted with it; the agents'
 // own files are the agent package's to rewrite (agent.RenameProvider).
@@ -99,6 +99,10 @@ func Rename(from, to string) error {
 	os.Rename(catalog.LivePath(from), catalog.LivePath(to))
 	os.Rename(catalog.LivePath(decisionsID(from)), catalog.LivePath(decisionsID(to)))
 	if err := store(f); err != nil {
+		return err
+	}
+	// so is its StepFun sign-in, kept by provider id
+	if err := renameStepFun(from, to); err != nil {
 		return err
 	}
 	s := settings.Load()

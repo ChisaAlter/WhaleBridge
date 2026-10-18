@@ -350,7 +350,7 @@ func notGlobal(dir string) error {
 	if realDir(dir) == realDir(home()) {
 		return fmt.Errorf("the home folder's skills are every project's: give skills to the agents themselves instead")
 	}
-	for _, t := range Targets() {
+	for _, t := range everyTarget() {
 		if t.Skills == "" {
 			continue
 		}
@@ -360,7 +360,7 @@ func notGlobal(dir string) error {
 			}
 		}
 	}
-	for _, t := range Targets() {
+	for _, t := range everyTarget() {
 		if t.MCP == nil {
 			continue
 		}

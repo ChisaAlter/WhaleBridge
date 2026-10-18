@@ -49,6 +49,25 @@ func accountCard(agent string) cardFace {
 	return cardFace{}
 }
 
+// KnownFace is the name and icon magpie knows the provider id by while it
+// isn't set up: a built-in subscription signed out of, or with account
+// discovery off ("claude" is Claude Code), or a preset's removed since.
+// The usage log keeps the id of every provider a call went to, and the
+// Usage page names those by this rather than by the bare id (@ByronVon1
+// on X: "claude" in the Provider filter). "" for an id magpie doesn't
+// know, such as a custom provider removed since.
+func KnownFace(id string) (name, icon string) {
+	if !strings.HasPrefix(id, "plugin:") {
+		if f := accountCard(id); f.name != "" {
+			return f.name, f.icon
+		}
+	}
+	if pr := Preset(id); pr != nil {
+		return pr.Name, pr.Icon
+	}
+	return "", ""
+}
+
 func pluginCardFace(pp plugin.Provider) cardFace {
 	name, icon := pluginCard(pp)
 	return cardFace{name, icon}
@@ -121,18 +140,44 @@ func withAccountReadings(cards []SubscriptionQuota) []SubscriptionQuota {
 				q.Provider, q.Name, q.Icon, q.User = id, out[i].Name, out[i].Icon, out[i].User
 				out[i] = q
 			}
+			out[i] = withHeardClaude(out[i], l)
 			continue
 		}
 		if !ok {
 			if q, ok = lastReading(id + "/" + strings.ToLower(l.User)); !ok {
-				continue
+				q = SubscriptionQuota{Plan: l.Plan, Windows: []QuotaWindow{}}
 			}
+		}
+		if q = withHeardClaude(q, l); !ok && q.readSeq == 0 {
+			continue
 		}
 		f := accountCard(l.Agent)
 		q.Provider, q.Name, q.Icon, q.User = id, f.name, f.icon, l.User
 		out = append(out, q)
 	}
 	return out
+}
+
+// withHeardClaude is q, the card of the Claude account l, with what
+// Claude Code last told of its allowance as it answered (NoteClaudeLimits)
+// when it told it after q was read: the windows a request's answer gave
+// are kept apart from the readings (claudeUsage), and telling them drops
+// the account's reading (StaleAllowance), so a magpie only requests reach
+// (`magpie serve` for a Remote magpie) had a card for nobody (#2206,
+// SuInk). A reading started after it stands, as it is newer.
+func withHeardClaude(q SubscriptionQuota, l Login) SubscriptionQuota {
+	if l.Agent != "claude" {
+		return q
+	}
+	claudeUsage.Lock()
+	e, ok := claudeUsage.m[strings.ToLower(l.User)]
+	claudeUsage.Unlock()
+	if !ok || e.heardSeq <= q.readSeq || len(e.ws) == 0 {
+		return q
+	}
+	at := e.heard
+	q.Windows, q.ReadAt, q.AsOf, q.Error, q.readSeq = e.windows(time.Now()), &at, nil, "", e.heardSeq
+	return q
 }
 
 // lastReading is the reading kept on disk under key (keepLast), with its
@@ -269,7 +314,7 @@ func withKeyReadings(cards []SubscriptionQuota, ps []Provider, kind string) []Su
 				q.Plan = r.plan
 			}
 			if r.balance != "" {
-				q.Balance, q.BalanceParts = r.balance, r.parts
+				q.Balance, q.BalanceParts, q.BalanceSplit = r.balance, r.parts, r.split
 			}
 			if i >= 0 {
 				out[i] = q
@@ -300,6 +345,7 @@ type keyReading struct {
 	plan    string
 	balance string
 	parts   []BalancePart
+	split   []BalancePart
 	at      time.Time
 	seq     uint64 // quotaReading's, begun as it was asked
 }

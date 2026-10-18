@@ -173,6 +173,10 @@ func supplierInfo(p provider.Provider) map[string]any {
 		"modelsURL": p.ModelsURL, "balanceTokenSet": p.BalanceToken != "", "balanceTokenTakes": provider.TakesBalanceToken(p),
 		"account": p.Account != nil, "accountProxies": p.AccountProxies, "accountModels": p.AccountModels, "accountCaps": p.AccountCaps, "accountWindowCaps": p.AccountWindowCaps, "accountNames": p.AccountNames,
 		"modelTest": p.ModelTest(), "decideTest": p.AsksDecideModels(), "listError": p.ListError(),
+		"quotaResetAt": p.QuotaResetAt, "restCap": p.RestCap, "balanceMethod": p.BalanceMethod,
+		"insecureTLS": p.InsecureTLS, "takesInsecureTLS": p.TakesInsecureTLS(),
+		"nativeCompaction": p.NativeCompaction, "carriesCompaction": p.CarriesCompaction(),
+		"ownList": p.Account == nil && !p.IsPlugin() && !p.DecideOnly(), "refreshEvery": p.RefreshEvery, "autoInclude": p.AutoInclude,
 	}
 	if vendor := provider.AccessKeyVendor(p); vendor != "" || p.AccessKeyID != "" || p.SecretAccessKey != "" {
 		out["accessKey"] = map[string]any{"vendor": vendor, "id": p.AccessKeyID, "secretSet": p.SecretAccessKey != ""}
@@ -197,7 +201,7 @@ func supplierInfo(p provider.Provider) map[string]any {
 		}
 	}
 	if site := provider.StepFunSite(p); site != "" {
-		out["stepPlan"] = map[string]any{"site": site, "signedIn": provider.StepFunSignedIn(site), "url": provider.StepFunSignInURL(site), "bookmarklet": provider.StepFunBookmarklet()}
+		out["stepPlan"] = map[string]any{"site": site, "signedIn": provider.StepFunSignedIn(p.ID), "url": provider.StepFunSignInURL(site), "bookmarklet": provider.StepFunBookmarklet()}
 	}
 	return out
 }
@@ -235,7 +239,7 @@ func bodyValue[T any](in map[string]json.RawMessage, name string) (T, error) {
 // patchProvider preserves every field omitted by the editor. The initial
 // DTO carries only header names; a null header value removes that header.
 func patchProvider(p provider.Provider, in map[string]json.RawMessage) (provider.Provider, error) {
-	allowed := strings.Fields("id name icon iconUrl preset keyName keyProtocol keyWeight keys chat responses anthropic gemini vertex decide baseAPI catalog website keysUrl family models noModels pickedFrom unlisted off contexts fallback routing affinity sink searches pinUpstream unredacted proxy accountProxies accountModels accountCaps accountWindowCaps accountNames accountConcurrency balanceURL balancePath modelsURL zhipuTeam maxConcurrency queueLimit queueWait priceRate maxRPM quotaRest extraBody passUserAgent authHeader codexAsSent")
+	allowed := strings.Fields("id name icon iconUrl preset keyName keyProtocol keyWeight keys chat responses anthropic gemini vertex decide baseAPI catalog website keysUrl family models noModels pickedFrom unlisted off contexts fallback routing affinity sink searches pinUpstream unredacted proxy accountProxies accountModels accountCaps accountWindowCaps accountNames accountConcurrency balanceURL balancePath modelsURL zhipuTeam maxConcurrency queueLimit queueWait priceRate maxRPM quotaRest extraBody passUserAgent authHeader codexAsSent quotaResetAt restCap balanceMethod insecureTLS nativeCompaction")
 	patch := map[string]json.RawMessage{}
 	for _, k := range allowed {
 		if v, ok := in[k]; ok {
@@ -246,7 +250,7 @@ func patchProvider(p provider.Provider, in map[string]json.RawMessage) (provider
 	if err := json.Unmarshal(data, &p); err != nil {
 		return p, err
 	}
-	for key, dst := range map[string]*int{"queueLimit": &p.QueueLimit, "queueWait": &p.QueueWait, "maxRPM": &p.MaxRPM, "quotaRest": &p.QuotaRest} {
+	for key, dst := range map[string]*int{"queueLimit": &p.QueueLimit, "queueWait": &p.QueueWait, "maxRPM": &p.MaxRPM, "quotaRest": &p.QuotaRest, "restCap": &p.RestCap} {
 		if string(in[key]) == "null" {
 			*dst = 0
 		}
@@ -319,6 +323,27 @@ func patchProvider(p provider.Provider, in map[string]json.RawMessage) (provider
 	}
 	if p.QuotaRest < 0 || p.QuotaRest > provider.MaxQuotaRest {
 		return p, fmt.Errorf("额度冷却时间必须为 0 到 %d 分钟", provider.MaxQuotaRest)
+	}
+	if p.RestCap != provider.RestCapOff && (p.RestCap < 0 || p.RestCap > provider.MaxQuotaRest) {
+		return p, fmt.Errorf("连续失败后的最长休息时间必须为 -1 或 0 到 %d 分钟", provider.MaxQuotaRest)
+	}
+	p.QuotaResetAt = strings.TrimSpace(p.QuotaResetAt)
+	if _, err := provider.ParseResetAt(p.QuotaResetAt); err != nil {
+		return p, fmt.Errorf("额度恢复时刻应为 HH:MM，或带时区的 HH:MM+08:00")
+	}
+	switch strings.ToUpper(strings.TrimSpace(p.BalanceMethod)) {
+	case "", http.MethodGet:
+		p.BalanceMethod = ""
+	case http.MethodPost:
+		p.BalanceMethod = http.MethodPost
+	default:
+		return p, fmt.Errorf("余额查询方式只能是 GET 或 POST")
+	}
+	if p.InsecureTLS && !p.TakesInsecureTLS() {
+		return p, fmt.Errorf("只有自行添加并填写了接口地址的供应商可以跳过证书校验")
+	}
+	if p.NativeCompaction && !p.CarriesCompaction() {
+		return p, fmt.Errorf("此供应商的接口不支持 Codex 原生压缩")
 	}
 	if !slices.Contains(provider.AuthChoices, p.AuthHeader) {
 		return p, fmt.Errorf("认证 Header 只能是自动、x-api-key 或 bearer")
@@ -439,6 +464,24 @@ func saveProviderBody(ctx context.Context, in map[string]json.RawMessage) (strin
 	if err != nil {
 		return "", err
 	}
+	// The model-list schedule and rules are kept by their own setters, which
+	// also take the current list's matches; check them before anything saves.
+	_, setsEvery := in["refreshEvery"]
+	every, err := bodyValue[string](in, "refreshEvery")
+	if err != nil {
+		return "", err
+	}
+	if _, err := provider.ParseRefreshEvery(every); err != nil {
+		return "", fmt.Errorf("自动刷新间隔无效（如 6h、1d，至少 %s）：%w", provider.MinRefreshEvery, err)
+	}
+	_, setsRules := in["autoInclude"]
+	rules, err := bodyValue[[]string](in, "autoInclude")
+	if err != nil {
+		return "", err
+	}
+	if rules, err = provider.CleanAutoInclude(rules); err != nil {
+		return "", fmt.Errorf("自动加入规则无效：%w", err)
+	}
 	// Validate prices before adding, renaming or saving the supplier: an
 	// invalid price must leave the supplier and its credentials as they were.
 	priceID := p.ID
@@ -541,6 +584,18 @@ func saveProviderBody(ctx context.Context, in map[string]json.RawMessage) (strin
 	for model, price := range prices {
 		if err := provider.SetModelPrice(id+"/"+model, price); err != nil {
 			return id, err
+		}
+	}
+	if saved, err := provider.Find(id); err == nil {
+		if setsEvery && every != saved.RefreshEvery {
+			if err := provider.SetRefreshEvery(id, every); err != nil {
+				return id, err
+			}
+		}
+		if setsRules && !slices.Equal(rules, saved.AutoInclude) {
+			if _, err := provider.SetAutoInclude(id, rules); err != nil {
+				return id, err
+			}
 		}
 	}
 	provider.ForgetBalances()

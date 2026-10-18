@@ -1,4 +1,4 @@
-package usage
+package otlp
 
 import (
 	"crypto/rand"
@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/usage"
 )
 
 type otelAttribute struct {
@@ -62,12 +64,13 @@ type OTelSpan struct {
 	Session, Inferred, Update        bool
 }
 
-func (e *otelExporter) traces(records []Record) any {
-	spans := make([]any, 0, len(records))
-	priceOf := pricer()
-	for _, r := range records {
+func (e *otelExporter) traces(items []otelItem) any {
+	spans := make([]any, 0, len(items))
+	priceOf := usage.Pricer()
+	for _, it := range items {
+		r, sp := it.record, it.span
 		var traceID [16]byte
-		if r.OTel == nil {
+		if sp == nil {
 			if r.RouteID != 0 {
 				copy(traceID[:8], e.salt[:])
 				binary.BigEndian.PutUint64(traceID[8:], uint64(r.RouteID))
@@ -76,7 +79,7 @@ func (e *otelExporter) traces(records []Record) any {
 			}
 		}
 		var spanID [8]byte
-		if r.OTel == nil {
+		if sp == nil {
 			rand.Read(spanID[:])
 		}
 		a := append(otelAttributes(r), otelInt("http.response.status_code", int64(r.Status)),
@@ -116,15 +119,15 @@ func (e *otelExporter) traces(records []Record) any {
 			"name": op + " " + r.Model, "kind": 3, "flags": 1,
 			"startTimeUnixNano": strconv.FormatInt(r.Time.UnixNano(), 10), "endTimeUnixNano": strconv.FormatInt(r.Time.Add(time.Duration(r.Millis)*time.Millisecond).UnixNano(), 10),
 			"attributes": a, "status": map[string]any{"code": status}}
-		if r.OTel != nil {
-			span["traceId"], span["spanId"] = r.OTel.TraceID, r.OTel.SpanID
-			if !r.OTel.End.IsZero() {
-				span["endTimeUnixNano"] = strconv.FormatInt(r.OTel.End.UnixNano(), 10)
+		if sp != nil {
+			span["traceId"], span["spanId"] = sp.TraceID, sp.SpanID
+			if !sp.End.IsZero() {
+				span["endTimeUnixNano"] = strconv.FormatInt(sp.End.UnixNano(), 10)
 			}
-			if r.OTel.ParentID != "" {
-				span["parentSpanId"] = r.OTel.ParentID
+			if sp.ParentID != "" {
+				span["parentSpanId"] = sp.ParentID
 			}
-			if r.OTel.Root {
+			if sp.Root {
 				span["name"], span["kind"] = "gateway "+r.Model, 2
 				a = []otelAttribute{otelString("magpie.agent", r.Agent), otelString("magpie.requested_model", r.Model), otelInt("http.response.status_code", int64(r.Status))}
 				if r.RouteID != 0 {
@@ -137,15 +140,15 @@ func (e *otelExporter) traces(records []Record) any {
 			} else {
 				a = append(a, otelString("langfuse.observation.type", "generation"))
 			}
-			if r.OTel.Session {
-				span["name"], span["kind"] = r.OTel.Name, 1
-				if r.OTel.Type != "generation" {
+			if sp.Session {
+				span["name"], span["kind"] = sp.Name, 1
+				if sp.Type != "generation" {
 					a = []otelAttribute{otelString("magpie.agent", r.Agent)}
 					if r.Status >= 400 {
 						a = append(a, otelString("error.type", "agent_operation_failed"))
 					}
 				}
-				a = append(a, otelString("langfuse.session.id", r.OTel.SessionID), otelString("langfuse.trace.name", r.OTel.TraceName))
+				a = append(a, otelString("langfuse.session.id", sp.SessionID), otelString("langfuse.trace.name", sp.TraceName))
 				// Replace the gateway-specific observation type, keeping the wire allowlist explicit.
 				filtered := a[:0]
 				for _, attr := range a {
@@ -153,13 +156,13 @@ func (e *otelExporter) traces(records []Record) any {
 						filtered = append(filtered, attr)
 					}
 				}
-				a = append(filtered, otelString("langfuse.observation.type", r.OTel.Type))
-				if r.OTel.Inferred {
+				a = append(filtered, otelString("langfuse.observation.type", sp.Type))
+				if sp.Inferred {
 					a = append(a, otelString("magpie.timing.source", "inferred"))
 				} else {
 					a = append(a, otelString("magpie.timing.source", "recorded"))
 				}
-				if r.OTel.Type != "generation" {
+				if sp.Type != "generation" {
 					if r.BodyIn != "" {
 						a = append(a, otelString("langfuse.observation.input", r.BodyIn))
 					}
@@ -174,7 +177,7 @@ func (e *otelExporter) traces(records []Record) any {
 		// tools. Cache reads/writes belong to input cost; reasoning is already
 		// included in output tokens. Use the ledger's effective tariff, including
 		// explicit free models, and leave unknown prices for Langfuse to infer.
-		generation := r.OTel == nil || !r.OTel.Root && (!r.OTel.Session || r.OTel.Type == "generation")
+		generation := sp == nil || !sp.Root && (!sp.Session || sp.Type == "generation")
 		if generation && !r.IsRejected() {
 			if pr := priceOf(r); pr != nil {
 				// the call's tier, by its whole input, for both halves
@@ -276,7 +279,7 @@ func otelReplyText(body string) string {
 	if !strings.Contains(body, "data:") {
 		return body
 	}
-	body, cut := strings.CutSuffix(body, BodyCut)
+	body, cut := strings.CutSuffix(body, usage.BodyCut)
 	var text strings.Builder
 	for _, line := range strings.Split(body, "\n") {
 		data, ok := strings.CutPrefix(strings.TrimSpace(line), "data:")
@@ -318,10 +321,7 @@ func otelReplyText(body string) string {
 		text.WriteString(body)
 	}
 	if cut {
-		text.WriteString(BodyCut)
+		text.WriteString(usage.BodyCut)
 	}
 	return text.String()
 }
-
-// BodyCut ends a body the gateway captured only the start of.
-const BodyCut = "\n… (cut here by magpie)"

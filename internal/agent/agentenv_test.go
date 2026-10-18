@@ -36,6 +36,7 @@ var notAnAgent = map[string]string{
 	"MAGPIE_EFFORT_UPDATES":     "magpie's own switch for effort updates (#617)",
 	"MAGPIE_SITE_ORIGIN":        "a site origin magpie's Omarchy theme answers, to try the site locally",
 	"MAGPIE_PARTNERS":           "where magpie's own partner list is read from (a URL, or off), not a folder",
+	"XDG_CACHE_HOME":            "Go's build cache's too, which a sandbox keeps shared; Air's ACP OpenCode under it is found by path in a test's own home (#2423)",
 	"CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "Claude Code's behaviour flag, not an agent's folder",
 }
 

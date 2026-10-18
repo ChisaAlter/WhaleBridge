@@ -45,14 +45,24 @@ func TestConfiguredModelsAdvertiseImageInput(t *testing.T) {
 		return result
 	}
 
+	// a config magpie wrote before #2209 has attachment on its models;
+	// the next write takes it away
+	ocPath := filepath.Join(home, ".config", "opencode", "opencode.json")
+	if err := os.MkdirAll(filepath.Dir(ocPath), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(ocPath, []byte(`{"provider":{"magpie":{"models":{"vision/image":{"name":"image","attachment":true}}}}}`), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	if err := opencode(home, filepath.Join(home, ".config")).Field("model").Set("magpie/vision/image"); err != nil {
 		t.Fatal(err)
 	}
 	oc := read(filepath.Join(home, ".config", "opencode", "opencode.json"))
 	ocModels := oc["provider"].(map[string]any)["magpie"].(map[string]any)["models"].(map[string]any)
 	image := ocModels["vision/image"].(map[string]any)
-	if image["attachment"] != true {
-		t.Fatalf("OpenCode image attachment: %v", image)
+	// OpenCode 2 warns on attachment, a V1 field it ignores (#2209)
+	if _, ok := image["attachment"]; ok {
+		t.Fatalf("OpenCode image model still has attachment: %v", image)
 	}
 	modalities := image["modalities"].(map[string]any)
 	if !reflect.DeepEqual(modalities["input"], []any{"text", "image"}) || !reflect.DeepEqual(modalities["output"], []any{"text"}) {
@@ -147,7 +157,7 @@ func TestInferredGroupImagesReachAgentCatalogs(t *testing.T) {
 	}
 	id := "group/auto-claude-sonnet-4-5"
 	oc := magpieProviderJSON("opencode").(map[string]any)["models"].(map[string]any)[id].(map[string]any)
-	if oc["attachment"] != true || !reflect.DeepEqual(oc["modalities"].(map[string]any)["input"], []string{"text", "image"}) {
+	if _, ok := oc["attachment"]; ok || !reflect.DeepEqual(oc["modalities"].(map[string]any)["input"], []string{"text", "image"}) {
 		t.Fatalf("OpenCode group image input: %v", oc)
 	}
 	pi := magpieProviderJSON("pi").(map[string]any)["models"].([]map[string]any)

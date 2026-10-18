@@ -31,6 +31,7 @@ import (
 	"github.com/tidwall/gjson"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/desktopdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/dirent"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 )
 
@@ -51,13 +52,13 @@ func desktopSkillRoots(desktopDir string) []string {
 		base := filepath.Join(d, "local-agent-mode-sessions", "skills-plugin")
 		orgs, _ := os.ReadDir(base)
 		for _, o := range orgs {
-			if !o.IsDir() {
+			if !dirent.IsFolder(base, o) {
 				continue
 			}
 			accts, _ := os.ReadDir(filepath.Join(base, o.Name()))
 			for _, a := range accts {
 				p := filepath.Join(base, o.Name(), a.Name())
-				if a.IsDir() && (isFile(filepath.Join(p, desktopManifest)) || isFile(filepath.Join(p, ".claude-plugin", "plugin.json"))) {
+				if dirent.IsFolder(filepath.Join(base, o.Name()), a) && (isFile(filepath.Join(p, desktopManifest)) || isFile(filepath.Join(p, ".claude-plugin", "plugin.json"))) {
 					out = append(out, p)
 				}
 			}

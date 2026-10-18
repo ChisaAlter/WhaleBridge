@@ -28,6 +28,7 @@ package provider
 // Only the Chinese build has the event: WorkBuddy AI ships with it off.
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -37,6 +38,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -71,9 +73,10 @@ const (
 	CheckinFailed     = "failed"     // no answer; tried again later that day
 	// A vendor challenge is completed by the user in its own app.
 	CheckinCaptcha = "captcha"
-	// CheckinOwnApp is a check-in the vendor pays out only to its own
-	// app (Trae CN's 9074 to a device its app didn't register): an
-	// answer for the day, and the user checks in in the vendor's app
+	// CheckinOwnApp is a check-in the user is to do in the vendor's own
+	// app: an answer for the day. WorkBuddy's check-in answered 401 while
+	// the sign-in works; Trae CN refused the claim with 9074, which says
+	// so in its own words (#1920), not that only its app is paid
 	CheckinOwnApp = "own-app"
 )
 
@@ -204,7 +207,7 @@ func (c wbCheckiner) checkiner() checkiner {
 			if a.creds.UID != "" {
 				key = wbCheckinKey(a)
 			}
-			out = append(out, checkinAcct{User: a.User, On: a.On, key: key, do: func(ctx context.Context) WorkBuddyCheckin { return wbCheckin(ctx, a) }})
+			out = append(out, checkinAcct{User: a.User, On: a.On, key: key, provider: cmp.Or(a.card, a.site.id), do: func(ctx context.Context) WorkBuddyCheckin { return wbCheckin(ctx, a) }})
 		}
 		return out
 	}}
@@ -295,11 +298,18 @@ func wbCheckinRefused(err error) WorkBuddyCheckin {
 
 // wbCheckinFailed is a check-in err kept from an answer: offline when the
 // request got no reply at all (no name lookup, no connection, no answer
-// in time), as a *url.Error from the client says.
+// in time), as a *url.Error from the client says, or, for a check-in sent
+// through a plugin's fetch, as Bun's words for it say: that comes back as
+// text, and a moved WorkBuddy account's "ECONNRESET: The socket connection
+// was closed unexpectedly" waited half an hour (plugins #149).
 func wbCheckinFailed(err error) WorkBuddyCheckin {
 	var ne net.Error
-	return WorkBuddyCheckin{Outcome: CheckinFailed, Msg: err.Error(), Offline: errors.As(err, &ne)}
+	return WorkBuddyCheckin{Outcome: CheckinFailed, Msg: err.Error(), Offline: errors.As(err, &ne) || unanswered.MatchString(err.Error())}
 }
+
+// unanswered is Bun's and Node's words for a fetch that got no reply: no
+// name lookup, no connection, or one closed before the answer.
+var unanswered = regexp.MustCompile(`\b(ECONNRESET|ECONNREFUSED|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|EHOSTUNREACH|ENETUNREACH|ConnectionRefused|ConnectionClosed|FailedToOpenSocket)\b|Unable to connect|socket connection was closed unexpectedly`)
 
 // CheckInWorkBuddy checks each WorkBuddy (China) account in use in for
 // today now, those not in yet, and says how each stands.

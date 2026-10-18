@@ -16,6 +16,7 @@ package provider
 // WorkBuddy's and Trae CN's are (checkin.go).
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -87,7 +88,7 @@ func newQoderCheckiner(accounts func() []qoderCheckinAcct, now func() time.Time)
 	return checkiner{path: qoderCheckinPath(), now: now, mu: &qoderCheckinMu, by: "qoder", label: "qoder", recheck: true, accounts: func() []checkinAcct {
 		var out []checkinAcct
 		for _, a := range accounts() {
-			out = append(out, checkinAcct{User: a.User, On: a.On, key: qoderCheckinKey(a), do: func(ctx context.Context) WorkBuddyCheckin { return qoderCheckin(ctx, a, now()) }})
+			out = append(out, checkinAcct{User: a.User, On: a.On, key: qoderCheckinKey(a), provider: cmp.Or(a.card, a.site), do: func(ctx context.Context) WorkBuddyCheckin { return qoderCheckin(ctx, a, now()) }})
 		}
 		return out
 	}}

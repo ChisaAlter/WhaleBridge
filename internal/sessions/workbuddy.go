@@ -44,7 +44,7 @@ func workbuddyFiles() []file { return buddyFiles("workbuddy", WorkBuddyDir()) }
 // or CodeBuddy Code's, which keeps them the same way.
 func buddyFiles(agent, dir string) []file {
 	var out []file
-	filepath.WalkDir(filepath.Join(dir, "projects"), func(p string, d os.DirEntry, err error) error {
+	walkLinked(filepath.Join(dir, "projects"), func(p string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() || !strings.HasSuffix(d.Name(), ".jsonl") {
 			return nil
 		}

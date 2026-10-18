@@ -171,6 +171,21 @@ func pluginModel(pp plugin.Provider, id string) (plugin.Model, bool) {
 	return plugin.Model{}, false
 }
 
+// PluginTiers are the service tiers p's plugin says its vendor serves
+// model at (m.serviceTiers, #2514): none for a provider not a plugin's, or
+// a model it doesn't list.
+func PluginTiers(p Provider, model string) []string {
+	if !p.IsPlugin() {
+		return nil
+	}
+	pp, ok := PluginOf(p.ID)
+	if !ok {
+		return nil
+	}
+	m, _ := pluginModel(pp, model)
+	return m.ServiceTiers
+}
+
 func pluginCatalog(pp plugin.Provider) []catalog.Model {
 	out := make([]catalog.Model, 0, len(pp.Models))
 	for _, m := range pp.Models {
@@ -182,6 +197,8 @@ func pluginCatalog(pp plugin.Provider) []catalog.Model {
 			// a decision model the plugin marked counts only where it
 			// serves a decision API (pp.Decide)
 			Decides: pp.Decide && m.Decides,
+			// the tiers it says its vendor serves the model at (#2514)
+			Tiers: m.ServiceTiers,
 		}
 		// a limit under catalog.LeastWindow (512, H20 on Discord) is none:
 		// the other one, or models.dev, answers (ListedWindow)
@@ -214,8 +231,8 @@ func pluginCatalog(pp plugin.Provider) []catalog.Model {
 		}
 		// OpenCode's price of a model it has none for is 0, as the
 		// plugins give a plan's models: a price is only one above it
-		if m.Cost != nil && (m.Cost.Input > 0 || m.Cost.Output > 0) {
-			c.Price = &catalog.Price{Input: m.Cost.Input, Output: m.Cost.Output}
+		if pr, ok := pluginPrice(m); ok {
+			c.Price = &pr
 		}
 		if m.ImageSaid {
 			c.ImageInput = &m.Image
@@ -228,6 +245,16 @@ func pluginCatalog(pp plugin.Provider) []catalog.Model {
 		out = append(out, c)
 	}
 	return out
+}
+
+// pluginPrice is m's price as its plugin gives it (m.Cost), if it gives
+// one: OpenCode's price of a model it has none for is 0, so only an input
+// or output price above it is one. A cache price of 0 is none given.
+func pluginPrice(m plugin.Model) (catalog.Price, bool) {
+	if m.Cost == nil || (m.Cost.Input <= 0 && m.Cost.Output <= 0) {
+		return catalog.Price{}, false
+	}
+	return catalog.Price{Input: m.Cost.Input, Output: m.Cost.Output, CacheRead: m.Cost.Cache.Read, CacheWrite: m.Cost.Cache.Write}, true
 }
 
 // pluginAccountCatalog is what the account at key serves: its own list
@@ -361,6 +388,10 @@ func pluginProvider(pp plugin.Provider, l pluginLogin) Provider {
 		// couldn't be reached (#1514)
 		p.Decide = pluginBase + pp.ID + "/v1"
 	}
+	// a plugin in front of Anthropic's or OpenAI's API says its upstream
+	// searches, as a relay is said to (#2027): its client's web_search goes
+	// to it as sent, on the APIs it has an address for (searchesItself)
+	p.Searches = pp.Searches
 	return p
 }
 

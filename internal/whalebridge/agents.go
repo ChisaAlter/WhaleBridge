@@ -53,6 +53,25 @@ func externalAgent(a *agent.Agent) bool {
 	return id != "dsh"
 }
 
+// unlistedAgents are the clients the component does not offer to connect.
+// Claude Science is connected by stopping its daemon and starting it again
+// on the gateway; the component never starts a client for the user.
+var unlistedAgents = map[string]bool{agent.ScienceID: true}
+
+func listedAgent(a *agent.Agent) bool {
+	id, _, _ := strings.Cut(a.ID, "@wsl:")
+	return externalAgent(a) && !unlistedAgents[id]
+}
+
+// findListedAgent is agent.Find limited to the clients this page offers.
+func findListedAgent(id string) (*agent.Agent, error) {
+	a, err := agent.Find(id)
+	if bare, _, _ := strings.Cut(id, "@wsl:"); err == nil && unlistedAgents[bare] {
+		return nil, fmt.Errorf("鲸桥不提供 %s 的接入", a.Name)
+	}
+	return a, err
+}
+
 func managedAgentsPath() string { return filepath.Join(appdir.Config(), "agents.json") }
 
 // Only a connection the user explicitly made here receives catalog updates.
@@ -216,7 +235,7 @@ func agentRows() []agentRow {
 		SyncError: dshSyncError(),
 	}}
 	for _, a := range agent.All() {
-		if !externalAgent(a) {
+		if !listedAgent(a) {
 			continue
 		}
 		vals := a.Values()
@@ -287,7 +306,7 @@ func agentAction(action string) http.HandlerFunc {
 		}
 		mutations.Lock()
 		defer mutations.Unlock()
-		a, err := agent.Find(input.ID)
+		a, err := findListedAgent(input.ID)
 		if err != nil {
 			agentFailure(w, err, http.StatusBadRequest)
 			return
@@ -455,7 +474,7 @@ func agentModelRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/agent-models/{id}", func(w http.ResponseWriter, r *http.Request) {
 		mutations.Lock()
 		defer mutations.Unlock()
-		a, err := agent.Find(r.PathValue("id"))
+		a, err := findListedAgent(r.PathValue("id"))
 		if err != nil {
 			agentFailure(w, err, 400)
 			return
@@ -476,7 +495,7 @@ func agentModelRoutes(mux *http.ServeMux) {
 		}
 		mutations.Lock()
 		defer mutations.Unlock()
-		a, err := agent.Find(r.PathValue("id"))
+		a, err := findListedAgent(r.PathValue("id"))
 		if err == nil && externalAgent(a) {
 			err = managedAgent(a)
 		}
@@ -540,7 +559,7 @@ func agentModelRoutes(mux *http.ServeMux) {
 		if in.ID == "" {
 			in.ID = in.For
 		}
-		a, err := agent.Find(in.ID)
+		a, err := findListedAgent(in.ID)
 		if err == nil && externalAgent(a) {
 			err = managedAgent(a)
 		}

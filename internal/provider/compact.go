@@ -53,14 +53,30 @@ func CompactFor(s settings.Settings, e Entry, find func(string) (Group, []Member
 
 // WindowTyped says the window agents are told for a model, by its
 // catalog id (as CompactSet takes it), is one the user typed: the
-// group's own size, or one set on the provider for the model or all of
-// its models. Claude Code then isn't handed magpie's default compaction
-// window for it (CompactFor's rule).
+// group's own size, a group's smallest member's that the user typed
+// (smallestWindow, #2224), or one set on the provider for the model or
+// all of its models. Claude Code then isn't handed magpie's default
+// compaction window for it (CompactFor's rule, as Entry.WindowSet).
 func WindowTyped(id string) bool {
 	id = catalogID(id)
 	if strings.HasPrefix(id, GroupPrefix) {
-		g, _, ok := GroupFinder()(id)
-		return ok && g.Context > 0
+		gid, ok := GroupIDOf(id)
+		if !ok {
+			return false
+		}
+		entries := providerEntries()
+		all := groupsIn(entries)
+		g, ok := groupOf(all, gid)
+		switch {
+		case !ok || g.Disabled:
+			return false
+		case g.Context > 0:
+			return true
+		case g.Context == ContextSmallest:
+			_, typed := smallestWindow(entries, membersIn(entries, all, g))
+			return typed
+		}
+		return false
 	}
 	pid, model, ok := strings.Cut(id, "/")
 	if !ok {

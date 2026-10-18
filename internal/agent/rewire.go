@@ -33,7 +33,9 @@ func OnGateway() []*Agent {
 // again, an agent joined to magpie beside its own models (Codex signed in
 // with ChatGPT) joined again. It says the names of those it moved, and
 // what one it couldn't move failed with. Cursor Private Inference's
-// variables and dsh's routes, which magpie keeps on its own, follow too.
+// variables and dsh's routes, which magpie keeps on its own, follow too;
+// Claude Science's daemon, started for the old address, is drift
+// (scienceCheck) and is started again with the rest.
 func Rewire(as []*Agent) (moved []string, err error) {
 	var off []*Agent
 	for _, a := range as {

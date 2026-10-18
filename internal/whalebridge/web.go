@@ -118,6 +118,7 @@ func Run(version string) error {
 		return err
 	}
 	defer listener.Close()
+	defer serveBuiltins()()
 	// A DSH config another writer holds, or one the component cannot edit yet,
 	// must not keep the gateway down: the error shows as the sync status and
 	// the channel is written again once the write succeeds.
@@ -130,8 +131,6 @@ func Run(version string) error {
 	stopCatalogSync := watchDSHCatalog(ctx)
 	defer stopCatalogSync()
 	server := gateway.New()
-	stopOTel := usage.StartOTel()
-	defer stopOTel()
 	gateway.ArchiveBucket = func() (gateway.Putter, bool) { b, ok := davsync.S3Bucket(); return b, ok }
 	go davsync.Run(ctx)
 	failures := make(chan error, 2)

@@ -7,10 +7,11 @@ import (
 	"strings"
 )
 
-// Middleware is the gateway middleware a plugin at target has: the file
-// its package.json's magpie.middleware names, or the file itself for a
-// path to a *.middleware.js (or .mjs). only is whether it is nothing
-// else: no OpenCode plugin for the host to load (no main, no exports).
+// Middleware is the gateway module a plugin at target has: the file its
+// package.json's magpie.middleware (or magpie.gateway, the same) names, or
+// the file itself for a path to a *.middleware.js or *.gateway.js (or
+// .mjs). only is whether it is nothing else: no OpenCode plugin for the
+// host to load (no main, no exports).
 func Middleware(target string) (file string, only bool) {
 	st, err := os.Stat(target)
 	if err != nil {
@@ -18,8 +19,10 @@ func Middleware(target string) (file string, only bool) {
 	}
 	if !st.IsDir() {
 		base := strings.ToLower(filepath.Base(target))
-		if strings.HasSuffix(base, ".middleware.js") || strings.HasSuffix(base, ".middleware.mjs") {
-			return target, true
+		for _, ext := range []string{".middleware.js", ".middleware.mjs", ".gateway.js", ".gateway.mjs"} {
+			if strings.HasSuffix(base, ext) {
+				return target, true
+			}
 		}
 		return "", false
 	}
@@ -32,12 +35,20 @@ func Middleware(target string) (file string, only bool) {
 		Exports json.RawMessage `json:"exports"`
 		Magpie  struct {
 			Middleware string `json:"middleware"`
+			Gateway    string `json:"gateway"`
 		} `json:"magpie"`
 	}
-	if json.Unmarshal(b, &pkg) != nil || strings.TrimSpace(pkg.Magpie.Middleware) == "" {
+	if json.Unmarshal(b, &pkg) != nil {
 		return "", false
 	}
-	file = filepath.Join(target, filepath.FromSlash(strings.TrimSpace(pkg.Magpie.Middleware)))
+	name := strings.TrimSpace(pkg.Magpie.Middleware)
+	if name == "" {
+		name = strings.TrimSpace(pkg.Magpie.Gateway)
+	}
+	if name == "" {
+		return "", false
+	}
+	file = filepath.Join(target, filepath.FromSlash(name))
 	return file, pkg.Main == "" && len(pkg.Exports) == 0
 }
 

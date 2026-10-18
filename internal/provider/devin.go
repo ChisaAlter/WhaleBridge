@@ -670,7 +670,7 @@ func devinExchange(ctx context.Context, code, verifier, redirect string) (savedL
 	}
 	// the CLI has no account: writing its file is signing it in, and puts
 	// the file where `devin auth status` reads it
-	if err := writePrivate(DevinCredentialsPath(), creds); err != nil {
+	if err := keepLogin(ctx, func() error { return writePrivate(DevinCredentialsPath(), creds) }); err != nil {
 		return savedLogin{}, err
 	}
 	forgetDevinStatus()

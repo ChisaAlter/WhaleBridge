@@ -151,9 +151,36 @@ func gooseProviderJSON(at place) map[string]any {
 // in Usage (#1083).
 func gooseKey(at place) string { return agentKeyAt("goose", at.gw()) }
 
+// gooseProviderKept is magpie's custom provider laid over the file at path.
+// Goose's own editor (update_custom_provider, crates/goose/src/config/
+// declarative_providers.rs) carries the keys it doesn't show into the file it
+// writes, and the user sets timeout_seconds, toolshim, supports_streaming,
+// preserves_thinking, a header or a name there (DeclarativeProviderConfig).
+// Each stays (#2030); what reaches the gateway, its key and the model list
+// are magpie's.
+func gooseProviderKept(path string, at place) map[string]any {
+	want := gooseProviderJSON(at)
+	raw, err := edit.Read(path)
+	if err != nil || raw == nil {
+		return want
+	}
+	var have map[string]any
+	if json.Unmarshal(raw, &have) != nil || have == nil {
+		return want
+	}
+	if name, _ := have["display_name"].(string); strings.TrimSpace(name) != "" {
+		want["display_name"] = name
+	}
+	if h, _ := have["headers"].(map[string]any); h != nil {
+		// a header of the user's, beside magpie's Authorization
+		want["headers"] = mergeKept(h, want["headers"].(map[string]any), nil)
+	}
+	return mergeKept(have, want, []string{"name", "engine", "api_key_env", "base_url", "requires_auth", "dynamic_models", "models", "headers"})
+}
+
 // writeGooseProvider writes magpie's custom provider file for Goose.
 func writeGooseProvider(path string, at place) error {
-	b, err := json.MarshalIndent(gooseProviderJSON(at), "", "  ")
+	b, err := json.MarshalIndent(gooseProviderKept(path, at), "", "  ")
 	if err != nil {
 		return err
 	}
@@ -170,7 +197,7 @@ func syncGooseProvider(path string, at place) error {
 	if err != nil || raw == nil {
 		return nil
 	}
-	if sameJSON(string(raw), gooseProviderJSON(at)) {
+	if sameJSON(string(raw), gooseProviderKept(path, at)) {
 		return nil
 	}
 	return writeGooseProvider(path, at)

@@ -24,7 +24,10 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
 )
 
 // factoryKeyPrefix is droid's Uh: what a Factory API key starts with.
@@ -91,6 +94,9 @@ func factoryAddKey(ctx context.Context, key string) ImportedAccount {
 	if user == "" {
 		return ImportedAccount{User: factoryKeyName(key), Status: "failed", Error: "Factory took the key but didn't say whose account it is"}
 	}
+	if Moved("factory") {
+		return factoryKeyToPlugin(wctx, user, c)
+	}
 	status := "added"
 	if l, ok := factoryLookup(user); ok {
 		status = "updated"
@@ -109,5 +115,29 @@ func factoryAddKey(ctx context.Context, key string) ImportedAccount {
 		ls[i].Lapsed = ""
 		return ls, nil
 	})
+	return ImportedAccount{User: user, Status: status}
+}
+
+// factoryKeyToPlugin keeps a key as an account of Factory's plugin, which
+// a moved Factory signs in with: an api account, as the plugin's own
+// "Factory API key" sign-in saves one (whoami's metadata beside the key).
+func factoryKeyToPlugin(ctx context.Context, user string, c factoryCreds) ImportedAccount {
+	status := "added"
+	for _, a := range plugin.Auths("factory") {
+		md, _ := a["metadata"].(map[string]any)
+		switch {
+		case str(a["type"]) == "api" && str(a["key"]) == c.Access:
+			status = "exists"
+		case status == "added" && strings.EqualFold(firstNonEmpty(str(md["email"]), str(a["email"])), user):
+			status = "updated"
+		}
+	}
+	auth := map[string]any{"type": "api", "key": c.Access, "metadata": map[string]any{
+		"email": c.Email, "userId": c.UserID, "region": c.Region, "premBaseHost": c.Prem}}
+	if status != "exists" {
+		if _, err := plugin.Import(ctx, "factory", auth); err != nil {
+			return ImportedAccount{User: user, Status: "failed", Error: err.Error()}
+		}
+	}
 	return ImportedAccount{User: user, Status: status}
 }

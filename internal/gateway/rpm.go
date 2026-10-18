@@ -159,6 +159,7 @@ func (l *rpms) wait(ctx context.Context, who string, limit int, longest time.Dur
 	if d <= 0 {
 		return 0, nil
 	}
+	defer notePhase(ctx, "rpm")()
 	t := time.NewTimer(d)
 	defer t.Stop()
 	select {

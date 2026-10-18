@@ -970,12 +970,14 @@ func TestVertexTestRequest(t *testing.T) {
 	for model, think := range map[string]map[string]any{
 		"gemini-3.5-flash":       low,
 		"gemini-3.1-pro-preview": low,
+		"gemini-4-argon":         low,
 		"gemini-3-flash-preview": low,
 		"gemini-2.5-pro":         budget(128),
 		"Gemini-2.5-Pro":         budget(128),
 		"gemini-2.5-flash":       budget(0),
 		"gemini-2.5-flash-lite":  budget(0),
 		"gemini-2.0-flash-001":   nil,
+		"gemini-flash-latest":    nil,
 	} {
 		u, body := vertexTest(q, model)
 		if u != base+"/publishers/google/models/"+model+":generateContent" {

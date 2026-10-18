@@ -201,3 +201,64 @@ func TestCline(t *testing.T) {
 		t.Fatalf("CLINE_DATA_DIR: %q", p)
 	}
 }
+
+// What the user set on magpie's entry in Cline's models.json stays through
+// every sync and pick (#2030's siblings): a key of the provider's, and on a
+// model magpie lists what magpie doesn't write (an override from the VS Code
+// extension's model editor). The address, default model and model list stay
+// magpie's.
+func TestClineKeepsTheUsersSettings(t *testing.T) {
+	home := syncHome(t)
+	t.Setenv("CLINE_DIR", "")
+	t.Setenv("CLINE_DATA_DIR", "")
+	mpath := filepath.Join(home, ".cline", "data", "settings", "models.json")
+	a := cline(home)
+	f := a.Field("model")
+	if err := f.Set("magpie/relay/glm-4.6"); err != nil {
+		t.Fatal(err)
+	}
+	slot := "providers." + clineSlot
+	if err := edit.SetJSON(mpath,
+		edit.KV{Path: slot + ".provider.modelsSourceUrl", Value: "https://x/models"},
+		edit.KV{Path: slot + ".provider.protocol", Value: "openai-chat"},
+		edit.KV{Path: slot + ".provider.baseUrl", Value: "http://127.0.0.1:1/v1"},
+		edit.KV{Path: slot + ".models.relay/glm-4\\.6.temperature", Value: 0.3},
+		edit.KV{Path: slot + ".models.gone/old", Value: map[string]any{"id": "gone/old", "temperature": 0.1}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Key: "k", Chat: "http://127.0.0.1:1/v1", Models: []string{"pro"}}); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if err := a.Sync(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(when string) {
+		t.Helper()
+		var c struct {
+			Providers map[string]struct {
+				Provider map[string]any            `json:"provider"`
+				Models   map[string]map[string]any `json:"models"`
+			} `json:"providers"`
+		}
+		raw := readFile(mpath)
+		if err := json.Unmarshal([]byte(raw), &c); err != nil {
+			t.Fatalf("%v\n%s", err, raw)
+		}
+		e := c.Providers[clineSlot]
+		if e.Provider["modelsSourceUrl"] != "https://x/models" || e.Provider["protocol"] != "openai-chat" || e.Models["relay/glm-4.6"]["temperature"] != 0.3 {
+			t.Errorf("%s: the user's settings not kept:\n%s", when, raw)
+		}
+		if e.Provider["baseUrl"] == "http://127.0.0.1:1/v1" || e.Provider["name"] != "magpie" || e.Models["gone/old"] != nil ||
+			e.Models["deepseek/pro"] == nil || e.Models["relay/glm-4.6"]["name"] == nil {
+			t.Errorf("%s: magpie's own parts not written:\n%s", when, raw)
+		}
+	}
+	check("sync")
+	if err := f.Set("magpie/deepseek/pro"); err != nil {
+		t.Fatal(err)
+	}
+	check("pick")
+}

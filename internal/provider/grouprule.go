@@ -439,8 +439,8 @@ func ruledEntry(e *Entry, g Group, ms []Member, entries []Entry) {
 		var out Entry
 		found := false
 		for _, m := range ms {
-			if m.ID != id {
-				continue
+			if m.ID != id && !slices.ContainsFunc(m.Also, func(o Member) bool { return o.ID == id }) {
+				continue // one of a later group in the group too (#2361)
 			}
 			for _, x := range entries {
 				if x.Provider.ID != m.Provider.ID || x.Model != m.Model {

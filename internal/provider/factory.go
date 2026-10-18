@@ -66,7 +66,7 @@ const (
 	// factoryClientID is droid's WorkOS client, production.
 	factoryClientID = "client_01HNM792M5G5G1A2THWPXKFMXB"
 	// factoryVersion is the droid release magpie's requests say they are.
-	factoryVersion = "0.233.0"
+	factoryVersion = "0.242.0"
 	// factoryRefreshLead is how long before an access token lapses it is
 	// renewed; droid renews a minute ahead, magpie a little more.
 	factoryRefreshLead = 2 * time.Minute
@@ -585,7 +585,11 @@ type factoryModel struct {
 // factoryModels are the ones droid's /model picker offers, less auto (droid
 // picks it client side). Gemini's are the ones droid 0.231.0's CLI registry
 // still offers (provider google); 2.5 and Gemini 3 Pro Image are
-// availableInCLI false there, and stay out. They go to /api/llm/g.
+// availableInCLI false there, and stay out. They go to /api/llm/g. Gemini 4
+// Argon is droid 0.241.1's (#2080), behind a Factory feature flag there.
+// Haiku 5.5 and Mistral Large 4 are droid 0.240.0's; GPT-6 Astra Ultra
+// Fast, new there too, stays out, as droid offers it only once the user
+// has accepted Factory's high-cost terms for it.
 var factoryModels = []factoryModel{
 	{"claude-fable-5.1", "Fable 5.1", Anthropic, "anthropic", 867000, 128000, []string{"low", "medium", "high", "xhigh", "max"}, true},
 	{"claude-fable-5", "Fable 5", Anthropic, "anthropic", 867000, 128000, []string{"low", "medium", "high", "xhigh", "max"}, true},
@@ -595,6 +599,7 @@ var factoryModels = []factoryModel{
 	{"claude-sonnet-5-5", "Sonnet 5.5", Anthropic, "anthropic", 872000, 128000, []string{"low", "medium", "high", "xhigh", "max"}, true},
 	{"claude-sonnet-5", "Sonnet 5", Anthropic, "anthropic", 872000, 128000, []string{"low", "medium", "high", "xhigh", "max"}, true},
 	{"claude-sonnet-4-6", "Sonnet 4.6", Anthropic, "anthropic", 931000, 64000, []string{"low", "medium", "high", "max"}, true},
+	{"claude-haiku-5-5", "Haiku 5.5", Anthropic, "anthropic", 872000, 128000, []string{"low", "medium", "high", "xhigh", "max"}, true},
 	{"claude-haiku-4-5-20251001", "Haiku 4.5", Anthropic, "anthropic", 0, 0, []string{"low", "medium", "high"}, true},
 	{"gpt-6-sol", "GPT-6 Sol", Responses, "openai", 1050000, 128000, []string{"none", "low", "medium", "high", "xhigh", "max"}, true},
 	{"gpt-6-astra", "GPT-6 Astra", Responses, "openai", 1050000, 128000, []string{"low", "medium", "high", "xhigh", "max"}, true},
@@ -607,6 +612,7 @@ var factoryModels = []factoryModel{
 	{"gpt-5.3-codex", "GPT-5.3-Codex", Responses, "openai", 400000, 128000, []string{"low", "medium", "high", "xhigh"}, true},
 	{"grok-4.7", "Grok 4.7", Responses, "xai", 500000, 63356, []string{"low", "medium", "high", "xhigh"}, true},
 	{"grok-4.6", "Grok 4.6", Responses, "xai", 200000, 63356, []string{"low", "medium", "high", "xhigh"}, true},
+	{"gemini-4-argon", "Gemini 4 Argon", Gemini, "google", 1000000, 65536, []string{"low", "medium", "high"}, true},
 	{"gemini-3.1-pro-preview", "Gemini 3.1 Pro", Gemini, "google", 1000000, 65536, []string{"low", "medium", "high"}, true},
 	{"gemini-3.8-flash", "Gemini 3.8 Flash", Gemini, "google", 1000000, 65536, []string{"low", "medium", "high"}, true},
 	{"gemini-3.7-flash", "Gemini 3.7 Flash", Gemini, "google", 1000000, 65536, []string{"low", "medium", "high"}, true},
@@ -624,6 +630,7 @@ var factoryModels = []factoryModel{
 	{"qwen3.8-max", "Qwen3.8 Max", Chat, "fireworks", 262144, 131072, []string{"low", "medium", "xhigh"}, false},
 	{"minimax-m3", "MiniMax M3", Chat, "fireworks", 512000, 64000, []string{"high"}, true},
 	{"minimax-m2.7", "MiniMax M2.7", Anthropic, "fireworks", 196600, 64000, []string{"high"}, false},
+	{"mistral-large-4", "Mistral Large 4", Chat, "mistral", 524288, 64000, []string{"high"}, true},
 	{"mistral-medium-3.5", "Mistral Medium 3.5", Chat, "mistral", 256000, 64000, []string{"high"}, true},
 	{"nemotron-3-ultra", "Nemotron 3 Ultra", Chat, "baseten", 202000, 65536, []string{"high"}, false},
 }

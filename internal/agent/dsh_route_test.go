@@ -788,3 +788,31 @@ func TestDshRoundWithoutDshBuildsNoCatalog(t *testing.T) {
 		t.Fatalf("a round without dsh made %.0f allocations", n)
 	}
 }
+
+// #2359 (IanLi592): a model picked for dsh in magpie, then work continued
+// in a workspace's session made before, which stayed on dsh's own
+// DeepSeek. dsh reads agent-default-model for new sessions only, and
+// keeps a session's own pick whether dsh is running or not, so a pick
+// says so with no dsh running too; before, it said nothing then.
+func TestDshPickSaysOldSessionsKeepTheirModel(t *testing.T) {
+	home, _, web := dshRouteHome(t)
+	if err := os.WriteFile(web, []byte("# Your patch layer for this dsh profile.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	old := Running
+	Running = func(...string) bool { return false }
+	t.Cleanup(func() { Running = old })
+	a := dsh(home)
+	if err := a.Field("model").Set("magpie/deepseek/pro"); err != nil {
+		t.Fatal(err)
+	}
+	if n := a.Notice(); !strings.Contains(n, "A session made before keeps its model") || !strings.Contains(n, "/model") {
+		t.Fatalf("a pick says nothing of the sessions dsh already has: %q", n)
+	}
+	// before 0.1.5 (no profiles) dsh is told only while it runs, as before
+	h2 := t.TempDir()
+	t.Setenv("HOME", h2)
+	if n := dsh(h2).Notice(); strings.Contains(n, "dsh") {
+		t.Fatalf("an old dsh not running was told something: %q", n)
+	}
+}

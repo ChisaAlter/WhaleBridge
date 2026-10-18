@@ -32,6 +32,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -41,6 +43,7 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/desktopdir"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 // desktopProfileID is magpie's profile in Desktop's configLibrary: a
@@ -167,7 +170,7 @@ func claudeDesktop(home string) *Agent {
 				return []Option{{Value: magpieID, Label: "magpie", Icon: "magpie",
 					Note: "Desktop's third-party gateway: Code and Cowork on magpie's models, no Anthropic sign-in (restart Desktop)"}}
 			},
-		}}, desktopTierFields(ps)...),
+		}}, append(desktopTierFields(ps), desktopSubagentField(ps), desktopSubagentEffortField(ps))...),
 	}
 }
 
@@ -237,6 +240,70 @@ func desktopTierFields(ps []desktopPaths) []Field {
 	return fields
 }
 
+// desktopSubagentField picks the model every subagent turn in Desktop's
+// Code tab and Cowork runs on, whatever its lead or tier asked for. It
+// writes nothing to Desktop's config, which has no key for it, and the
+// Claude Code it runs ignores CLAUDE_CODE_SUBAGENT_MODEL in ~/.claude
+// while Desktop manages its provider: it is magpie's setting
+// (settings.DesktopSubagentModel), which the gateway reads on each
+// request (gateway desktopSubagentPick), so it is Live and a change needs
+// no restart of Desktop. Labelled as Codex's "subagent model", it gets the
+// same square on the Agents page. A Desktop alias picked is kept by its
+// catalog id.
+func desktopSubagentField(ps []desktopPaths) Field {
+	return Field{
+		Key: "subagent_model", Label: "subagent model", Quiet: true, Live: true,
+		Get: provider.DesktopSubagentModel,
+		Set: func(v string) error {
+			return provider.SetDesktopSubagentModel(gateway.DesktopCatalogID(v))
+		},
+		Options: func(map[string]string) []Option {
+			if !desktopWiredAny(ps) {
+				return nil
+			}
+			return viaMagpie("claude-desktop", "")
+		},
+	}
+}
+
+// Desktop's subagent effort is a live gateway setting, like its subagent
+// model. With no model picked, a subagent may use any of Desktop's models,
+// so all levels are offered and the gateway fits each to the actual model.
+func desktopSubagentEffortField(ps []desktopPaths) Field {
+	return Field{
+		Key: "subagent_effort", Label: "subagent effort", Quiet: true, Live: true,
+		Get: provider.DesktopSubagentEffort,
+		Set: provider.SetDesktopSubagentEffort,
+		Options: func(map[string]string) []Option {
+			if !desktopWiredAny(ps) {
+				return nil
+			}
+			target := provider.DesktopSubagentModel()
+			if target == "" {
+				return static(provider.MemberEfforts...)
+			}
+			for _, e := range provider.Served() {
+				if e.ID != target {
+					continue
+				}
+				if provider.Reasonless(e.Provider.ID, e.Model) {
+					return nil
+				}
+				var levels []string
+				for _, level := range e.Efforts {
+					if slices.Contains(provider.MemberEfforts, level) {
+						levels = append(levels, level)
+					}
+				}
+				if len(levels) > 0 {
+					return static(levels...)
+				}
+			}
+			return static(provider.MemberEfforts...)
+		},
+	}
+}
+
 // desktopWired: _meta.json lists magpie's profile.
 func desktopWired(p desktopPaths) bool {
 	entries, _, err := desktopEntries(p.meta)
@@ -295,6 +362,9 @@ func desktopObject(path string) error {
 // The stash keeps what Desktop had before magpie: each file's
 // deploymentMode ("" when it had none), the profile applied, and the
 // files and folders magpie made, so switching off puts all of it back.
+// It also keeps magpie's profile as it was when switched off, the
+// settings the user made in it from Desktop's window among them, so
+// switching on again brings them back (#2035).
 // A package's folders keep theirs under the same keys ending in ".package".
 const (
 	desktopStashed = "claude-desktop.on"
@@ -302,9 +372,10 @@ const (
 	desktopMode3p  = "claude-desktop.mode3p"
 	desktopApplied = "claude-desktop.applied"
 	desktopMade    = "claude-desktop.made"
+	desktopProfile = "claude-desktop.profile"
 )
 
-var desktopStashKeys = []string{desktopStashed, desktopMode, desktopMode3p, desktopApplied, desktopMade}
+var desktopStashKeys = []string{desktopStashed, desktopMode, desktopMode3p, desktopApplied, desktopMade, desktopProfile}
 
 // desktopAdoptStash moves the stash a packaged Desktop's folders got
 // before they had keys of their own (when magpie wrote only one set) onto
@@ -365,12 +436,19 @@ func desktopOn(p desktopPaths) error {
 	}
 
 	// the profile: the gateway's address and key set, Desktop's own
-	// settings in it (the user's, from its window) kept
+	// settings in it (the user's, from its window) kept, and those it had
+	// when switched off put back (#2035)
 	if b, _ := edit.Read(p.prof); len(bytes.TrimSpace(b)) == 0 {
 		if err := os.MkdirAll(p.library, 0o755); err != nil {
 			return err
 		}
-		if err := os.WriteFile(p.prof, []byte("{}\n"), 0o600); err != nil {
+		was := []byte("{}\n")
+		if kept := unstash(desktopProfile + p.key); kept != "" && desktopObjectBytes([]byte(kept)) {
+			was = []byte(kept)
+		} else if own := desktopOwnGatewayProfile(p); own != nil {
+			was = own
+		}
+		if err := os.WriteFile(p.prof, was, 0o600); err != nil {
 			return err
 		}
 	}
@@ -478,6 +556,11 @@ func desktopOff(p desktopPaths) error {
 			return err
 		}
 	}
+	// the profile goes, and what is in it is kept for the next on: the
+	// settings the user made in it are theirs (#2035)
+	if b, err := os.ReadFile(p.prof); err == nil && desktopObjectBytes(b) && !desktopEmpty(b) {
+		stash(map[string]string{desktopProfile + k: string(b)})
+	}
 	if err := os.Remove(p.prof); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
@@ -498,6 +581,60 @@ func desktopOff(p desktopPaths) error {
 		}
 	}
 	return nil
+}
+
+// desktopOwnGatewayProfile is the profile the user made themselves in
+// Desktop's window for magpie's gateway, the one applied before magpie
+// applied its own: its settings (chat tab, default effort, allowed hosts
+// and whatever Desktop adds) start magpie's profile, so switching on
+// doesn't trade them for magpie's defaults (#2035). A profile for another
+// gateway, Bedrock or Vertex is not one: its models and settings are for
+// somewhere else. nil when there is none.
+func desktopOwnGatewayProfile(p desktopPaths) []byte {
+	id, _ := edit.GetJSON(p.meta, "appliedId")
+	if id == desktopProfileID {
+		id = unstash(desktopApplied + p.key)
+	}
+	if id == "" || id == desktopProfileID || filepath.Base(id) != id || strings.HasPrefix(id, ".") {
+		return nil
+	}
+	b, err := os.ReadFile(filepath.Join(p.library, id+".json"))
+	if err != nil || !desktopObjectBytes(b) {
+		return nil
+	}
+	var prof struct {
+		Provider string `json:"inferenceProvider"`
+		BaseURL  string `json:"inferenceGatewayBaseUrl"`
+	}
+	if json.Unmarshal(b, &prof) != nil || prof.Provider != "gateway" || !desktopIsOurGateway(prof.BaseURL) {
+		return nil
+	}
+	return b
+}
+
+// desktopIsOurGateway: u is magpie's gateway, by its port on this machine
+// (127.0.0.1, localhost or ::1, with or without /v1).
+func desktopIsOurGateway(u string) bool {
+	a, err := url.Parse(strings.TrimSpace(u))
+	if err != nil || a.Port() == "" {
+		return false
+	}
+	ours, err := url.Parse(gateway.URL())
+	if err != nil || a.Port() != ours.Port() {
+		return false
+	}
+	h := a.Hostname()
+	if h == ours.Hostname() || h == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(h)
+	return ip != nil && ip.IsLoopback()
+}
+
+// desktopObjectBytes: b is a JSON object.
+func desktopObjectBytes(b []byte) bool {
+	var m map[string]json.RawMessage
+	return json.Unmarshal(b, &m) == nil && m != nil
 }
 
 func desktopEmpty(b []byte) bool {

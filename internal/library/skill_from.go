@@ -18,7 +18,9 @@ import (
 // CC Switch's record, the skills CLI's lock (npx skills add, in
 // ~/.agents/.skill-lock.json), the git checkout a linked folder is in,
 // or the repository the user installed from since that has the very same
-// skill (From). It only groups: such a skill is not updated from there.
+// skill (From). It only groups: such a skill is not updated from there,
+// unless the library's own copy is the repository's to the file, which
+// then is the repository's skill (noteFrom).
 
 // repoOf is the repository a library skill came from: owner/repo on
 // GitHub, host/path elsewhere, "" when it can't be told.
@@ -257,7 +259,8 @@ func remoteRepo(s string) string {
 }
 
 // noteFrom writes down, for the skills the library has already that a
-// repository being installed from has too, that they came from there:
+// repository being installed from has too, that they came from there (and
+// binds a copy that is the repository's whole to it, to update from):
 // one whose SKILL.md is that repository's very own, and one traced to
 // nowhere by the same name when the library has others from there. A
 // pack added a while ago is mostly older copies (White Immortal on
@@ -277,22 +280,37 @@ func noteFrom(src Source, root string, cands []Candidate) int {
 	}
 	tr := &tracer{}
 	have := slices.ContainsFunc(l.Skills, func(s *Skill) bool { return strings.EqualFold(tr.repoOf(s), src.Repo) })
-	noted := 0
+	noted, bound := 0, 0
 	var same []*Skill
 	for _, c := range cands {
 		s := l.skill(c.Name)
-		if s == nil || (s.Source != nil && s.Source.Kind == "github") || strings.EqualFold(s.From, src.Repo) {
+		if s == nil || (s.Source != nil && s.Source.Kind == "github") {
 			continue
 		}
+		grouped := strings.EqualFold(s.From, src.Repo)
 		mine, err1 := os.ReadFile(filepath.Join(skillDir(s.Name), "SKILL.md"))
 		theirs, err2 := os.ReadFile(filepath.Join(root, filepath.FromSlash(c.Path), "SKILL.md"))
 		if err1 != nil || err2 != nil {
 			continue
 		}
 		if bytes.Equal(bytes.TrimSpace(mine), bytes.TrimSpace(theirs)) {
-			s.From, have = src.Repo, true
-			noted++
-		} else if tr.repoOf(s) == "" {
+			if !grouped {
+				s.From, have = src.Repo, true
+				noted++
+			}
+			// the library's own copy, every file of it the repository's:
+			// it is that skill, and updates from there as one installed
+			// from it does (RockyShowlle on X). One linked to a folder
+			// elsewhere is kept by whatever put it there (npx skills, a
+			// git checkout), and an edited one stays only grouped.
+			if dir := skillDir(s.Name); s.Source == nil && !linked(dir) && sameTree(dir, filepath.Join(root, filepath.FromSlash(c.Path))) {
+				s.Source = &Source{Kind: "github", Repo: src.Repo, Ref: src.Ref, Path: c.Path}
+				s.Hash, s.Commit, s.From = hashDir(dir), "", ""
+				l.seenAt(src.Repo, src.Ref, c.Path)
+				forgetCheck(s.Name)
+				bound++
+			}
+		} else if !grouped && tr.repoOf(s) == "" {
 			same = append(same, s)
 		}
 	}
@@ -302,7 +320,7 @@ func noteFrom(src Source, root string, cands []Candidate) int {
 			noted++
 		}
 	}
-	if noted > 0 {
+	if noted > 0 || bound > 0 {
 		l.save()
 	}
 	return noted

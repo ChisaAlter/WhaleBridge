@@ -543,8 +543,30 @@ func (p Provider) cloudflareAccount(ctx context.Context) (string, error) {
 }
 
 // Deciders are the models of the decision providers ready now, as a
-// group's classifier names them.
+// group's classifier names them: every one the gateway answers.
 func Deciders() []Entry {
+	return deciders(nil)
+}
+
+// OfferedDeciders are the Deciders a routing group's pickers and templates
+// offer: of a provider whose decision models are listed beside its chat
+// models (OpenRouter's, a Bailian plan's, a plugin's, a remote magpie's),
+// with picks saved, those among the picks alone, as its editor shows the
+// rest unpicked (coeo91 on Discord: two OpenRouter models picked, and a
+// new group's picker listed OpenRouter's twenty-odd decision models after
+// them). With none picked every one is offered, as before. keep, when
+// given, says a decision model a group names already, offered whatever
+// the picks, so a group made of one before reads as it did.
+func OfferedDeciders(keep func(id string) bool) []Entry {
+	if keep == nil {
+		keep = func(string) bool { return false }
+	}
+	return deciders(keep)
+}
+
+// deciders are Deciders, less the unpicked ones keep doesn't name when
+// keep is given.
+func deciders(keep func(id string) bool) []Entry {
 	var out []Entry
 	s := settings.Load()
 	off := disabledNow()
@@ -555,6 +577,11 @@ func Deciders() []Entry {
 		ms := p.Exposed()
 		if !p.DecideOnly() && (len(p.Models) == 0 || p.listsDecisions() || p.bailianApart() || p.IsRemoteMagpie() || p.IsPlugin()) {
 			ms = p.decideModels() // the conversation picker's limit does not hide Jev
+			if keep != nil && len(p.Models) > 0 {
+				ms = slices.DeleteFunc(slices.Clone(ms), func(m catalog.Model) bool {
+					return !slices.Contains(p.Models, m.ID) && !keep(p.ID+"/"+m.ID)
+				})
+			}
 		}
 		for _, m := range ms {
 			if p.isDecision(m) && !off(p.ID, m.ID) { // a disabled one isn't offered (#1867)

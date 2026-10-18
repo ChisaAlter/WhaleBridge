@@ -14,8 +14,8 @@ import (
 // ANTHROPIC_DEFAULT_FABLE_MODEL names for a Fable model, so Opus written
 // there was Fable to it, and a Claude Pro sign-in without Fable asked for
 // usage credits and fell back to Haiku (Zhenzhen on Discord, magpie claude
-// claude/claude-opus-5-5). On a Fable, or another vendor's model, it follows
-// as before; a value of the user's own stays theirs.
+// claude/claude-opus-5-5). So it is on another vendor's model (#2090). On a
+// Fable it follows as before; a value of the user's own stays theirs.
 func TestClaudeFableTierOnClaude(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -25,6 +25,7 @@ func TestClaudeFableTierOnClaude(t *testing.T) {
 	for _, p := range []provider.Provider{
 		{ID: "anth", Name: "Anthropic", Chat: "https://api.anthropic.com/v1", Key: "k", Models: []string{"claude-opus-5-5", "claude-sonnet-5", "claude-fable-5-1", "claude-haiku-4-5"}},
 		{ID: "deepseek", Name: "DeepSeek", Chat: "https://api.deepseek.com/v1", Key: "k", Models: []string{"pro", "flash"}},
+		{ID: "cx", Name: "Codex models", Chat: "https://codex.invalid/v1", Key: "k", Models: []string{"gpt-6.1-sol"}},
 	} {
 		if err := provider.Save(p); err != nil {
 			t.Fatal(err)
@@ -78,17 +79,40 @@ func TestClaudeFableTierOnClaude(t *testing.T) {
 		t.Fatal(err)
 	}
 	noFable("back from Fable")
-	// another vendor's model: it follows as before
-	if err := a.Field("model").Set("deepseek/pro"); err != nil {
+	// another vendor's model is no Fable either: GPT-6.1 Sol written there
+	// was Fable to Claude Code, which asked for usage credits before Sol's
+	// first turn (#2090)
+	for _, m := range []string{"cx/gpt-6.1-sol", "deepseek/pro"} {
+		if err := a.Field("model").Set(m); err != nil {
+			t.Fatal(err)
+		}
+		noFable("on " + m)
+		if env("ANTHROPIC_DEFAULT_OPUS_MODEL") != m || env("ANTHROPIC_DEFAULT_SONNET_MODEL") != m || env("ANTHROPIC_DEFAULT_HAIKU_MODEL") != m {
+			t.Fatalf("on %s the other tiers should follow:\n%s", m, readFile(path))
+		}
+		if got := claudeStandInAt(path, "claude-fable-5-1", env("ANTHROPIC_BASE_URL")); got != m {
+			t.Fatalf("on %s claude-fable-5-1 stands in as %q", m, got)
+		}
+	}
+	// the reporter's settings.json, the fable tier on Sol, from 0.1.1229:
+	// Follow takes it out. 0.1.1229 wrote it there following the main
+	// model on Sol; a fable tier on Sol before the main model moved onto
+	// it is one given Sol, which stays (#2257,
+	// TestClaudeOwnTierOnTheNewMainModelStays)
+	if err := a.Field("model").Set("cx/gpt-6.1-sol"); err != nil {
 		t.Fatal(err)
 	}
-	if v, _ := fable(); v != "deepseek/pro" {
-		t.Fatalf("on deepseek, fable is %q", v)
+	if err := edit.SetJSON(path, edit.KV{Path: "env.ANTHROPIC_DEFAULT_FABLE_MODEL", Value: "cx/gpt-6.1-sol"}); err != nil {
+		t.Fatal(err)
 	}
+	if err := a.Follow(); err != nil {
+		t.Fatal(err)
+	}
+	noFable("Sol's older wiring after Follow")
 	if err := a.Field("model").Set("anth/claude-opus-5-5"); err != nil {
 		t.Fatal(err)
 	}
-	noFable("back from deepseek")
+	noFable("back from another vendor")
 
 	// the user's pick of the main model for fable is theirs: it stays
 	if err := a.Field("fable").Set("anth/claude-opus-5-5"); err != nil {

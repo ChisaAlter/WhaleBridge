@@ -111,11 +111,13 @@ func LoginPath() []string {
 // netproxy.
 var ProxyVars = []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "ALL_PROXY", "all_proxy", "NO_PROXY", "no_proxy"}
 
-// shellVars are the variables shellProbe asks for, in its order.
-var shellVars = slices.Concat(agentenv.Vars, ProxyVars)
+// shellVars are the variables shellProbe asks for, in its order. Claude
+// Code's provider switches (agentenv.ClaudeProviders) are only read, as the
+// proxy variables are.
+var shellVars = slices.Concat(agentenv.Vars, ProxyVars, agentenv.ClaudeProviders)
 
 // LoginEnv is the value a terminal opened now has for k, one of
-// agentenv.Vars or ProxyVars: the login shell's, asked as LoginPath asks
+// agentenv.Vars, ProxyVars or agentenv.ClaudeProviders: the login shell's, asked as LoginPath asks
 // and with it; "" when the shell has none for it or doesn't say.
 func LoginEnv(k string) string {
 	LoginPath()

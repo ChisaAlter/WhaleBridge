@@ -31,8 +31,18 @@ type heldValue struct {
 
 func init() {
 	catalog.Forget = Changed
-	// a plugin's sign-in saved or renewed, a plugin added
-	plugin.OnChange(Changed)
+	// a plugin's sign-in saved or renewed, a plugin added, and the models
+	// a plugin lists once the host has answered: the catalog may be
+	// another, so the model lists agents keep in their own files follow,
+	// as for a provider saved (catalog.Changed). Dropping only what is
+	// held left Pi's models.json without a plugin's models signed in to
+	// after it was written (#2373).
+	plugin.OnChange(catalog.Touched)
+	plugin.OnListed(catalog.Touched)
+	// and what a request holds goes at once: a SyncCatalog running holds
+	// the plugins as they were before a sign-in, and a look at the
+	// accounts right after it was given those for a second (#2449)
+	plugin.OnChangeNow(dropHeld)
 }
 
 // heldFor is how long a held catalog is used before it is built again,
@@ -58,6 +68,12 @@ func Hold() (release func()) {
 // setting was written.
 func Changed() {
 	filememo.Forget()
+	dropHeld()
+}
+
+// dropHeld is Changed for what is built on the plugins alone, which
+// read their files afresh each time.
+func dropHeld() {
 	held.Lock()
 	held.gen++
 	held.built = nil

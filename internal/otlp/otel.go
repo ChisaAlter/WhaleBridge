@@ -1,4 +1,4 @@
-package usage
+package otlp
 
 import (
 	"bytes"
@@ -18,6 +18,7 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/netproxy"
 	"github.com/ChisaAlter/WhaleBridge/internal/sessions"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/usage"
 )
 
 const otelQueueSize = 128
@@ -33,10 +34,23 @@ const otelQueueBytes = 128 << 20
 // POST at most, so a batch of whole bodies stays inside a collector's limit.
 const otelBodiesBatchBytes = 16 << 20
 
-var otel atomic.Pointer[otelExporter]
+// Record is a usage row as the exporter sends it.
+type Record = usage.Record
+
+// Exporter sends the gateway's requests, the ledger's rows and the agents'
+// sessions to an OpenTelemetry collector, as settings.OTel says. It is a
+// usage.Observer: plugins/otel registers one while it is on, and magpie's
+// core never exports on its own.
+type Exporter struct {
+	running atomic.Pointer[otelExporter]
+}
+
+// New is an exporter, not yet serving.
+func New() *Exporter { return &Exporter{} }
 
 type otelItem struct {
 	record Record
+	span   *OTelSpan // nil for a ledger row
 	config settings.OTel
 }
 
@@ -56,15 +70,16 @@ type otelExporter struct {
 
 // OTelEvery is how often the exporter sends what it holds, and
 // OTelSessionsEvery how often it reads the agents' transcripts for
-// sessions. Read once when StartOTel starts an exporter; tests shorten them
+// sessions. Read once when Serve starts an exporter; tests shorten them
 // so a test that waits for an export doesn't wait seconds.
 var OTelEvery, OTelSessionsEvery = 5 * time.Second, 2 * time.Second
 
-// StartOTel runs only in the process serving the gateway. Stopping drains
-// accepted metadata for at most three seconds, after in-flight calls finish.
-func StartOTel() func() {
+// Serve runs only in the process serving the gateway
+// (usage.ServeObservers). Stopping drains accepted metadata for at most
+// three seconds, after in-flight calls finish.
+func (x *Exporter) Serve() func() {
 	e := newOTelExporter()
-	otel.Store(e)
+	x.running.Store(e)
 	if _, err := settings.OTelExport(); err != nil {
 		log.Printf("otel: %s", err)
 	}
@@ -74,7 +89,7 @@ func StartOTel() func() {
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			otel.CompareAndSwap(e, nil)
+			x.running.CompareAndSwap(e, nil)
 			close(e.stop)
 			timer := time.NewTimer(3 * time.Second)
 			defer timer.Stop()
@@ -98,23 +113,23 @@ func newOTelExporter() *otelExporter {
 	return e
 }
 
-// ExportOTel queues telemetry without writing a usage ledger record.
-func ExportOTel(r Record) { offerOTel(r) }
-
-// OTelEnabled reports whether the running gateway exports traces.
-func OTelEnabled() bool {
-	if otel.Load() == nil {
+// enabled is whether it serves and settings say to export.
+func (x *Exporter) enabled() bool {
+	if x.running.Load() == nil {
 		return false
 	}
 	config, err := settings.OTelExport()
 	return err == nil && config.Enabled
 }
 
-func offerOTel(r Record) {
-	if r.SkipOTel {
+// Ledger offers a usage row. One of a request the gateway sent as spans
+// (Watched), or a local agent's turn its own transcript sends, is passed
+// over.
+func (x *Exporter) Ledger(r Record) {
+	if r.Watched {
 		return
 	}
-	e := otel.Load()
+	e := x.running.Load()
 	if e == nil {
 		return
 	}
@@ -126,34 +141,47 @@ func offerOTel(r Record) {
 	if session == "" {
 		session = r.Session
 	}
-	if r.Local && r.CallerKeyID == "" && r.Via == "" && r.OTel == nil && r.Kind == "" && e.sessionObserved(r.Agent, session, config) {
+	if r.Local && r.CallerKeyID == "" && r.Via == "" && r.Kind == "" && e.sessionObserved(r.Agent, session, config) {
 		return
 	}
+	e.offerWith(r, nil, config)
+}
+
+// offerSpan offers one of a watched request's spans.
+func (x *Exporter) offerSpan(r Record, span *OTelSpan) {
+	e := x.running.Load()
+	if e == nil {
+		return
+	}
+	config, err := settings.OTelExport()
+	if err != nil || !config.Enabled {
+		return
+	}
+	e.offerWith(r, span, config)
+}
+
+func (e *otelExporter) offerWith(r Record, span *OTelSpan, config settings.OTel) {
 	if !config.Bodies {
 		r.BodyIn, r.BodyOut = "", ""
 	}
-	e.offer(otelItem{record: r, config: config})
+	e.offer(otelItem{record: r, span: span, config: config})
 }
 
-// OTelBodies is whether calls' request and reply bodies go with their
-// spans (#538): the gateway fills Record.BodyIn/BodyOut only then
-func OTelBodies() bool {
-	if otel.Load() == nil {
-		return false
+// Bodies is how much of the bodies go with the spans (#538): the gateway
+// fills Record.BodyIn/BodyOut only for some, and keeps a reply whole for
+// it only for whole.
+func (x *Exporter) Bodies() usage.Bodies {
+	if x.running.Load() == nil {
+		return usage.NoBodies
 	}
 	config, err := settings.OTelExport()
-	return err == nil && config.Enabled && config.Bodies
-}
-
-// OTelWhole is whether calls' bodies go whole, not cut at the gateway's
-// 256 KiB Recent-calls capture (#538): the gateway keeps the whole reply for
-// the export only then
-func OTelWhole() bool {
-	if otel.Load() == nil {
-		return false
+	switch {
+	case err != nil || !config.Enabled || !config.Bodies:
+		return usage.NoBodies
+	case config.BodiesWhole:
+		return usage.WholeBodies
 	}
-	config, err := settings.OTelExport()
-	return err == nil && config.Enabled && config.Bodies && config.BodiesWhole
+	return usage.CapturedBodies
 }
 
 // recordBytes is how much of a record the queue holds: its bodies, the
@@ -234,11 +262,11 @@ func (e *otelExporter) flush(batch []otelItem) {
 	if err != nil || !config.Enabled {
 		return
 	}
-	var records []Record
+	var records []otelItem
 	for _, it := range batch {
 		// Never send queued records to a new destination or with changed credentials.
 		if reflect.DeepEqual(it.config, config) {
-			records = append(records, it.record)
+			records = append(records, it)
 		}
 	}
 	if len(records) == 0 {
@@ -257,7 +285,7 @@ func (e *otelExporter) flush(batch []otelItem) {
 		if config.Bodies {
 			bytes := 0
 			for j = i; j < len(records) && j < i+step; j++ {
-				bytes += recordBytes(records[j])
+				bytes += recordBytes(records[j].record)
 				if j > i && bytes > otelBodiesBatchBytes {
 					break
 				}
@@ -268,9 +296,9 @@ func (e *otelExporter) flush(batch []otelItem) {
 	}
 	if config.Metrics {
 		ledger := make([]Record, 0, len(records))
-		for _, r := range records {
-			if r.OTel == nil || !r.OTel.Root && !r.OTel.Update && (!r.OTel.Session || r.OTel.Type == "generation") {
-				ledger = append(ledger, r)
+		for _, it := range records {
+			if s := it.span; s == nil || !s.Root && !s.Update && (!s.Session || s.Type == "generation") {
+				ledger = append(ledger, it.record)
 			}
 		}
 		if len(ledger) > 0 {

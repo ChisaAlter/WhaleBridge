@@ -18,7 +18,9 @@ package provider
 // three dots and the refresh token) and the page's own headers; the
 // international site is app 20700, the Chinese one 10300. The session is
 // kept in stepfun-auth.json beside providers.json, readable by the user
-// alone, one per site.
+// alone, one per provider: two StepFun providers on one site can be two
+// accounts, each with its own windows (#2384). The site, which platform
+// is asked, is the provider's (StepFunSite), never the session's.
 
 import (
 	"context"
@@ -27,13 +29,17 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/lastgood"
 )
 
 // stepfunSites are StepFun's two platforms, by the API host a provider uses.
@@ -90,10 +96,11 @@ func StepFunBookmarklet() string {
 		`}catch(e){alert(String(e))}})()`
 }
 
-// SaveStepFunPaste keeps the session the user pasted for the site: what
-// the bookmarklet copied, or the Oasis-Token cookie as the browser's
-// developer tools show it (the access token, three dots, the refresh one).
-func SaveStepFunPaste(ctx context.Context, site, text string) error {
+// SaveStepFunPaste keeps the session the user pasted for the provider id,
+// whose platform is site: what the bookmarklet copied, or the Oasis-Token
+// cookie as the browser's developer tools show it (the access token, three
+// dots, the refresh one).
+func SaveStepFunPaste(ctx context.Context, id, site, text string) error {
 	text = strings.TrimSpace(text)
 	if body, ok := strings.CutPrefix(text, stepfunPaste); ok {
 		var in struct{ Site, Access, Refresh, WebID string }
@@ -103,14 +110,14 @@ func SaveStepFunPaste(ctx context.Context, site, text string) error {
 		if in.Site != site {
 			return fmt.Errorf("that is a sign-in on %s, not %s", strings.TrimPrefix(StepFunOrigin(in.Site), "https://"), strings.TrimPrefix(StepFunOrigin(site), "https://"))
 		}
-		return SaveStepFunSession(ctx, site, in.Access, in.Refresh, in.WebID)
+		return SaveStepFunSession(ctx, id, site, in.Access, in.Refresh, in.WebID)
 	}
 	text, _, _ = strings.Cut(strings.TrimPrefix(text, "Oasis-Token="), ";")
 	access, refresh, ok := strings.Cut(text, "...")
 	if !ok || access == "" || refresh == "" {
 		return errors.New("paste what the bookmarklet copied")
 	}
-	return SaveStepFunSession(ctx, site, access, refresh, "")
+	return SaveStepFunSession(ctx, id, site, access, refresh, "")
 }
 
 // StepFunOrigin is the site's platform.
@@ -131,12 +138,95 @@ var stepfunMu sync.Mutex
 
 func stepfunPath() string { return filepath.Join(filepath.Dir(Path()), "stepfun-auth.json") }
 
+// loadStepFun is every provider's session, by provider id; the caller
+// holds stepfunMu. A file that doesn't parse is no session, and is left
+// as it is (saveStepFun keeps it aside before a sign-in writes over it).
+// One written before #2384 kept a session per site ("ai", "com"): it is
+// given to the StepFun providers on that site and written back
+// (stepfunBySite), so nobody signs in again for the upgrade.
 func loadStepFun() map[string]stepfunSession {
 	out := map[string]stepfunSession{}
-	if b, err := os.ReadFile(stepfunPath()); err == nil {
-		_ = json.Unmarshal(b, &out)
+	b, err := os.ReadFile(stepfunPath())
+	if err != nil {
+		return out
+	}
+	if json.Unmarshal(b, &out) != nil {
+		return map[string]stepfunSession{}
+	}
+	if moved, ok := stepfunBySite(out); ok {
+		_ = saveStepFun(moved) // not written, it is moved again on the next read
+		return moved
 	}
 	return out
+}
+
+// stepfunOldSites are the keys stepfun-auth.json had before #2384, when
+// a session was kept per site.
+var stepfunOldSites = []string{"ai", "com"}
+
+// stepfunBySite is all with each session kept under a site's name given to
+// the StepFun providers on that site instead, and whether there was any.
+// One provider on the site: it was clearly theirs. Several: each gets it,
+// so none loses its windows, and the user brings another account's sign-in
+// to the ones that are someone else's (those copies are one sign-in, and
+// are renewed together until then: stepfunNow). A provider with a session
+// of its own keeps it. With providers.json unreadable, or no StepFun
+// provider on the site yet, the session waits where it is.
+func stepfunBySite(all map[string]stepfunSession) (map[string]stepfunSession, bool) {
+	var old []string
+	for _, site := range stepfunOldSites {
+		if _, ok := all[site]; ok {
+			old = append(old, site)
+		}
+	}
+	if len(old) == 0 {
+		return nil, false
+	}
+	f, err := read()
+	if err != nil {
+		return nil, false
+	}
+	out := maps.Clone(all)
+	moved := false
+	for _, site := range old {
+		var to []string
+		for _, p := range f.Providers {
+			if StepFunSite(normalize(p)) == site {
+				to = append(to, p.ID)
+			}
+		}
+		if len(to) == 0 {
+			continue
+		}
+		for _, id := range to {
+			if _, own := out[id]; !own {
+				out[id] = all[site]
+			}
+		}
+		// a StepFun provider whose id is the site's name has it already
+		if !slices.Contains(to, site) {
+			delete(out, site)
+		}
+		moved = true
+	}
+	return out, moved
+}
+
+// forgetStepFun drops the provider's session, when it is removed.
+func forgetStepFun(id string) error { return SignOutStepFun(id) }
+
+// renameStepFun moves the provider's session with it to its new id.
+func renameStepFun(from, to string) error {
+	stepfunMu.Lock()
+	defer stepfunMu.Unlock()
+	all := loadStepFun()
+	s, ok := all[from]
+	if !ok {
+		return nil
+	}
+	delete(all, from)
+	all[to] = s
+	return saveStepFun(all)
 }
 
 func saveStepFun(all map[string]stepfunSession) error {
@@ -145,6 +235,11 @@ func saveStepFun(all map[string]stepfunSession) error {
 		return err
 	}
 	if err := os.MkdirAll(filepath.Dir(stepfunPath()), 0o700); err != nil {
+		return err
+	}
+	// loadStepFun reads a file that doesn't parse as no session: what it
+	// held, every provider's sign-in, is kept aside before it is written over
+	if err := lastgood.KeepUnparsed(stepfunPath(), lastgood.Into[map[string]stepfunSession]); err != nil {
 		return err
 	}
 	return writeFileAtomic(stepfunPath(), b)
@@ -180,17 +275,18 @@ func (c stepfunClaims) account() string {
 	return ""
 }
 
-// StepFunSignedIn reports whether magpie has a sign-in on the site.
-func StepFunSignedIn(site string) bool {
+// StepFunSignedIn reports whether magpie has a sign-in for the provider.
+func StepFunSignedIn(id string) bool {
 	stepfunMu.Lock()
 	defer stepfunMu.Unlock()
-	return loadStepFun()[site].Access != ""
+	return loadStepFun()[id].Access != ""
 }
 
 // SaveStepFunSession keeps the session the sign-in page ended in, once
 // the platform has taken it: a page that isn't signed in yet has an
-// anonymous one, which is refused here.
-func SaveStepFunSession(ctx context.Context, site, access, refresh, webID string) error {
+// anonymous one, which is refused here. It is the provider id's alone; site
+// is the provider's platform.
+func SaveStepFunSession(ctx context.Context, id, site, access, refresh, webID string) error {
 	if _, ok := stepfunSites[site]; !ok {
 		return fmt.Errorf("no StepFun site %q", site)
 	}
@@ -220,19 +316,19 @@ func SaveStepFunSession(ctx context.Context, site, access, refresh, webID string
 	}
 	stepfunMu.Lock()
 	all := loadStepFun()
-	all[site] = s
+	all[id] = s
 	err := saveStepFun(all)
 	stepfunMu.Unlock()
 	forgetPlanQuotas()
 	return err
 }
 
-// SignOutStepFun forgets the site's sign-in.
-func SignOutStepFun(site string) error {
+// SignOutStepFun forgets the provider's sign-in, and no other's.
+func SignOutStepFun(id string) error {
 	stepfunMu.Lock()
 	all := loadStepFun()
-	_, had := all[site]
-	delete(all, site)
+	_, had := all[id]
+	delete(all, id)
 	var err error
 	if had {
 		err = saveStepFun(all)
@@ -310,13 +406,16 @@ func renewStepFun(ctx context.Context, site string, s stepfunSession) (stepfunSe
 	return s, nil
 }
 
-// stepfunNow is the site's session, renewed first when it is about to run
-// out, and kept.
-func stepfunNow(ctx context.Context, site string, force bool) (stepfunSession, error) {
+// stepfunNow is the provider's session, renewed on its site first when it
+// is about to run out, and kept. Another provider holding the same session
+// (one sign-in the upgrade gave to every provider on its site, or the same
+// one brought to two) is renewed with it: the platform may end the refresh
+// token a renewal replaces, which would sign that one out.
+func stepfunNow(ctx context.Context, id, site string, force bool) (stepfunSession, error) {
 	stepfunMu.Lock()
 	defer stepfunMu.Unlock()
 	all := loadStepFun()
-	s, ok := all[site]
+	s, ok := all[id]
 	if !ok || s.Access == "" {
 		return s, errStepFunSession
 	}
@@ -327,15 +426,19 @@ func stepfunNow(ctx context.Context, site string, force bool) (stepfunSession, e
 	if err != nil {
 		return s, err
 	}
-	all[site] = n
+	for k, o := range all {
+		if k == id || o.Refresh == s.Refresh && o.Account == s.Account {
+			all[k] = n
+		}
+	}
 	_ = saveStepFun(all)
 	return n, nil
 }
 
-// stepfunAsk calls the platform as the site's session, renewing it once
-// when the platform says it has run out.
-func stepfunAsk(ctx context.Context, site, path string, dst any) error {
-	s, err := stepfunNow(ctx, site, false)
+// stepfunAsk calls the site's platform as the provider's session, renewing
+// it once when the platform says it has run out.
+func stepfunAsk(ctx context.Context, id, site, path string, dst any) error {
+	s, err := stepfunNow(ctx, id, site, false)
 	if err != nil {
 		return err
 	}
@@ -343,7 +446,7 @@ func stepfunAsk(ctx context.Context, site, path string, dst any) error {
 	if !errors.Is(err, errStepFunSession) {
 		return err
 	}
-	if s, err = stepfunNow(ctx, site, true); err != nil {
+	if s, err = stepfunNow(ctx, id, site, true); err != nil {
 		return err
 	}
 	return stepfunCall(ctx, site, s, path, dst)
@@ -454,11 +557,13 @@ func readStepPlanStatus(b []byte) (plan string, until *time.Time, renew string) 
 	return plan, until, renew
 }
 
-// stepPlanQuota is the site's Step Plan as a card, for the provider p.
-func stepPlanQuota(ctx context.Context, site string, p Provider) SubscriptionQuota {
+// stepPlanQuota is the provider's Step Plan as a card, asked with its own
+// sign-in.
+func stepPlanQuota(ctx context.Context, p Provider) SubscriptionQuota {
+	site := StepFunSite(p)
 	q := SubscriptionQuota{Provider: p.ID, Name: p.Name, Icon: p.Icon, Windows: []QuotaWindow{}}
 	var raw json.RawMessage
-	if err := stepfunAsk(ctx, site, "/api/step.openapi.devcenter.Dashboard/QueryStepPlanRateLimit", &raw); err != nil {
+	if err := stepfunAsk(ctx, p.ID, site, "/api/step.openapi.devcenter.Dashboard/QueryStepPlanRateLimit", &raw); err != nil {
 		q.Error = err.Error()
 		return q
 	}
@@ -469,7 +574,7 @@ func stepPlanQuota(ctx context.Context, site string, p Provider) SubscriptionQuo
 	}
 	q.Windows = append(q.Windows, ws...)
 	var status json.RawMessage
-	if stepfunAsk(ctx, site, "/api/step.openapi.devcenter.Dashboard/GetStepPlanStatus", &status) == nil {
+	if stepfunAsk(ctx, p.ID, site, "/api/step.openapi.devcenter.Dashboard/GetStepPlanStatus", &status) == nil {
 		q.Plan, q.Until, q.Renew = readStepPlanStatus(status)
 	}
 	switch {
@@ -481,33 +586,27 @@ func stepPlanQuota(ctx context.Context, site string, p Provider) SubscriptionQuo
 	return q
 }
 
-// stepPlanQuotas is a card for each StepFun site magpie is signed in to
-// that a provider in use is on, named for the first such provider.
+// stepPlanQuotas is a card for each StepFun provider in use that magpie
+// has a sign-in for: one per provider, not per site, as two on one site
+// can be two accounts (#2384).
 func stepPlanQuotas(ctx context.Context) []SubscriptionQuota {
-	seen := map[string]bool{}
-	type job struct {
-		site string
-		p    Provider
-	}
-	var jobs []job
+	var jobs []Provider
 	for _, p := range All() {
 		if p.Hidden || p.Off {
 			continue
 		}
-		site := StepFunSite(p)
-		if site == "" || seen[site] || !wantsCard(ctx, p.ID, "") || !StepFunSignedIn(site) {
+		if StepFunSite(p) == "" || !wantsCard(ctx, p.ID, "") || !StepFunSignedIn(p.ID) {
 			continue
 		}
-		seen[site] = true
-		jobs = append(jobs, job{site, p})
+		jobs = append(jobs, p)
 	}
 	out := make([]SubscriptionQuota, len(jobs))
 	var wg sync.WaitGroup
-	for i, j := range jobs {
+	for i, p := range jobs {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			out[i] = stepPlanQuota(ctx, j.site, j.p)
+			out[i] = stepPlanQuota(ctx, p)
 		}()
 	}
 	wg.Wait()

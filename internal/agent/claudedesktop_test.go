@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -287,6 +288,120 @@ func TestClaudeDesktopChangedSince(t *testing.T) {
 	}
 	if _, err := os.Stat(p.prof); !os.IsNotExist(err) {
 		t.Error("magpie's profile is still there")
+	}
+}
+
+// #2035 (capiton0): settings the user made in Desktop's third-party window
+// live in magpie's profile. Switching Desktop off magpie and on again
+// brings them back, the gateway's address and key set anew.
+func TestClaudeDesktopOffOnKeepsTheUsersSettings(t *testing.T) {
+	home, p := desktopSandbox(t)
+	os.MkdirAll(p.dir, 0o755)
+	a := claudeDesktop(home)
+	f := a.Field("provider")
+	if err := f.Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	desktopWrite(t, p.prof, `{"inferenceProvider":"gateway","inferenceGatewayBaseUrl":"http://old:1","inferenceGatewayApiKey":"old","inferenceGatewayAuthScheme":"bearer",`+
+		`"disableDeploymentModeChooser":false,"coworkEgressAllowedHosts":["corp.example"],"inferenceModels":["claude-opus-4-7"],"isClaudeCodeForDesktopEnabled":true}`)
+	if err := f.Set(""); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(p.prof); !os.IsNotExist(err) {
+		t.Fatal("magpie's profile is still there after off")
+	}
+	if err := f.Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	prof := desktopJSON(t, p.prof)
+	want := map[string]any{
+		"inferenceProvider": "gateway", "inferenceGatewayBaseUrl": gateway.URL(),
+		"inferenceGatewayApiKey": "magpie-claude-desktop", "inferenceGatewayAuthScheme": "bearer",
+		"disableDeploymentModeChooser": false, "coworkEgressAllowedHosts": []any{"corp.example"},
+		"inferenceModels": []any{"claude-opus-4-7"}, "isClaudeCodeForDesktopEnabled": true,
+	}
+	if !reflect.DeepEqual(prof, want) {
+		t.Errorf("profile after off and on:\n%v\nwant\n%v", prof, want)
+	}
+	if f.Get() != "magpie" || a.Check() != "" {
+		t.Errorf("get %q, check %q", f.Get(), a.Check())
+	}
+}
+
+// #2035 (capiton0): a profile the user made in Desktop's window for
+// magpie's gateway, applied when magpie is switched on, starts magpie's
+// profile: their settings (as they posted them) are kept, only the
+// gateway's address, key and auth scheme set. Their own profile is left
+// as it was and applied again when magpie is switched off.
+func TestClaudeDesktopOnKeepsTheUsersOwnGatewayProfile(t *testing.T) {
+	home, p := desktopSandbox(t)
+	const theirs = `{
+  "inferenceGatewayBaseUrl": "` + "%s" + `",
+  "inferenceGatewayApiKey": "magpie",
+  "sshHostAllowlist": ["*"],
+  "chatTabEnabled": true,
+  "chatAdvancedFileAnalysisEnabled": true,
+  "isDesktopExtensionEnabled": true,
+  "modelPrefer1mContext": true,
+  "defaultModelEffort": "max",
+  "autoModeEnabled": true,
+  "toolSearchEnabled": true,
+  "skipWebFetchPreflight": true,
+  "coworkEgressAllowedHosts": ["*"],
+  "disableDeploymentModeChooser": true,
+  "disableDeepLinkRegistration": true,
+  "inferenceProvider": "gateway",
+  "inferenceCredentialKind": "static"
+}`
+	own := filepath.Join(p.library, "5b0d0c6e-1f2a-4c3b-9d4e-0a1b2c3d4e5f.json")
+	body := fmt.Sprintf(theirs, gateway.URL())
+	desktopWrite(t, own, body)
+	desktopWrite(t, p.meta, `{"appliedId":"5b0d0c6e-1f2a-4c3b-9d4e-0a1b2c3d4e5f","entries":[{"id":"5b0d0c6e-1f2a-4c3b-9d4e-0a1b2c3d4e5f","name":"mine"}]}`)
+	a := claudeDesktop(home)
+	f := a.Field("provider")
+	if err := f.Set("magpie"); err != nil {
+		t.Fatal(err)
+	}
+	var want map[string]any
+	json.Unmarshal([]byte(body), &want)
+	want["inferenceGatewayApiKey"] = "magpie-claude-desktop"
+	want["inferenceGatewayAuthScheme"] = "bearer"
+	if prof := desktopJSON(t, p.prof); !reflect.DeepEqual(prof, want) {
+		t.Errorf("magpie's profile:\n%v\nwant\n%v", prof, want)
+	}
+	if b, _ := os.ReadFile(own); string(b) != body {
+		t.Errorf("their profile was changed:\n%s", b)
+	}
+	if err := f.Set(""); err != nil {
+		t.Fatal(err)
+	}
+	if id, _ := desktopJSON(t, p.meta)["appliedId"].(string); id != "5b0d0c6e-1f2a-4c3b-9d4e-0a1b2c3d4e5f" {
+		t.Errorf("applied after off: %q", id)
+	}
+	if b, _ := os.ReadFile(own); string(b) != body {
+		t.Errorf("their profile after off:\n%s", b)
+	}
+}
+
+// A profile for somewhere else (another gateway, Bedrock) is not carried
+// into magpie's: its models and settings are for that place.
+func TestClaudeDesktopOnLeavesOtherProfilesOut(t *testing.T) {
+	for name, prof := range map[string]string{
+		"other gateway": `{"inferenceProvider":"gateway","inferenceGatewayBaseUrl":"https://llm.example.com","inferenceModels":["corp-model"],"chatTabEnabled":true}`,
+		"bedrock":       `{"inferenceProvider":"bedrock","inferenceBedrockRegion":"us-east-1","chatTabEnabled":true}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			home, p := desktopSandbox(t)
+			desktopWrite(t, filepath.Join(p.library, "abc.json"), prof)
+			desktopWrite(t, p.meta, `{"appliedId":"abc","entries":[{"id":"abc","name":"mine"}]}`)
+			if err := claudeDesktop(home).Field("provider").Set("magpie"); err != nil {
+				t.Fatal(err)
+			}
+			got := desktopJSON(t, p.prof)
+			if _, ok := got["chatTabEnabled"]; ok {
+				t.Errorf("magpie's profile took another place's settings: %v", got)
+			}
+		})
 	}
 }
 

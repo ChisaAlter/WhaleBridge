@@ -1,4 +1,4 @@
-package usage
+package otlp
 
 import (
 	"context"
@@ -8,6 +8,7 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/redact"
 	"github.com/ChisaAlter/WhaleBridge/internal/sessions"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/usage"
 )
 
 type sessionAvailability struct {
@@ -20,14 +21,14 @@ type observedSession struct {
 	agent, id string
 }
 
-// OTelSessionAgent reports recent observations for callers without a session ID.
-func OTelSessionAgent(agent string) bool { return OTelSession(agent, "") }
+// SessionAgent reports recent observations for callers without a session ID.
+func (x *Exporter) SessionAgent(agent string) bool { return x.Session(agent, "") }
 
-// OTelSession reports whether this exact agent/session has recent local
+// Session reports whether this exact agent/session has recent local
 // observations. Only requests without an ID fall back to agent-level readiness.
 // Callers must also verify loopback and absence of a gateway key.
-func OTelSession(agent, session string) bool {
-	e := otel.Load()
+func (x *Exporter) Session(agent, session string) bool {
+	e := x.running.Load()
 	if e == nil || !sessions.TraceAgent(agent) {
 		return false
 	}
@@ -35,13 +36,13 @@ func OTelSession(agent, session string) bool {
 	return err == nil && e.sessionObserved(agent, session, config)
 }
 
-// OTelSessionFresh resolves a cached miss once before the gateway exports its
+// SessionFresh resolves a cached miss once before the gateway exports its
 // first attempt. Requests without a native ID retain observed-agent readiness.
-func OTelSessionFresh(agent, session string) bool {
-	if OTelSession(agent, session) {
+func (x *Exporter) SessionFresh(agent, session string) bool {
+	if x.Session(agent, session) {
 		return true
 	}
-	e := otel.Load()
+	e := x.running.Load()
 	if e == nil || session == "" {
 		return false
 	}
@@ -80,21 +81,21 @@ func sessionBody(body string, config settings.OTel) string {
 		cut = true
 	}
 	if cut {
-		body += BodyCut
+		body += usage.BodyCut
 	}
 	return body
 }
-func sessionRecord(s sessions.TraceSpan, config settings.OTel) Record {
+func sessionRecord(s sessions.TraceSpan, config settings.OTel) (Record, *OTelSpan) {
 	status := 200
 	if s.Error {
 		status = 500
 	}
 	typ := s.Kind
 	return Record{Agent: s.Agent, Model: s.Model, Served: s.Served, Provider: s.Provider, Time: s.Start, Millis: s.End.Sub(s.Start).Milliseconds(), Status: status,
-		Input: s.Tokens.Input, Output: s.Tokens.Output, CacheRead: s.Tokens.CacheRead, CacheWrite: s.Tokens.CacheWrite, CacheWrite1h: s.Tokens.CacheWrite1h, Reasoning: s.Reasoning,
-		BodyIn: sessionBody(s.Input, config), BodyOut: sessionBody(s.Output, config),
-		OTel: &OTelSpan{TraceID: sessions.TraceID(s.Agent, s.Session, s.Turn), SpanID: s.ID, ParentID: s.Parent, Root: s.Parent == "", End: s.End,
-			Name: s.Name, Type: typ, SessionID: s.Session, TraceName: s.Agent + " interaction", Session: true, Inferred: s.Inferred, Update: s.Update}}
+			Input: s.Tokens.Input, Output: s.Tokens.Output, CacheRead: s.Tokens.CacheRead, CacheWrite: s.Tokens.CacheWrite, CacheWrite1h: s.Tokens.CacheWrite1h, Reasoning: s.Reasoning,
+			BodyIn: sessionBody(s.Input, config), BodyOut: sessionBody(s.Output, config)},
+		&OTelSpan{TraceID: sessions.TraceID(s.Agent, s.Session, s.Turn), SpanID: s.ID, ParentID: s.Parent, Root: s.Parent == "", End: s.End,
+			Name: s.Name, Type: typ, SessionID: s.Session, TraceName: s.Agent + " interaction", Session: true, Inferred: s.Inferred, Update: s.Update}
 }
 
 func (e *otelExporter) offerSession(s sessions.TraceSpan, config settings.OTel) {
@@ -102,7 +103,8 @@ func (e *otelExporter) offerSession(s sessions.TraceSpan, config settings.OTel) 
 	// Sending the empty start root and later reusing its ID can leave Langfuse
 	// displaying the empty copy even though the completed copy has bodies.
 	if !s.Pending {
-		e.offer(otelItem{record: sessionRecord(s, config), config: config})
+		r, span := sessionRecord(s, config)
+		e.offer(otelItem{record: r, span: span, config: config})
 	}
 }
 

@@ -30,9 +30,10 @@ func fx(home string) *Agent { return fxIn(here(home)) }
 // fxIn is fx at a place: this machine's home, or a WSL distro's (see
 // wsl.go), its provider naming the gateway as the distro reaches it.
 func fxIn(at place) *Agent {
-	fxProvider := func(cur string) any { return fxProviderAt(cur, at.v1()) }
 	dir := filepath.Join(at.home, ".fx")
 	path := filepath.Join(dir, "settings.json")
+	// magpie's provider, with what the user set on it in fx kept
+	fxProvider := func(cur string) any { return fxKept(path, fxProviderAt(cur, at.v1())) }
 	get := func(k string) string { v, _ := edit.GetJSON(path, k); return v }
 	// the provider fx talks to; unset, it is Vercel's AI Gateway
 	prov := func() string {
@@ -147,7 +148,7 @@ func fxModels(path string) map[string]string {
 // reaching the gateway's /v1 at v1. Its model_metadata is what fx's model
 // picker lists: the catalog, the model in use first so it is never the one
 // cut at fx's limit.
-func fxProviderAt(cur, v1 string) any {
+func fxProviderAt(cur, v1 string) map[string]any {
 	all := magpieModels("fx")
 	slices.SortStableFunc(all, func(a, b catalog.Model) int {
 		switch {
@@ -177,6 +178,22 @@ func fxProviderAt(cur, v1 string) any {
 		"protocol": "openai-chat-completions", "base_url": v1, "auth": map[string]any{"type": "none"},
 		"tool_choice_mode": "send", "model_metadata": ms,
 	}
+}
+
+// fxKept is want, magpie's provider in fx's settings.json at path, with
+// what the user set on the one there kept: fx takes a reviewer_model on a
+// provider (the model its auto permission mode asks), which magpie doesn't
+// write, and a tool_choice_mode, which magpie writes "send" and the user
+// may turn to "omit" (src/core/config/configured_provider.zig); a sync wrote
+// both away on every start, as T3 Code's did (#2030). Its protocol,
+// address, auth and model_metadata are magpie's; auth is written whole, as
+// fx refuses an env beside type none.
+func fxKept(path string, want map[string]any) any {
+	key := "providers." + magpieID
+	if mode, ok := edit.GetJSON(path, key+".tool_choice_mode"); ok && (mode == "omit" || mode == "send") {
+		want["tool_choice_mode"] = mode
+	}
+	return theirsKept(path, key, func() any { return want }, "model_metadata", "auth")()
 }
 
 // what fx says after a change (notice.go)

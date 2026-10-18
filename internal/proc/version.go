@@ -32,6 +32,9 @@ func Version(bin string) string {
 	if v := npmVersion(real); v != "" {
 		return v
 	}
+	if v := shimVersion(real); v != "" {
+		return v
+	}
 	stamp := fmt.Sprint(real, st.Size(), st.ModTime().UnixNano())
 	versionsFailed.Lock()
 	failed := versionsFailed.m[bin] == stamp
@@ -65,7 +68,10 @@ var runVersion = func(bin string) (string, error) {
 	defer cancel()
 	cmd := ProbeContext(ctx, bin, "--version")
 	cmd.Stdin = nil // /dev/null: one that would ask something gets nothing
-	cmd.Env = append(os.Environ(), "NO_COLOR=1")
+	// Cline checks for an update on every start, --version too, and at exit
+	// spawns a detached npm install -g cline@latest the user never asked
+	// for (新v学员 on Discord); asking its version mustn't update it.
+	cmd.Env = append(os.Environ(), "NO_COLOR=1", "CLINE_NO_AUTO_UPDATE=1")
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() != nil {
 		return "", ctx.Err()
@@ -94,4 +100,45 @@ func npmVersion(real string) string {
 			return p.Version
 		}
 	}
+}
+
+// shimVersion is the version of the npm package a shim at real starts, ""
+// when real is no shim. npm on Windows puts a cline.cmd (and .ps1, and a sh
+// script) beside node_modules, not a link into it, so npmVersion can't
+// follow it; the shim names %dp0%\node_modules\cline\bin\cline, and that
+// package's package.json says the version without running anything.
+func shimVersion(real string) string {
+	st, err := os.Stat(real)
+	if err != nil || st.IsDir() || st.Size() > 64<<10 {
+		return ""
+	}
+	b, err := os.ReadFile(real)
+	if err != nil {
+		return ""
+	}
+	text := strings.ReplaceAll(string(b), `\`, "/")
+	const nm = "/node_modules/"
+	i := strings.Index(text, nm)
+	if i < 0 {
+		return ""
+	}
+	parts := strings.SplitN(text[i+len(nm):], "/", 3)
+	if len(parts) < 2 {
+		return ""
+	}
+	pkg := parts[0]
+	if strings.HasPrefix(pkg, "@") {
+		pkg += "/" + parts[1]
+	}
+	if pkg == "" || strings.ContainsAny(pkg, " \t\r\n\"'%$") {
+		return ""
+	}
+	var p struct {
+		Version string `json:"version"`
+	}
+	b, err = os.ReadFile(filepath.Join(filepath.Dir(real), "node_modules", filepath.FromSlash(pkg), "package.json"))
+	if err != nil || json.Unmarshal(b, &p) != nil {
+		return ""
+	}
+	return p.Version
 }

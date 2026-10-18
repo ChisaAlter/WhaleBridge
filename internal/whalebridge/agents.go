@@ -420,6 +420,10 @@ type agentModel struct {
 	FastFor string `json:"fastFor,omitempty"`
 	Fast    bool   `json:"fast,omitempty"`
 	OwnFast bool   `json:"ownFast,omitempty"`
+	// CanUltra: a fast pick of it can go as Ultrafast (a Codex account offers
+	// the tier on the model); Ultra: the agent's requests for it do.
+	CanUltra bool `json:"canUltra,omitempty"`
+	Ultra    bool `json:"ultra,omitempty"`
 }
 
 func agentModelList(a *agent.Agent) []agentModel {
@@ -428,6 +432,7 @@ func agentModelList(a *agent.Agent) []agentModel {
 	off := provider.ModelOff(id)
 	vals := a.Values()
 	out := []agentModel{}
+	var ultra map[string]bool
 	for _, e := range listed {
 		m := agentModel{ID: e.ID, Name: e.Name, Group: e.Provider.Name, Context: e.Context, Hidden: off(e.ID)}
 		if m.Name == "" {
@@ -451,6 +456,10 @@ func agentModelList(a *agent.Agent) []agentModel {
 		}
 		if e.Group == "" && provider.CanFast(e.Provider, e.Model) {
 			m.FastFor, m.Fast, m.OwnFast = id, provider.IsFastPick(id, e.ID), provider.OwnFast(e.Provider, e.Model)
+			if ultra == nil {
+				ultra = provider.UltraModels()
+			}
+			m.CanUltra, m.Ultra = provider.UltraOn(e.Provider, e.Model, ultra), provider.IsUltraPick(id, e.ID)
 		}
 		out = append(out, m)
 	}
@@ -549,6 +558,9 @@ func agentModelRoutes(mux *http.ServeMux) {
 		var in struct {
 			ID, For, Ref string
 			Fast         bool
+			// Tier, when sent: "" the usual speed, "priority" fast,
+			// "ultrafast" Ultrafast where the account offers it
+			Tier *string
 		}
 		if err := decode(w, r, &in); err != nil {
 			agentFailure(w, err, 400)
@@ -566,14 +578,16 @@ func agentModelRoutes(mux *http.ServeMux) {
 		if err == nil && in.For != "" && in.For != a.ListsFor() {
 			err = fmt.Errorf("模型名单不属于这个 Agent")
 		}
-		if err == nil {
+		if err == nil && in.Tier != nil {
+			err = provider.SetFastTier(a.ListsFor(), in.Ref, *in.Tier)
+		} else if err == nil {
 			err = provider.SetFastPick(a.ListsFor(), in.Ref, in.Fast)
 		}
 		if err != nil {
 			agentFailure(w, err, 400)
 			return
 		}
-		writeJSON(w, map[string]any{"ok": true, "fast": provider.IsFastPick(a.ListsFor(), in.Ref)})
+		writeJSON(w, map[string]any{"ok": true, "fast": provider.IsFastPick(a.ListsFor(), in.Ref), "ultra": provider.IsUltraPick(a.ListsFor(), in.Ref)})
 	})
 }
 

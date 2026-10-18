@@ -141,6 +141,7 @@ func supplierInfo(p provider.Provider) map[string]any {
 		if n, ok := set.ModelEfforts[p.ID+"/"+m.ID]; ok {
 			row["kept"] = n
 		}
+		row["reasonless"] = provider.Reasonless(p.ID, m.ID)
 		if len(provider.EffortsOf(m)) == 0 {
 			row["efforts"], row["given"] = provider.Levels, true
 		}

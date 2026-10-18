@@ -11,11 +11,12 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/jsonc"
-	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 )
 
 // Hooks (#1790) are commands an agent runs at a point of its turn: when
@@ -38,6 +39,10 @@ import (
 // Hook is a command the agents ticked for it run at Event.
 type Hook struct {
 	Name string `json:"name"`
+	// Description says what the hook is for, in any language (#2011):
+	// the name is letters, digits, - and _, which says little to someone
+	// who reads Chinese. Only the library keeps it; no agent is given it.
+	Description string `json:"description,omitempty"`
 	// Event is a portable event (HookEvents), or an agent's own,
 	// "<agent>:<Event>" as that agent names it
 	Event string `json:"event"`
@@ -72,15 +77,59 @@ type hookSpec struct {
 	tools  map[string]string // shell, edit → the agent's matcher for them
 	flat   bool              // Cursor: an entry is the command itself, not a group of them
 	ms     bool              // Gemini: timeouts in milliseconds
+	toml   bool              // Grok: hooks are [[hooks.<Event>]] tables in config.toml, not JSON
 }
 
 // hookAgents are the agents magpie can give hooks to.
-var hookAgents = []string{"claude", "codex", "cursor", "gemini"}
+var hookAgents = []string{"claude", "codex", "cursor", "gemini", "grok", "grok-app"}
+
+// grokHookEvents are the events the Grok CLI fires (docs/user-guide/10-hooks.md),
+// shared by Grok Build and the Grok App that runs it. Only the ones magpie
+// maps a portable event to, plus an agent's own ("grok:Stop"), are offered;
+// the rest are listed so an own-event hook can name any of them.
+var grokHookEvents = []string{"SessionStart", "SessionEnd", "UserPromptSubmit", "PreToolUse", "PostToolUse",
+	"PostToolUseFailure", "PermissionDenied", "Stop", "StopFailure", "StopCancelled", "Notification",
+	"SubagentStart", "SubagentStop", "PreCompact", "PostCompact"}
+
+// grokHookTools is Grok's own tool names for a portable tool matcher. Grok also
+// reads Claude's names (Bash → run_terminal_command, Edit|Write|MultiEdit →
+// search_replace), so the shared Claude tools would do; these are its own.
+var grokHookTools = map[string]string{
+	"shell": "run_terminal_command",
+	"edit":  "search_replace",
+}
+
+// grokHookSpec is how the Grok CLI keeps hooks: [[hooks.<Event>]] array tables
+// in its config.toml, each with a [[hooks.<Event>.hooks]] child holding the
+// command. Grok Build reads ~/.grok/config.toml; Grok App, on a custom route,
+// reads agent-home/config.toml. Both are the same shape.
+func grokHookSpec(path string) *hookSpec {
+	return &hookSpec{
+		path: path,
+		events: map[string]string{
+			"turn-end": "Stop", "after-tool": "PostToolUse", "before-tool": "PreToolUse",
+			"prompt": "UserPromptSubmit", "session-start": "SessionStart",
+		},
+		native: grokHookEvents,
+		tools:  grokHookTools,
+		toml:   true,
+	}
+}
 
 // toolEvents are the portable events that take a matcher.
 var toolEvents = []string{"after-tool", "before-tool"}
 
 // hookSpecOf is how t keeps its hooks, or why magpie can't give it any.
+// claudeHookEvents are every hook event Claude Code has, in its own order:
+// the HOOK_EVENTS enum in claude 2.1.296. A settings.json hook under any
+// other name is one Claude Code never runs (#2020, emo172).
+var claudeHookEvents = []string{"PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch", "Notification",
+	"UserPromptSubmit", "UserPromptExpansion", "SessionStart", "SessionEnd", "Stop", "StopFailure", "SubagentStart",
+	"SubagentStop", "PreCompact", "PostCompact", "PreModelSwitch", "PostModelSwitch", "PermissionRequest",
+	"PermissionDenied", "Setup", "TeammateIdle", "TaskCreated", "TaskCompleted", "Elicitation", "ElicitationResult",
+	"ConfigChange", "WorktreeCreate", "WorktreeRemove", "InstructionsLoaded", "CwdChanged", "FileChanged",
+	"DirectoryAdded", "MessageDisplay"}
+
 func hookSpecOf(t *Target) (*hookSpec, string) {
 	if t.Agent.WSL != "" {
 		return nil, fmt.Sprintf("magpie gives hooks only to agents on this computer, not yet to %s in WSL", t.Agent.Name)
@@ -91,9 +140,8 @@ func hookSpecOf(t *Target) (*hookSpec, string) {
 			path: filepath.Join(claudeDir(), "settings.json"),
 			events: map[string]string{"turn-end": "Stop", "after-tool": "PostToolUse", "before-tool": "PreToolUse",
 				"prompt": "UserPromptSubmit", "session-start": "SessionStart"},
-			native: []string{"PreToolUse", "PostToolUse", "PostToolUseFailure", "PermissionRequest", "Notification", "UserPromptSubmit",
-				"Stop", "SubagentStart", "SubagentStop", "PreCompact", "SessionStart", "SessionEnd"},
-			tools: map[string]string{"shell": "Bash", "edit": "Edit|Write|MultiEdit"},
+			native: claudeHookEvents,
+			tools:  map[string]string{"shell": "Bash", "edit": "Edit|Write|MultiEdit"},
 		}, ""
 	case "codex":
 		// codex-rs/hooks: hooks.json beside config.toml, whose events are
@@ -128,6 +176,13 @@ func hookSpecOf(t *Target) (*hookSpec, string) {
 			tools: map[string]string{"shell": "Shell", "edit": "Write"},
 			flat:  true,
 		}, ""
+	case "grok":
+		// Grok Build: [[hooks.<Event>]] tables in ~/.grok/config.toml
+		return grokHookSpec(filepath.Join(grokDir(), "config.toml")), ""
+	case "grok-app":
+		// Grok App runs the same CLI, on a custom route reading
+		// agent-home/config.toml, the same [[hooks.<Event>]] shape
+		return grokHookSpec(t.MCP.Path), ""
 	}
 	return nil, fmt.Sprintf("%s has no hooks magpie can write", t.Agent.Name)
 }
@@ -135,7 +190,7 @@ func hookSpecOf(t *Target) (*hookSpec, string) {
 // event is the agent's own name for h's event, or why it has none.
 func (sp *hookSpec) event(agent string, h *Hook) (string, error) {
 	if a, ev, ok := strings.Cut(h.Event, ":"); ok {
-		if a != agent {
+		if !sameHookFamily(a, agent) {
 			return "", fmt.Errorf("%s is an event of another agent's", ev)
 		}
 		if !slices.Contains(sp.native, ev) {
@@ -149,8 +204,8 @@ func (sp *hookSpec) event(agent string, h *Hook) (string, error) {
 	return "", fmt.Errorf("no event called %s", h.Event)
 }
 
-// entry is h as the agent's file holds it, under event ev.
-func (sp *hookSpec) entry(h *Hook) json.RawMessage {
+// entry is h as the agent's file holds it, under its event ev.
+func (sp *hookSpec) entry(h *Hook, ev string) json.RawMessage {
 	m := h.Matcher
 	if !strings.Contains(h.Event, ":") {
 		m = sp.tools[h.Matcher] // "" for none, and for an event that takes no matcher
@@ -158,6 +213,13 @@ func (sp *hookSpec) entry(h *Hook) json.RawMessage {
 	timeout := h.Timeout
 	if sp.ms {
 		timeout *= 1000
+	}
+	if sp.toml {
+		// Grok: a [[hooks.<Event>]] table with a [[hooks.<Event>.hooks]]
+		// child. The block text is what goes in the file and what is
+		// recorded (as a JSON string) so an entry the user changed is
+		// theirs, exactly as with a JSON agent's.
+		return json.RawMessage(grokHookBlock(ev, m, h.Command, timeout))
 	}
 	var v any
 	if sp.flat {
@@ -181,12 +243,59 @@ func (sp *hookSpec) entry(h *Hook) json.RawMessage {
 	return b
 }
 
+// maxHookDescription is how long a hook's description can be, in
+// characters: a line that says what it is for, not a document.
+const maxHookDescription = 200
+
+// grokBlockText decodes a Grok hook entry (a JSON string holding the TOML
+// block) into the block text.
+func grokBlockText(entry json.RawMessage) (string, bool) {
+	var s string
+	if json.Unmarshal(entry, &s) != nil {
+		return "", false
+	}
+	return s, true
+}
+
+// grokHookBlock is one Grok hook as a TOML block: a [[hooks.<Event>]] array
+// table, its matcher (when any) and a single [[hooks.<Event>.hooks]] child
+// with the command. Returned as a JSON string so it can sit in HookEntry.Entry
+// and be compared and moved exactly as a JSON agent's entry is.
+func grokHookBlock(ev, matcher, command string, timeout int) string {
+	var b strings.Builder
+	b.WriteString("[[hooks." + ev + "]]\n")
+	if matcher != "" {
+		b.WriteString("matcher = " + strconv.Quote(matcher) + "\n")
+	}
+	b.WriteString("  [[hooks." + ev + ".hooks]]\n")
+	b.WriteString("  type = \"command\"\n")
+	b.WriteString("  command = " + strconv.Quote(command) + "\n")
+	if timeout > 0 {
+		b.WriteString("  timeout = " + strconv.Itoa(timeout) + "\n")
+	}
+	s, _ := json.Marshal(b.String())
+	return string(s)
+}
+
+// sameHookFamily is whether two agent ids are the same agent for an own
+// event: Grok Build and Grok App run the one Grok CLI, so an agent's own
+// ("grok:Notification") event goes to both, as a portable one does.
+func sameHookFamily(a, b string) bool {
+	if a == b {
+		return true
+	}
+	return (a == "grok" || a == "grok-app") && (b == "grok" || b == "grok-app")
+}
+
 func (h *Hook) check() error {
 	if err := checkName("hook", h.Name); err != nil {
 		return err
 	}
 	if strings.TrimSpace(h.Command) == "" {
 		return errors.New("a hook needs a command to run")
+	}
+	if utf8.RuneCountInString(h.Description) > maxHookDescription {
+		return fmt.Errorf("a hook's description is at most %d characters", maxHookDescription)
 	}
 	if h.Timeout < 0 || h.Timeout > 86400 {
 		return errors.New("a hook's timeout is between 0 (the agent's own) and 86400 seconds")
@@ -196,7 +305,7 @@ func (h *Hook) check() error {
 			return fmt.Errorf("no event called %s", h.Event)
 		}
 		for _, x := range h.Agents {
-			if x != a {
+			if !sameHookFamily(x, a) {
 				return fmt.Errorf("%s is %s's own event: only it can be given this hook", ev, a)
 			}
 		}
@@ -271,6 +380,144 @@ func hookList(doc []byte, path, ev string) ([]json.RawMessage, error) {
 	return list, nil
 }
 
+// grokHookBlocks reads the [[hooks.<ev>]] blocks a Grok config.toml has, each
+// as the block text it is, so it lines up with what grokHookBlock records and
+// the same find/claim/drop logic a JSON list uses applies. A file that isn't
+// valid TOML is an error, never treated as having no hooks.
+func grokHookBlocks(path, ev string) ([]json.RawMessage, error) {
+	raw, err := edit.Read(path)
+	if err != nil {
+		return nil, err
+	}
+	if len(bytes.TrimSpace(raw)) == 0 {
+		return nil, nil
+	}
+	lines := edit.SplitLines(string(raw))
+	header := "[[hooks." + ev + "]]"
+	var blocks []json.RawMessage
+	for i := 0; i < len(lines); i++ {
+		if strings.TrimSpace(lines[i]) != header {
+			continue
+		}
+		j := grokBlockEnd(lines, i)
+		block := strings.Join(lines[i:j], "\n") + "\n"
+		s, _ := json.Marshal(block)
+		blocks = append(blocks, json.RawMessage(s))
+		i = j - 1
+	}
+	return blocks, nil
+}
+
+// grokBlockEnd is the line index just past the [[hooks.<ev>]] block starting
+// at from: its body, including any [[hooks.<ev>.hooks]] child array tables,
+// up to the next table header of another event, trailing blank lines excluded.
+func grokBlockEnd(lines []string, from int) int {
+	ev, _ := grokArrayEvent(lines[from])
+	child := "hooks." + ev + "." // a table under this event continues the block
+	j := from + 1
+	for j < len(lines) {
+		s := strings.TrimSpace(lines[j])
+		if isGrokHeader(s) {
+			if name := grokTableName(s); !strings.HasPrefix(name, child) {
+				break
+			}
+		}
+		j++
+	}
+	for j-1 > from && strings.TrimSpace(lines[j-1]) == "" {
+		j--
+	}
+	return j
+}
+
+// grokTableName is the dotted table name a [[x.y]] header declares, "" for a
+// line that isn't one.
+func grokTableName(line string) string {
+	if ev, ok := grokArrayEvent(line); ok {
+		return "hooks." + ev
+	}
+	return ""
+}
+
+// isGrokHeader is whether a line starts a TOML table ([x] or [[x]]).
+func isGrokHeader(line string) bool {
+	return strings.HasPrefix(strings.TrimSpace(line), "[")
+}
+
+// writeGrokHooks applies the drop and add of Grok hook blocks to the config:
+// each block whose exact text is dropped is taken out, each added one appended
+// after the last [[hooks.*]] block (or at the end). Comments and the user's
+// own blocks around them are left as they are; the result is validated as TOML
+// before it is written, so a bad state never lands.
+func writeGrokHooks(path string, drop, add [][]byte) error {
+	raw, err := edit.Read(path)
+	if err != nil {
+		return err
+	}
+	lines := edit.SplitLines(string(raw))
+	dropped := map[string]bool{}
+	for _, d := range drop {
+		dropped[string(d)] = true
+	}
+	var out []string
+	lastHooks := -1 // line count up to and including the last [[hooks.*]] block
+	i := 0
+	for i < len(lines) {
+		// start a block only at a [[hooks.<Event>]] header, never at a
+		// child [[hooks.<Event>.hooks]] (grokArrayEvent returns that as
+		// "Event.hooks"), which belongs to the block above it
+		if ev, ok := grokArrayEvent(lines[i]); ok && ev != "" && !strings.Contains(ev, ".") {
+			j := grokBlockEnd(lines, i)
+			block := strings.Join(lines[i:j], "\n") + "\n"
+			if dropped[block] {
+				for len(out) > 0 && strings.TrimSpace(out[len(out)-1]) == "" {
+					out = out[:len(out)-1] // take the blank line before it too
+				}
+			} else {
+				out = append(out, lines[i:j]...)
+			}
+			lastHooks = len(out)
+			i = j
+			continue
+		}
+		out = append(out, lines[i])
+		i++
+	}
+	for _, a := range add {
+		// the block text ends in "\n"; TrimRight then SplitLines leaves no
+		// trailing empty element to drop
+		blk := edit.SplitLines(strings.TrimRight(string(a), "\n"))
+		if lastHooks > 0 {
+			insert := append([]string{""}, blk...)
+			tail := append([]string{}, out[lastHooks:]...)
+			out = append(append(out[:lastHooks], insert...), tail...)
+			lastHooks += len(insert)
+		} else {
+			if len(out) > 0 && strings.TrimSpace(out[len(out)-1]) != "" {
+				out = append(out, "")
+			}
+			out = append(out, blk...)
+			lastHooks = len(out)
+		}
+	}
+	return edit.WriteTOMLFile(path, out)
+}
+
+// grokArrayEvent is the event a [[hooks.<ev>]] or [[hooks.<ev>.hooks]] header
+// names, or "" for a header of another table. The bool says the line is an
+// array-table header of the hooks namespace at all.
+func grokArrayEvent(line string) (string, bool) {
+	s := strings.TrimSpace(line)
+	if !strings.HasPrefix(s, "[[") || !strings.HasSuffix(s, "]]") {
+		return "", false
+	}
+	name := strings.TrimSuffix(strings.TrimPrefix(s, "[["), "]]")
+	if !strings.HasPrefix(name, "hooks.") {
+		return "", false
+	}
+	return strings.TrimPrefix(name, "hooks."), true
+}
+
 // syncHooks writes into t the hooks the library gives it and takes out the
 // ones it no longer does: only entries exactly as magpie wrote them, the
 // user's own hooks, before and after them, left where they are.
@@ -301,17 +548,27 @@ func (l *Library) syncHooks(t *Target, b *backups, res *Result) {
 			res.fail(id, "hooks", err)
 		}
 	}
-	doc, err := readHooksFile(sp.path)
-	if err != nil {
-		failAll(err)
-		return
+	var doc []byte
+	if !sp.toml {
+		d, err := readHooksFile(sp.path)
+		if err != nil {
+			failAll(err)
+			return
+		}
+		doc = d
 	}
 	lists := map[string][]json.RawMessage{}
 	listOf := func(ev string) ([]json.RawMessage, error) {
 		if x, ok := lists[ev]; ok {
 			return x, nil
 		}
-		x, err := hookList(doc, sp.path, ev)
+		var x []json.RawMessage
+		var err error
+		if sp.toml {
+			x, err = grokHookBlocks(sp.path, ev)
+		} else {
+			x, err = hookList(doc, sp.path, ev)
+		}
 		if err == nil {
 			lists[ev] = x
 		}
@@ -334,7 +591,7 @@ func (l *Library) syncHooks(t *Target, b *backups, res *Result) {
 			res.fail(id, "hook:"+h.Name, err)
 			continue
 		}
-		ws = append(ws, &wanted{h: h, ev: ev, entry: sp.entry(h)})
+		ws = append(ws, &wanted{h: h, ev: ev, entry: sp.entry(h, ev)})
 	}
 	claimed := map[string]map[int]bool{} // event → the entries magpie's records found
 	find := func(ev string, entry json.RawMessage) int {
@@ -378,7 +635,9 @@ func (l *Library) syncHooks(t *Target, b *backups, res *Result) {
 	add := map[string][]json.RawMessage{}
 	var added []HookEntry
 	for _, w := range ws {
-		if w.done {
+		// an agent gone from here is given nothing new; what it has stays
+		// its until unticked
+		if w.done || t.Gone {
 			continue
 		}
 		// the same entry of the user's own already runs: it isn't written
@@ -391,6 +650,39 @@ func (l *Library) syncHooks(t *Target, b *backups, res *Result) {
 	}
 	if len(drop) == 0 && len(add) == 0 {
 		a.Hooks = append(kept, unread...)
+		return
+	}
+	if sp.toml {
+		if err := b.keep(id, sp.path); err != nil {
+			failAll(err)
+			return
+		}
+		err := os.MkdirAll(filepath.Dir(sp.path), 0o755)
+		if err == nil {
+			var drops, adds [][]byte
+			// the dropped blocks: the entry text each index in lists holds
+			for ev, idxs := range drop {
+				for _, i := range idxs {
+					if blk, ok := grokBlockText(lists[ev][i]); ok {
+						drops = append(drops, []byte(blk))
+					}
+				}
+			}
+			for _, es := range add {
+				for _, e := range es {
+					if blk, ok := grokBlockText(e); ok {
+						adds = append(adds, []byte(blk))
+					}
+				}
+			}
+			err = writeGrokHooks(sp.path, drops, adds)
+		}
+		if err != nil {
+			failAll(fmt.Errorf("%s: %w", sp.path, err))
+			return
+		}
+		res.changed(id)
+		a.Hooks = append(append(kept, added...), unread...)
 		return
 	}
 	// what each list becomes, and where each entry left in it moves to
@@ -684,6 +976,7 @@ func hooksOff(t *Target, sp *hookSpec) bool {
 // SaveHook adds a hook, or replaces the one called old (renaming it). An
 // agent it can't be given is left out of it, said in the result.
 func SaveHook(old string, h Hook) (*Result, error) {
+	h.Description = strings.Join(strings.Fields(h.Description), " ")
 	if err := h.check(); err != nil {
 		return nil, err
 	}
@@ -757,7 +1050,7 @@ func SomeHooksAgents(names, agents []string, on bool) (*Result, error) {
 // hookTakes is whether agent a can be given h.
 func hookTakes(h *Hook, a string) bool {
 	if x, _, ok := strings.Cut(h.Event, ":"); ok {
-		return x == a
+		return sameHookFamily(x, a)
 	}
 	return slices.Contains(hookAgents, a)
 }

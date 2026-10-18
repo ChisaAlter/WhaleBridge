@@ -13,7 +13,6 @@ import (
 	"strings"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/access"
-	"github.com/ChisaAlter/WhaleBridge/internal/budget"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
@@ -23,7 +22,7 @@ import (
 // (JonahFu on X), so an agent on a model that can't see, or any agent at
 // all, can mount it as an analyze_image tool: Streamable HTTP at
 // VisionMCPPath, served and guarded as SearchMCPPath is (serveMCP), a
-// gateway key's limit holding each look (budget.Reserve).
+// gateway key's limit holding each look (reserveFor).
 
 // VisionMCPPath is where the image recognition MCP server is served.
 const VisionMCPPath = "/mcp/magpie/vision"
@@ -124,9 +123,9 @@ func (s *Server) visionMCPRun(r *http.Request, image, prompt string) (string, er
 		}
 		return "", searchMCPError("magpie has no model that sees images: add a provider with one, or pick one in Settings → Models → Image recognition")
 	}
-	release, refused := budget.Reserve(access.Caller(r.Context()), int64(len(src)+len(prompt)), "", limitClock())
-	if refused != nil {
-		return "", refused
+	release, err := reserveFor(access.Caller(r.Context()), int64(len(src)+len(prompt)), "", limitClock())
+	if err != nil {
+		return "", err
 	}
 	defer release()
 	ctx := context.WithValue(r.Context(), describeForKey{}, describeFor{call: &CallFor{Agent: callerOf(r).agent, Missing: VisionMissing(), MCP: true}})

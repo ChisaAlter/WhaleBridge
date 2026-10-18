@@ -271,7 +271,7 @@ func classifyEffort(model string) string {
 // call of its own, at once.
 func (s *Server) askClassifier(model string, intents []string, prev before, effort bool, text string) (verdict, error) {
 	if p, m, ok := provider.Resolve(model); ok && p.DecidesModel(m) {
-		return s.askJev(p, m, intents, prev, effort, text)
+		return s.askDecider(p, m, intents, prev, effort, text)
 	}
 	// a group of decision models: each in turn (decide_group.go)
 	if v, ok, err := s.askDecisionGroup(model, intents, prev, effort, text); ok {

@@ -9,9 +9,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/lastgood"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
@@ -48,6 +50,31 @@ func desktopAccepts(id string) bool {
 		}
 	}
 	return false
+}
+
+// desktopKnowsMythos says a Claude Desktop build keeps the mythos word its
+// 2.7032 filter knows (desktopWords). Older builds have no such word: the
+// Store's 1.6608.2 keeps a gateway model only when its id reads as a
+// sonnet|opus|haiku tier or has claude, sonnet, opus, haiku or anthropic in
+// it (its app.asar has neither mythos nor fable), so every reasoning-level
+// model listed by mythos-magpie-<n> vanished from its menu
+// (sublatesublate-design). The version a User-Agent names ("Mozilla/5.0 …
+// Claude/2.7032.0 Chrome/…") is the only word magpie gets of the build: one
+// that says a version below 2 falls back to the plain alias every build
+// keeps (no effort picker there, and those builds have no mythos effort
+// table either). Anything else keeps the picker alias: 2 and up, and a
+// request that names no build at all, as the Code tab's Claude Code
+// ("claude-cli/… (external, claude-desktop)", known by its key) whose
+// ids are mythos-magpie-<n> already.
+var desktopUAVersion = regexp.MustCompile(` Claude/(\d+)`)
+
+func desktopKnowsMythos(ua string) bool {
+	m := desktopUAVersion.FindStringSubmatch(ua)
+	if m == nil {
+		return true
+	}
+	n, err := strconv.Atoi(m[1])
+	return err != nil || n >= 2
 }
 
 // desktopAlias is the prefix of the id a model is listed by to Claude
@@ -159,8 +186,10 @@ func DesktopID(e provider.Entry) string { return claudeLooking(e) }
 // folds rows of one name into one entry, so no two of one name read the
 // same (desktopNames). A model of 1M or more is listed by its "[1m]" id
 // under settings.DesktopLongest, described as Desktop's own 1M entry is
-// (desktop1M).
-func desktopModels(entries []provider.Entry) []map[string]any {
+// (desktop1M). A build that has no mythos word (desktopKnowsMythos) is
+// shown a reasoning-level model by its plain alias instead of the picker
+// one, which such a build would drop whole (#2426).
+func desktopModels(entries []provider.Entry, knowsMythos bool) []map[string]any {
 	names := desktopNames(entries)
 	// the tier each model stands in for: the user's pick (a model picked
 	// for two is tagged with the first, desktopTierTurn sends the other),
@@ -177,7 +206,11 @@ func desktopModels(entries []provider.Entry) []map[string]any {
 	for i, e := range entries {
 		m := modelObject(e)
 		m["display_name"] = names[i]
-		m["id"] = claudeLooking(e)
+		id := claudeLooking(e)
+		if !knowsMythos && strings.HasPrefix(id, desktopEffortAlias) {
+			id = aliasFor(e.ID)
+		}
+		m["id"] = id
 		if desktopListed1M(e, longest) {
 			m["id"] = m["id"].(string) + "[1m]"
 			m["description"] = desktop1MSaid
@@ -251,6 +284,12 @@ func DesktopTiers() map[string]string {
 // SetDesktopTier picks the model (a catalog id) Claude Desktop runs a tier
 // on; "" takes the pick away.
 func SetDesktopTier(tier, id string) error {
+	// DesktopTiers reads a file that doesn't parse as no pick: what it held,
+	// every other tier's pick, is kept aside before it is written over or
+	// taken away
+	if err := lastgood.KeepUnparsed(desktopTiersPath(), lastgood.Into[map[string]string]); err != nil {
+		return err
+	}
 	tiers := DesktopTiers()
 	if id == "" {
 		delete(tiers, tier)
@@ -336,13 +375,17 @@ func desktopNames(entries []provider.Entry) []string {
 // aliased is the catalog id an alias Claude Desktop was given stands for:
 // anthropic/magpie-<number> (as it was listed before too),
 // mythos-magpie-<number> or magpie-<number>.anthropic.<claude model>, with
-// or without Claude Code's "[1m]".
+// or without Claude Code's "[1m]"; or Claude Science's,
+// claude-magpie-<number>.
 func aliased(id string) (string, bool) {
 	id = strings.TrimSuffix(id, "[1m]")
 	var number string
 	if n, ok := strings.CutPrefix(id, desktopAlias); ok {
 		number = n
 	} else if n, ok := strings.CutPrefix(id, desktopEffortAlias); ok {
+		number = n
+	} else if n, ok := strings.CutPrefix(id, scienceAlias); ok {
+		// Claude Science's (science.go)
 		number = n
 	} else if rest, ok := strings.CutPrefix(id, "magpie-"); ok {
 		if i := strings.Index(rest, desktopClaudeInfix); i > 0 {
@@ -395,7 +438,12 @@ func desktopPickedPath() string { return filepath.Join(settings.Dir(), "claude-d
 
 // desktopTurn is the model a Claude Desktop request for asked is served by.
 // byClaudeCode is a request Claude Code sent (its claude-cli/ User-Agent)
-// rather than Desktop's own client.
+// rather than Desktop's own client. bySubagent is a subagent's request
+// (x-claude-code-agent-id): its turns carry tools too, but its model is
+// the one its tier or definition asked for, not the user's pick, so it is
+// never kept as the session's model. Before, a subagent on the opus tier's
+// model took the session's place until the lead's next turn, and the
+// titles asked for meanwhile went to it.
 //
 // Claude Code names the model of each of its own background requests on
 // purpose: its auto mode's safety classifier asks for its sonnet with no
@@ -406,7 +454,7 @@ func desktopPickedPath() string { return filepath.Join(settings.Dir(), "claude-d
 // pick> --system-prompt "You write short session titles…" --tools ""`,
 // sent with max_tokens 64000); one for a model magpie doesn't serve still
 // goes there whoever sent it.
-func desktopTurn(asked string, body []byte, byClaudeCode bool) string {
+func desktopTurn(asked string, body []byte, byClaudeCode, bySubagent bool) string {
 	if asked == "" {
 		return asked
 	}
@@ -428,7 +476,14 @@ func desktopTurn(asked string, body []byte, byClaudeCode bool) string {
 	if byClaudeCode {
 		aside = desktopTitle(body)
 	}
-	if unserved(asked) || !tools && aside && desktopAccepts(asked) {
+	title := !tools && aside && desktopAccepts(asked)
+	gone := unserved(asked)
+	if gone && !title {
+		if m := servedBeside(asked, picked); m != "" {
+			return m
+		}
+	}
+	if gone || title {
 		if picked != "" {
 			return picked
 		}
@@ -437,13 +492,58 @@ func desktopTurn(asked string, body []byte, byClaudeCode bool) string {
 		}
 		return asked
 	}
-	if tools {
+	if tools && !bySubagent {
 		desktopPicked.model = asked
 		if os.MkdirAll(settings.Dir(), 0o755) == nil {
 			os.WriteFile(desktopPickedPath(), []byte(asked+"\n"), 0o600)
 		}
 	}
 	return asked
+}
+
+// servedBeside is the catalog id the session's provider serves a Claude
+// model by that Claude Code asked for by Claude's own id, which no entry
+// has as its id or model: another magpie (a Remote magpie provider) lists
+// it under its own provider's prefix, office/claude/claude-sonnet-5 with
+// the model claude/claude-sonnet-5. Its auto mode's classifier asks for
+// its sonnet by name while the session is on office/claude/claude-opus-5-5,
+// and went to that opus, writing an hour's cache for each tiny reply
+// (#2187, SuInk). Only the provider picked is looked at, so another
+// provider's model of the same name doesn't take it; of that provider's,
+// the one beside the picked model (the same subscription there) comes
+// first. "" when the session's provider serves no such model.
+func servedBeside(asked, picked string) string {
+	bare := strings.TrimSuffix(asked, "[1m]")
+	if picked == "" || strings.Contains(bare, "/") || claudeTier(bare) == "" {
+		return ""
+	}
+	cat := provider.Catalog()
+	var pid, dir string
+	for _, e := range cat {
+		if e.ID == strings.TrimSuffix(picked, "[1m]") && e.Group == "" {
+			pid = e.Provider.ID
+			if i := strings.LastIndex(e.Model, "/"); i >= 0 {
+				dir = e.Model[:i+1]
+			}
+			break
+		}
+	}
+	if pid == "" {
+		return ""
+	}
+	found := ""
+	for _, e := range cat {
+		if e.Group != "" || e.Provider.ID != pid || !strings.HasSuffix(e.Model, "/"+bare) {
+			continue
+		}
+		if dir != "" && e.Model == dir+bare {
+			return e.ID + strings.TrimPrefix(asked, bare)
+		}
+		if found == "" {
+			found = e.ID + strings.TrimPrefix(asked, bare)
+		}
+	}
+	return found
 }
 
 // desktopDefault is the model a request Desktop sends before any turn has

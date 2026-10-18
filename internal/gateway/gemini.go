@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 )
 
@@ -242,8 +243,12 @@ func parseGemini(body []byte) (*Request, error) {
 		}
 	}
 	// function results carry the call's id when the client kept it; older
-	// clients send only the name, matched to the latest call of that name
+	// clients send only the name, matched to the first call of that name
+	// still unanswered, as Gemini lists a turn's responses in its calls'
+	// order (two calls of one function each get their own answer), else to
+	// the latest call of that name
 	names := map[string]string{}
+	open := map[string][]string{} // calls of each name not yet answered
 	for _, c := range g.Contents {
 		role := "user"
 		if c.Role == "model" || c.Role == "assistant" {
@@ -276,6 +281,7 @@ func parseGemini(body []byte) (*Request, error) {
 					id = "call_" + newID()
 				}
 				names[fc.Name] = id
+				open[fc.Name] = append(open[fc.Name], id)
 				// its thought signature goes back to Gemini as it came (#1445)
 				msg.Parts = append(msg.Parts, Part{Kind: ToolCall, ID: id, Name: fc.Name, Args: parseArgs(string(fc.Args)), Signature: p.Signature})
 			case p.FunctionResponse != nil:
@@ -283,7 +289,11 @@ func parseGemini(body []byte) (*Request, error) {
 				id := fr.ID
 				if id == "" {
 					id = names[fr.Name]
+					if q := open[fr.Name]; len(q) > 0 {
+						id = q[0]
+					}
 				}
+				open[fr.Name] = slices.DeleteFunc(open[fr.Name], func(c string) bool { return c == id })
 				text, isErr := functionResponseText(fr.Response)
 				images, files := functionResponseParts(fr.Parts, &text)
 				msg.Parts = append(msg.Parts, Part{Kind: ToolResult, CallID: id, Name: fr.Name, Text: text, Images: images, IsError: isErr})

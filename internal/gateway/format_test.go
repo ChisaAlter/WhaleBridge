@@ -35,7 +35,6 @@ type formatVendor struct {
 	mu     sync.Mutex
 	bodies []map[string]any
 	paths  []string
-	refuse bool
 }
 
 func (v *formatVendor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -45,18 +44,11 @@ func (v *formatVendor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	v.mu.Lock()
 	v.bodies = append(v.bodies, m)
 	v.paths = append(v.paths, r.URL.Path)
-	refuse := v.refuse
 	v.mu.Unlock()
 	text, _ := json.Marshal(calendarAnswer)
 	w.Header().Set("Content-Type", "text/event-stream")
 	switch {
 	case strings.HasSuffix(r.URL.Path, "/chat/completions"):
-		if rf, _ := m["response_format"].(map[string]any); refuse && rf["type"] == "json_schema" {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(400)
-			io.WriteString(w, `{"error":{"message":"This response_format type is unavailable now","type":"invalid_request_error","param":null,"code":"invalid_request_error"}}`)
-			return
-		}
 		io.WriteString(w, sse(`data: {"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{"role":"assistant","content":`+string(text)+`}}]}`,
 			`data: {"id":"c1","object":"chat.completion.chunk","model":"m","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":5,"total_tokens":10}}`,
 			`data: [DONE]`))
@@ -213,38 +205,50 @@ func TestResponsesTextKeepsVerbosityBesideFormat(t *testing.T) {
 	}
 }
 
-// An upstream that turns the format away (DeepSeek: "This response_format
-// type is unavailable now") is asked again with the format in the system
-// prompt, and so from then on, rather than the client getting a 400 for a
-// field the model could have been told in words.
+// An upstream that turns a schema away but takes any JSON object
+// (DeepSeek: "This response_format type is unavailable now"; Xiaomi MiMo's
+// Token Plan, #2126) is asked again for an object, the schema in the
+// system prompt; one that turns the object away too, with the format in
+// the system prompt alone. Each from then on, rather than the client
+// getting a 400 for a field the model could have been told in words.
 func TestRefusedFormatToldInWords(t *testing.T) {
-	fresh(t)
-	up := &formatVendor{refuse: true}
-	srv := httptest.NewServer(up)
-	t.Cleanup(srv.Close)
-	if err := provider.Save(provider.Provider{ID: "ds", Name: "DS", Key: "k", Chat: srv.URL + "/v1", Models: []string{"deepseek-chat"}}); err != nil {
-		t.Fatal(err)
-	}
-	h := New().upstreamHandler()
-	for i := range 2 {
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(strings.Replace(sdkResponsesParse, "%s", "ds/deepseek-chat", 1))))
-		if rec.Code != 200 {
-			t.Fatalf("turn %d: status %d: %s", i, rec.Code, rec.Body.String())
-		}
-		_, sent := up.sent()
-		if sent["response_format"] != nil {
-			t.Fatalf("turn %d: response_format still sent: %s", i, jsonOf(sent["response_format"]))
-		}
-		if !strings.Contains(jsonOf(sent["messages"]), "matching this JSON schema") {
-			t.Fatalf("turn %d: format not told in words: %s", i, jsonOf(sent["messages"]))
-		}
-	}
-	up.mu.Lock()
-	n := len(up.bodies)
-	up.mu.Unlock()
-	if n != 3 {
-		t.Fatalf("%d requests, want 3: one refused, then two told in words", n)
+	for _, c := range []struct {
+		name   string
+		object bool // json_object turned away too
+		first  int  // requests on the first turn
+		want   any  // response_format once it is taken
+	}{
+		{"object taken", false, 2, map[string]any{"type": "json_object"}},
+		{"object refused too", true, 3, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			fresh(t)
+			up := &formatRefuser{object: c.object}
+			srv := httptest.NewServer(up)
+			t.Cleanup(srv.Close)
+			if err := provider.Save(provider.Provider{ID: "ds", Name: "DS", Key: "k", Chat: srv.URL + "/v1", Models: []string{"deepseek-chat"}}); err != nil {
+				t.Fatal(err)
+			}
+			h := New().upstreamHandler()
+			for i := range 2 {
+				rec := httptest.NewRecorder()
+				h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/responses", strings.NewReader(strings.Replace(sdkResponsesParse, "%s", "ds/deepseek-chat", 1))))
+				if rec.Code != 200 {
+					t.Fatalf("turn %d: status %d: %s", i, rec.Code, rec.Body.String())
+				}
+				bodies := up.all()
+				sent := bodies[len(bodies)-1]
+				if jsonOf(sent["response_format"]) != jsonOf(c.want) {
+					t.Fatalf("turn %d: response_format %s, want %s", i, jsonOf(sent["response_format"]), jsonOf(c.want))
+				}
+				if m := jsonOf(sent["messages"]); !strings.Contains(m, "matching this JSON schema") || strings.Count(m, "Respond with a single JSON") != 1 {
+					t.Fatalf("turn %d: format not told in words once: %s", i, m)
+				}
+			}
+			if n := len(up.all()); n != c.first+1 {
+				t.Fatalf("%d requests, want %d: refused on the first turn, then remembered", n, c.first+1)
+			}
+		})
 	}
 }
 

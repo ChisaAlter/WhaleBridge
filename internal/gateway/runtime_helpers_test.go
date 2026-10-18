@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/routes"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -266,11 +267,9 @@ func setHome(t *testing.T, dir string) {
 func jsonStr(s string) string { b, _ := json.Marshal(s); return string(b) }
 func forgetRouting() {
 	routed.Lock()
-	routed.turn, routed.used, routed.failures = map[string]int{}, map[string]tokenUse{}, map[string]int{}
+	routed.used, routed.failures = map[string]tokenUse{}, map[string]int{}
 	routed.Unlock()
-	wrr.Lock()
-	wrr.m = map[string]*wrrRound{}
-	wrr.Unlock()
+	routes.Forget()
 }
 
 // keyed is a vendor that says which key each request came with, and

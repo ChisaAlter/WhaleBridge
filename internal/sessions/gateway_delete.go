@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/lastgood"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
@@ -49,6 +50,9 @@ func readHidden() []hiddenGateway {
 }
 
 func writeHidden(list []hiddenGateway) error {
+	if err := keepUnreadHidden(); err != nil {
+		return err
+	}
 	if len(list) == 0 {
 		if err := os.Remove(gatewayHiddenPath()); err != nil && !errors.Is(err, os.ErrNotExist) {
 			return err
@@ -67,6 +71,14 @@ func writeHidden(list []hiddenGateway) error {
 		return err
 	}
 	return os.Rename(tmp, gatewayHiddenPath())
+}
+
+// keepUnreadHidden copies a gateway-sessions-hidden.json that doesn't parse
+// aside before it is written over (or taken away): it holds the deletions
+// magpie made before, and a read that came back empty is unknown, not
+// nothing. A copy that can't be made stops the write.
+func keepUnreadHidden() error {
+	return lastgood.KeepUnparsed(gatewayHiddenPath(), lastgood.Into[[]hiddenGateway])
 }
 
 // GatewayHidden says whether a gateway session was deleted: true when it

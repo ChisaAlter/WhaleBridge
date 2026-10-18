@@ -18,6 +18,22 @@ func outputLimit(p provider.Provider, model string) int {
 	return 0
 }
 
+// userOutput is the Max output the user set for p's model (provider ›
+// model, or the provider's "*"), 0 when they set none. A request asking
+// for more is lowered to it on any route, not only in a group: Claude Code
+// asks claude-* models for their full 128000 and isn't told magpie's
+// figure for them (claudeOutput), so a key whose quota is held per request
+// as max_tokens times the price turned every turn away, and the field the
+// editor says caps max_tokens did nothing (YaCo on Discord).
+func userOutput(p provider.Provider, model string) int {
+	for _, e := range provider.Served() {
+		if e.Group == "" && e.Provider.ID == p.ID && (e.Model == model || e.ID == model) && e.OutputSet && e.Output > 0 {
+			return e.Output
+		}
+	}
+	return 0
+}
+
 // askedOutput is the reply limit a request that names none is sent on
 // Anthropic's Messages API, which needs one: the model's own as the agents
 // are told it (the user's Max output, else the vendor's list or

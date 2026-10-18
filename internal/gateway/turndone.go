@@ -65,13 +65,23 @@ type turnState struct {
 	timer       *time.Timer
 }
 
-// turns follows each session's turn.
+// turns follows each conversation's turns. An agent that sends no session
+// id has its concurrent turns told apart by the conversation a request
+// belongs to (Conv, the first user turn's digest): without it every task
+// an agent runs at once would share one clock, and a finished task's
+// notification would read the longest task still going (#2001).
 type turns struct {
 	mu sync.Mutex
 	m  map[string]*turnState
 }
 
-func sessionTurnKey(r *Route) string { return r.Agent + "\x00" + r.Session }
+func sessionTurnKey(r *Route) string {
+	session := r.Session
+	if session == "" {
+		session = r.Conv
+	}
+	return r.Agent + "\x00" + session
+}
 
 // begin is a request of a turn starting.
 func (ts *turns) begin(r *Route, now time.Time) {

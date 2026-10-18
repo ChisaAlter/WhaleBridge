@@ -522,7 +522,7 @@ func QoderCompleteSignIn(ctx context.Context, fl *qoderFlow) (user string, err e
 	if err := ctx.Err(); err != nil {
 		return "", err
 	}
-	if err := qoderSave(cred); err != nil {
+	if err := keepLogin(ctx, func() error { return qoderSave(cred) }); err != nil {
 		return "", err
 	}
 	_, _ = qoderFetchModels(ctx, site.ID, qoderWho(cred))

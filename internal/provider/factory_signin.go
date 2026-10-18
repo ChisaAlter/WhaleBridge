@@ -49,7 +49,7 @@ func startFactorySignIn(s *signInFlow) error {
 	s.st.URL, s.st.Code = firstNonEmpty(dc.Complete, dc.URI), dc.UserCode
 	s.stop = cancel
 	s.mu.Unlock()
-	interval := time.Duration(max(dc.Interval, 1)) * time.Second
+	interval := devicePoll(dc.Interval)
 	go func() {
 		defer cancel()
 		fail := func(msg string) { s.finish(SignInState{State: "failed", Error: msg}) }
@@ -150,7 +150,9 @@ func factorySignedInWith(ctx context.Context, t factoryTokens) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	if err := addSideLogin(savedLogin{Agent: "factory", User: user, Auth: auth}, "", func(savedLogin) {}); err != nil {
+	if err := keepLogin(ctx, func() error {
+		return addSideLogin(savedLogin{Agent: "factory", User: user, Auth: auth}, "", func(savedLogin) {})
+	}); err != nil {
 		return "", err
 	}
 	// signed in again: whatever WorkOS refused before is over

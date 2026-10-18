@@ -258,7 +258,11 @@ func plugged(home string, p *agentplug.Agent) *Agent {
 		forget(key)
 		return nil
 	}
-	// wire writes ref and connect's keys, stashing what each key had
+	// only: the agent picks its model itself among those connect writes
+	// (#2374), so magpie writes no model, and the switch is its one field
+	only := d.Model == ""
+	// wire writes ref and connect's keys, stashing what each key had; a
+	// connect-only agent's ref is ""
 	wire := func(ref string) error {
 		var model map[string]any
 		var models []map[string]any
@@ -276,17 +280,28 @@ func plugged(home string, p *agentplug.Agent) *Agent {
 			model = map[string]any{"id": ref, "name": ref, "context": 0, "output": 0, "images": false, "efforts": []string{}}
 		}
 		gk := agentKeyAt(id, at.gw())
-		out, err := p.Connect(map[string]any{
+		in := map[string]any{
 			"gateway": map[string]any{"url": at.gw(), "v1": at.v1(), "key": gk},
-			"model":   model,
 			"models":  models,
 			"agent":   map[string]any{"id": id, "config": f.path},
-		})
+		}
+		if !only {
+			in["model"] = model
+		}
+		out, err := p.Connect(in)
 		if err != nil {
 			return fmt.Errorf("%s: %w", plugin.Name(p.Spec), err)
 		}
-		delete(out, d.Model)
-		kvs := []edit.KV{{Path: d.Model, Value: d.Prefix + ref}}
+		var kvs []edit.KV
+		if only {
+			// nothing written would read as connected all the same
+			if len(out) == 0 {
+				return fmt.Errorf("%s: connect returned no keys to write", plugin.Name(p.Spec))
+			}
+		} else {
+			delete(out, d.Model)
+			kvs = append(kvs, edit.KV{Path: d.Model, Value: d.Prefix + ref})
+		}
 		mark, strs := "", map[string]string{}
 		for _, k := range sortedKeys(out) {
 			kvs = append(kvs, edit.KV{Path: k, Value: out[k]})
@@ -356,7 +371,7 @@ func plugged(home string, p *agentplug.Agent) *Agent {
 			if !ok {
 				return ""
 			}
-			if v, _ := f.get(d.Model); v != d.Prefix+st.Ref {
+			if v, _ := f.get(d.Model); !only && v != d.Prefix+st.Ref {
 				return ""
 			}
 			var kvs []string
@@ -365,6 +380,7 @@ func plugged(home string, p *agentplug.Agent) *Agent {
 			}
 			return wiringOff(d.Name, f.path, f.get, kvs...)
 		},
+		ListsModels: only,
 		Fields: []Field{{
 			Key: "model", Label: "model",
 			Get: get,
@@ -389,7 +405,7 @@ func plugged(home string, p *agentplug.Agent) *Agent {
 		// the catalog changed: what connect writes for the model may too
 		Sync: func() error {
 			if st, ok := onMagpie(); ok {
-				if v, _ := f.get(d.Model); v == d.Prefix+st.Ref {
+				if v, _ := f.get(d.Model); only || v == d.Prefix+st.Ref {
 					return wire(st.Ref)
 				}
 			}
@@ -401,6 +417,31 @@ func plugged(home string, p *agentplug.Agent) *Agent {
 			}
 			return nil
 		},
+	}
+	if only {
+		// magpie as its provider, on or off: the models are the agent's
+		// to pick, in the list connect writes
+		a.Fields = []Field{{
+			Key: "provider", Label: "provider",
+			Get: func() string {
+				if _, ok := onMagpie(); ok {
+					return magpieID
+				}
+				return ""
+			},
+			Set: func(v string) error {
+				if v == magpieID {
+					return wire("")
+				}
+				if st, ok := onMagpie(); ok {
+					return restore(st)
+				}
+				return nil
+			},
+			Options: func(map[string]string) []Option {
+				return []Option{{Value: magpieID, Label: "magpie", Icon: "magpie"}}
+			},
+		}}
 	}
 	if d.Dir != "" {
 		a.Dir = pluggedPath(home, d.Dir)

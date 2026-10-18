@@ -14,6 +14,7 @@ import (
 
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"github.com/ChisaAlter/WhaleBridge/internal/proc"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
@@ -61,7 +62,10 @@ func (a *Agent) Source() string {
 		if codexChatGPT(dir) {
 			return "chatgpt"
 		}
-		if v, _ := edit.GetJSON(filepath.Join(dir, "auth.json"), "OPENAI_API_KEY"); v != "" {
+		var k struct {
+			Key string `json:"OPENAI_API_KEY"`
+		}
+		if b, ok := provider.CodexSignIn(dir); ok && json.Unmarshal(b, &k) == nil && k.Key != "" {
 			return "key"
 		}
 	case "opencode", "mimocode", "deveco":

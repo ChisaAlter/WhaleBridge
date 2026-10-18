@@ -1016,6 +1016,24 @@ func (st *cursorStream) decode(ctx context.Context, br *bufio.Reader, out chan<-
 		send(Event{Kind: KError, Text: msg})
 	}
 	var calls, listed, said int
+	// answered: the step's execs answered here, not handed to the caller
+	// (Cursor's get_mcp_tools, a shell or file tool of its own refused).
+	// Cursor's count of a step's calls takes them in (plugins #142).
+	var answered int
+	// stepDone is whether every call the step listed has come. A step
+	// whose calls were all answered here goes on on Cursor's side, under
+	// a count of its own: this one is spent, not left to end the next
+	// step early.
+	stepDone := func() bool {
+		if listed == 0 || calls+answered < listed {
+			return false
+		}
+		if calls > 0 {
+			return true
+		}
+		listed, answered = 0, 0
+		return false
+	}
 	var usage Usage
 	ended := false // Cursor said what the turn used
 	var finish func()
@@ -1091,22 +1109,27 @@ func (st *cursorStream) decode(ctx context.Context, br *bufio.Reader, out chan<-
 							finish()
 							return
 						}
-					case 27: // how many tool calls the step makes, sent before them
-						if listed = int(pbNum(uf, 1)); listed > 0 && calls >= listed {
+					case 27: // how many tool calls the step makes, sent before or after them
+						if listed = int(pbNum(uf, 1)); stepDone() {
 							settle()
 							return
 						}
 					}
 				}
 			case 2: // exec_server_message: the server asks the client to run something
+				called := false
 				if !st.exec(m.data, tools, func(id, name string, args []byte) bool {
+					called = true
 					calls++
 					said += len(args)
 					return send(Event{Kind: KToolStart, ID: id, Name: name}) && send(Event{Kind: KToolArgs, Text: string(args)})
 				}) {
 					return
 				}
-				if listed > 0 && calls >= listed { // every call made: the caller runs them
+				if !called && !cursorAsksContext(m.data) {
+					answered++
+				}
+				if stepDone() { // every call made: the caller runs them
 					settle()
 					return
 				}
@@ -1190,6 +1213,17 @@ func (st *cursorStream) exec(msg []byte, tools []bridgeTool, call func(id, name 
 	st.send(pb{}.bytes(5, pb{}.bytes(2, pb{}.varint(1, id).str(2, "not available"))))
 	st.closeExec(id)
 	return true
+}
+
+// cursorAsksContext is whether an exec is Cursor asking for the
+// environment (request_context_args), which is not a call of the step.
+func cursorAsksContext(msg []byte) bool {
+	for _, e := range pbFields(msg) {
+		if e.num == 10 {
+			return true
+		}
+	}
+	return false
 }
 
 // pbStr and pbNum are a field of a message read, "" or 0 when it has none.

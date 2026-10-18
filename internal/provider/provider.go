@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -172,6 +173,19 @@ type Provider struct {
 	// back (#1772: Ollama Cloud's weekly limit); 0 is the gateway's own
 	// quarter of an hour. A time the vendor names stands over it.
 	QuotaRest int `json:"quotaRest,omitempty"`
+	// QuotaResetAt is the time of day a key of it out of its allowance is
+	// back, when its vendor refuses for a day's allowance without saying
+	// when (#2008: a free tier's "today's free-model token quota"): "08:00"
+	// on this computer's clock, or "00:00+08:00" on the vendor's. Set, it
+	// stands over QuotaRest; a time the vendor names stands over both.
+	QuotaResetAt string `json:"quotaResetAt,omitempty"`
+	// RestCap is the most, in minutes, one of its keys or accounts sits
+	// out while it keeps failing or keeps being rate limited as soon as
+	// its rest is over (#2008); 0 is the gateway's own, 10 minutes for a
+	// failure and 30 for a rate limit. The vendor's own "try again in"
+	// still stands over it. RestCapOff (-1): no rest at all after a
+	// failure that says nothing of why, a rate limit's as the gateway's own.
+	RestCap int `json:"restCap,omitempty"`
 
 	// PriceRate is what the provider charges against the official price
 	// (ITea312, #819): a relay that bills 0.8× or 1.5× of it. It scales the
@@ -210,6 +224,18 @@ type Provider struct {
 	// fitting, which a backend that isn't OpenAI's needs (#350).
 	CodexAsSent bool `json:"codexAsSent,omitempty"`
 
+	// NativeCompaction has Codex's compaction_trigger go to the provider
+	// as Codex sent it, and the compaction the provider writes back go to
+	// Codex as it came (#1099), where magpie otherwise asks the model for
+	// a summary and hands Codex that (its "magpie1:" compaction). Only a
+	// provider whose wire carries it takes it (CarriesCompaction): a
+	// Responses API (Sub2API, a remote magpie), a ChatGPT account, GitHub
+	// Copilot's GPT models. Such a compaction is sealed by the key or
+	// account that wrote it, so its conversation stays there, or is
+	// refused, never sent elsewhere to be dropped. Off, the default,
+	// keeps magpie's summary.
+	NativeCompaction bool `json:"nativeCompaction,omitempty"`
+
 	// PassUserAgent has a request go to the vendor with the User-Agent the
 	// agent that sent it gave (pi, opencode, Claude Code…), in place of
 	// magpie's own (#1851): a coding plan that serves only agents it names
@@ -242,6 +268,13 @@ type Provider struct {
 	// run locally, or Ollama's cloud models, pass a request on to a vendor.
 	// See SkipsRedaction.
 	Unredacted bool `json:"unredacted,omitempty"`
+
+	// InsecureTLS has magpie take the certificate of the provider's own
+	// HTTPS host as it is, unchecked (#2383, fangzhengjin: a vLLM on the
+	// LAN, Ollama behind a self-signed cert). Only a provider the user
+	// added takes it (TakesInsecureTLS), and only for the hosts of its own
+	// base URLs (UncheckedHosts); see Via.
+	InsecureTLS bool `json:"insecureTLS,omitempty"`
 
 	// Proxy is the proxy magpie's requests to this provider go through
 	// (#237: Codex through one, a vendor at home without): "" follows
@@ -284,6 +317,10 @@ type Provider struct {
 	// magpie knows need neither.
 	BalanceURL  string `json:"balanceURL,omitempty"`
 	BalancePath string `json:"balancePath,omitempty"`
+	// BalanceMethod is how BalanceURL is asked: "" (or GET), or POST with
+	// no body, for an endpoint that answers only a POST (#2368). Any other
+	// is refused when the balance is read (balanceMethodOf).
+	BalanceMethod string `json:"balanceMethod,omitempty"`
 	// BalanceToken is what a vendor tells the whole account's balance to,
 	// where a key is told only what is left on itself: AiHubMix's system
 	// access token, or a new-api relay's for its /api/user/self named in
@@ -318,6 +355,14 @@ type Provider struct {
 	// listed since is served beside picks that held every one listed then
 	// (withNewlyListed), and one listed then and left unpicked stays out.
 	PickedFrom []string `json:"pickedFrom,omitempty"`
+	// RefreshEvery, for a provider of the user's own, is how often the
+	// gateway fetches its model list by itself ("6h", "1d"; none, only when
+	// asked), as Fetch models does (#2135). See autolist.go.
+	RefreshEvery string `json:"refreshEvery,omitempty"`
+	// AutoInclude are patterns over a model's id (a glob with *, or a
+	// regular expression after "re:"): a model a fetch newly lists that one
+	// matches joins Models, beside the picks already there (#2135).
+	AutoInclude []string `json:"autoInclude,omitempty"`
 	// Unlisted keeps the provider's own models out of the list agents see:
 	// it serves only through the routing groups it is in, and by its
 	// "provider/model" ids.
@@ -377,6 +422,10 @@ type file struct {
 	// Routing page (#779), by id, found ones among them; one not in it
 	// follows those that are (see SetGroupOrder).
 	GroupOrder []string `json:"groupOrder,omitempty"`
+	// PluginLeft are the picks of a removed plugin's providers, set aside
+	// when it was removed and put back when it is added again (#2057; see
+	// plugin_left.go).
+	PluginLeft []LeftRecord `json:"pluginLeft,omitempty"`
 }
 
 // Path is the file the user's providers live in.
@@ -450,6 +499,28 @@ func FileError() error {
 	return err
 }
 
+// Routings is the routing of each provider and group providers.json sets
+// one for, read from the file alone: for what asks often (the rotation
+// plugin's InUse), without building the catalog and reading every sign-in.
+func Routings() ([]string, error) {
+	f, err := read()
+	if err != nil {
+		return nil, err
+	}
+	var out []string
+	for _, p := range f.Providers {
+		if p.Routing != "" {
+			out = append(out, p.Routing)
+		}
+	}
+	for _, g := range f.Groups {
+		if g.Routing != "" {
+			out = append(out, g.Routing)
+		}
+	}
+	return out, nil
+}
+
 // store replaces providers.json whole, through a file renamed over it, so
 // that a read at that moment sees the old catalog or the new one, never a
 // file cut short.
@@ -510,6 +581,7 @@ func (p Provider) clone() Provider {
 	p.Fallback = slices.Clone(p.Fallback)
 	p.Models = slices.Clone(p.Models)
 	p.PickedFrom = slices.Clone(p.PickedFrom)
+	p.AutoInclude = slices.Clone(p.AutoInclude)
 	p.Headers = maps.Clone(p.Headers)
 	p.ExtraBody = maps.Clone(p.ExtraBody)
 	p.AccountProxies = maps.Clone(p.AccountProxies)
@@ -590,12 +662,16 @@ func withPicks(a, pk Provider) Provider {
 	a.Models, a.Unlisted, a.Off, a.Fallback, a.Routing, a.Affinity, a.KeepLogin, a.KeepLoginAs, a.Contexts, a.Family = pk.Models, pk.Unlisted, pk.Off, pk.Fallback, pk.Routing, pk.Affinity, pk.KeepLogin, pk.KeepLoginAs, pk.Contexts, pk.Family
 	a.SwitchOnly = pk.SwitchOnly
 	a.Sink, a.NoModels, a.PriceRate = pk.Sink, pk.NoModels, pk.PriceRate
+	a.NativeCompaction = pk.NativeCompaction
 	a.Proxy, a.AccountProxies, a.AccountModels = pk.Proxy, pk.AccountProxies, pk.AccountModels
 	a.AccountCaps, a.AccountWindowCaps = pk.AccountCaps, pk.AccountWindowCaps
 	a.AccountNames = pk.AccountNames
 	a.MaxConcurrency, a.PinUpstream = pk.MaxConcurrency, pk.PinUpstream
 	a.AccountConcurrency, a.QueueLimit, a.QueueWait = pk.AccountConcurrency, pk.QueueLimit, pk.QueueWait
 	a.MaxRPM, a.QuotaRest = pk.MaxRPM, pk.QuotaRest
+	// the extra body fields written for it, which a ChatGPT account's
+	// requests take (WithExtraBody, magpie-releases#18)
+	a.ExtraBody = pk.ExtraBody
 	return a
 }
 
@@ -706,7 +782,7 @@ func Save(p Provider) error {
 		if p.ID == "kiro" {
 			key = p.Key
 		}
-		p = Provider{ID: p.ID, Key: key, Models: p.Models, NoModels: p.NoModels, PickedFrom: p.PickedFrom, Unlisted: p.Unlisted, Off: p.Off, Fallback: p.Fallback, Routing: p.Routing, Sink: p.Sink, PriceRate: p.PriceRate, Affinity: p.Affinity, KeepLogin: p.KeepLogin, KeepLoginAs: p.KeepLoginAs, SwitchOnly: p.SwitchOnly, Contexts: p.Contexts, Family: p.Family, Proxy: p.Proxy, AccountProxies: p.AccountProxies, AccountModels: p.AccountModels, AccountCaps: p.AccountCaps, AccountWindowCaps: p.AccountWindowCaps, AccountNames: p.AccountNames, MaxConcurrency: p.MaxConcurrency, AccountConcurrency: p.AccountConcurrency, QueueLimit: p.QueueLimit, QueueWait: p.QueueWait, MaxRPM: p.MaxRPM, QuotaRest: p.QuotaRest, PinUpstream: p.PinUpstream, Hidden: hiddenAccount(p.ID), Quiet: quietAccount(p.ID), Tucked: tuckedAccount(p.ID)}
+		p = Provider{ID: p.ID, Key: key, Models: p.Models, NoModels: p.NoModels, PickedFrom: p.PickedFrom, Unlisted: p.Unlisted, Off: p.Off, Fallback: p.Fallback, Routing: p.Routing, Sink: p.Sink, PriceRate: p.PriceRate, Affinity: p.Affinity, KeepLogin: p.KeepLogin, KeepLoginAs: p.KeepLoginAs, SwitchOnly: p.SwitchOnly, Contexts: p.Contexts, Family: p.Family, Proxy: p.Proxy, AccountProxies: p.AccountProxies, AccountModels: p.AccountModels, AccountCaps: p.AccountCaps, AccountWindowCaps: p.AccountWindowCaps, AccountNames: p.AccountNames, MaxConcurrency: p.MaxConcurrency, AccountConcurrency: p.AccountConcurrency, QueueLimit: p.QueueLimit, QueueWait: p.QueueWait, MaxRPM: p.MaxRPM, QuotaRest: p.QuotaRest, QuotaResetAt: p.QuotaResetAt, RestCap: p.RestCap, PinUpstream: p.PinUpstream, NativeCompaction: p.NativeCompaction, Hidden: hiddenAccount(p.ID), Quiet: quietAccount(p.ID), Tucked: tuckedAccount(p.ID)}
 	} else {
 		p.AccountProxies = keyProxies(p) // a provider of keys proxies each key apart
 		if subscriptionID(p.ID) && !stored(p.ID) {
@@ -722,6 +798,9 @@ func Save(p Provider) error {
 				return errors.New("Azure OpenAI needs your resource's endpoint, e.g. https://<resource>.openai.azure.com")
 			}
 			return errors.New("a provider needs a base URL")
+		}
+		if p.InsecureTLS && !p.TakesInsecureTLS() {
+			return fmt.Errorf("%s is a preset's: only a provider you added with your own base URL can skip the certificate check", p.Name)
 		}
 		if strings.Contains(p.Decide, WorkspaceID) {
 			return errors.New("Bailian's decision model is asked at your workspace's host: give its workspace ID (workspace=… or the editor's Workspace ID), or pick the Token Plan")
@@ -744,6 +823,13 @@ func Save(p Provider) error {
 		if p.Was == nil {
 			p.Was = was.Was
 		}
+		if sameStored(*was, p) {
+			// Save pressed on an editor left as it was: providers.json
+			// would be written byte for byte as it is, and its write
+			// handed the catalog to every agent again (agent.SyncCatalog),
+			// seconds of CPU with many agents set up (#1962, witt-bit)
+			return nil
+		}
 		f.Providers[i] = p
 	} else {
 		f.Providers = append(f.Providers, p)
@@ -757,6 +843,16 @@ func Save(p Provider) error {
 		syncClaudeProxyEnvNow()
 	}
 	return nil
+}
+
+// sameStored is whether a and b are written to providers.json alike.
+func sameStored(a, b Provider) bool {
+	x, err := json.Marshal(a)
+	if err != nil {
+		return false
+	}
+	y, err := json.Marshal(b)
+	return err == nil && bytes.Equal(x, y)
 }
 
 // listedWith is what p.PickedFrom is saved as: none without picks; what was
@@ -854,6 +950,7 @@ func AddCopy(p Provider, from string) (string, error) {
 	p.Unlisted = p.Unlisted || src.Unlisted
 	p.Searches = p.Searches || src.Searches
 	p.Unredacted = p.Unredacted || src.Unredacted
+	p.NativeCompaction = p.NativeCompaction || src.NativeCompaction
 	p.PassUserAgent = p.PassUserAgent || src.PassUserAgent
 	if p.Website == "" {
 		p.Website = src.Website
@@ -1030,7 +1127,12 @@ func Delete(id string) error {
 		return fmt.Errorf("no provider %q", id)
 	}
 	f.Providers = keep
-	return store(f)
+	if err := store(f); err != nil {
+		return err
+	}
+	// its StepFun sign-in goes with it, not to a provider added later
+	// under the same id
+	return forgetStepFun(id)
 }
 
 // keyOptional is true for local servers, which usually have no key.
@@ -1119,7 +1221,7 @@ func normalize(p Provider) Provider {
 	if (p.Preset == OMLXPreset || p.Preset == MLXServePreset) && p.Decide == "" && p.Chat != "" {
 		p.Decide = p.Chat
 	}
-	if p.Routing != Ordered && p.Routing != Rotate && p.Routing != LeastUsed && p.Routing != Pace && p.Routing != Weighted {
+	if p.Routing != Ordered && p.Routing != Rotate && p.Routing != LeastUsed && p.Routing != Pace && p.Routing != Weighted && !PluginRouting(p.Routing) {
 		p.Routing = ""
 	}
 	if !slices.Contains(Affinities, p.Affinity) {
@@ -1135,6 +1237,12 @@ func normalize(p Provider) Provider {
 	p.QueueLimit, p.QueueWait = min(max(p.QueueLimit, 0), MaxQueueLimit), min(max(p.QueueWait, 0), MaxQueueWait)
 	p.MaxRPM = min(max(p.MaxRPM, 0), MaxRPMLimit)
 	p.QuotaRest = min(max(p.QuotaRest, 0), MaxQuotaRest)
+	if p.RestCap != RestCapOff {
+		p.RestCap = min(max(p.RestCap, 0), MaxQuotaRest)
+	}
+	if _, err := ParseResetAt(p.QuotaResetAt); err != nil {
+		p.QuotaResetAt = ""
+	}
 	p.Catalog = strings.Join(p.Catalogs(), ", ")
 	// a Bedrock provider saved before the preset had its Responses API
 	// (#176) gets it where its chat completions are: the runtime serves both
@@ -1147,6 +1255,8 @@ func normalize(p Provider) Provider {
 	p.azureEndpoints()
 	// OpenCode Zen's or Go's other APIs, beside the one it was given (#1215)
 	p.openCodeEndpoints()
+	// Bedrock Mantle's other APIs, beside the one it was given
+	p.mantleEndpoints()
 	// a preset's provider keeps its headers too: the preset gives the
 	// endpoints and catalog, the headers say which workspace or app it is
 	p.Headers = cleanHeaders(p.Headers)
@@ -1444,18 +1554,94 @@ func (p Provider) Where() string {
 // which routes and caches by conversation and turns away requests that do
 // not name one in x-opencode-session.
 func (p Provider) IsOpenCode() bool {
-	h := p.Host()
-	return h == "opencode.ai" || strings.HasSuffix(h, ".opencode.ai")
+	return OpenCodeURL("//" + p.Host()) // its port, if it names one, aside
 }
 
-// IsBedrock reports whether the provider is Amazon Bedrock's runtime: made
-// from its preset, or at its host.
+// IsBedrock reports whether the provider is Amazon Bedrock: its runtime
+// (bedrock-runtime.{region}.amazonaws.com) or its Mantle endpoint
+// (bedrock-mantle.{region}.api.aws), made from either's preset or at
+// either's host. The two take the same Bedrock API key and share what
+// Bedrock asks of a request: x-api-key alone on Messages, its own names
+// for Anthropic's betas, no metadata.user_id, max_completion_tokens on
+// chat completions, Claude on Messages and OpenAI's GPT models on
+// Responses first. What only the runtime does (no list of models) is the
+// preset's; what only Mantle does is IsBedrockMantle's.
 func (p Provider) IsBedrock() bool {
-	if p.Preset == "bedrock" {
+	if p.Preset == "bedrock" || p.IsBedrockMantle() {
 		return true
 	}
 	h := p.Host()
 	return strings.HasPrefix(h, "bedrock-runtime.") && strings.HasSuffix(h, ".amazonaws.com")
+}
+
+// IsBedrockMantle reports whether the provider is Amazon Bedrock's Mantle
+// endpoint (@marktoown on X): made from its preset, or added by its
+// address at bedrock-mantle.{region}.api.aws.
+func (p Provider) IsBedrockMantle() bool {
+	return p.Preset == "bedrock-mantle" || mantleHost(p.Host())
+}
+
+// mantleHost is a host of Bedrock's Mantle endpoint.
+func mantleHost(h string) bool {
+	return strings.HasPrefix(h, "bedrock-mantle.") && strings.HasSuffix(h, ".api.aws")
+}
+
+// mantleOpenAI is a model Mantle serves on its OpenAI APIs under
+// /openai/v1 rather than /v1, as the model's card says: OpenAI's closed
+// GPT models (GPT-6 Sol, GPT-5.5) and xAI's Grok. gpt-oss, Gemma and the
+// other open models are at /v1. Asked at the other one, Mantle answers
+// "model `x` isn't supported on this route".
+func mantleOpenAI(model string) bool {
+	return bedrockGPT(model) || strings.HasPrefix(strings.ToLower(model), "xai.")
+}
+
+// MantleBase is the base a request for model goes to on Mantle's chat
+// completions or Responses API, given a Mantle provider's base for it
+// (IsBedrockMantle): one ending /v1 or /openai/v1 goes at whichever of the
+// two serves the model, or at the other when other is set (the model was
+// refused at the first, so the gateway learned its prefix). A base ending
+// otherwise, one the user typed, is given back as it is.
+func MantleBase(base, model string, other bool) string {
+	root, ok := strings.CutSuffix(strings.TrimRight(strings.TrimSpace(base), "/"), "/v1")
+	if !ok {
+		return base
+	}
+	root = strings.TrimSuffix(root, "/openai")
+	if mantleOpenAI(model) != other {
+		return root + "/openai/v1"
+	}
+	return root + "/v1"
+}
+
+// mantleEndpoints fills in the APIs of Bedrock's Mantle endpoint a
+// provider added by its address was saved without: chat completions and
+// Responses at /v1, Messages at /anthropic, as the preset gives them. A
+// chat or Responses URL given at /openai/v1 is moved to /v1, where Mantle
+// lists its models (/openai/v1/models is 404); the gateway still asks each
+// model at the prefix that serves it (MantleBase). Any other URL the user
+// gave an API keeps it.
+func (p *Provider) mantleEndpoints() {
+	if p.Preset != "" && p.Preset != "bedrock-mantle" {
+		return
+	}
+	root := ""
+	for _, b := range []string{p.Chat, p.Responses, p.Anthropic} {
+		if u, err := url.Parse(strings.TrimSpace(b)); err == nil && u.Scheme != "" && mantleHost(strings.ToLower(u.Hostname())) {
+			root = u.Scheme + "://" + u.Host
+			break
+		}
+	}
+	if root == "" {
+		return
+	}
+	for _, b := range []*string{&p.Chat, &p.Responses} {
+		if strings.TrimRight(strings.TrimSpace(*b), "/") == root+"/openai/v1" {
+			*b = root + "/v1"
+		}
+	}
+	p.Chat = cmp.Or(p.Chat, root+"/v1")
+	p.Responses = cmp.Or(p.Responses, p.Chat)
+	p.Anthropic = cmp.Or(p.Anthropic, root+"/anthropic")
 }
 
 // bedrockClaude is a Bedrock id of a Claude model: a model id

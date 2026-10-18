@@ -6,7 +6,9 @@ import (
 	"fmt"
 	"net/http"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
@@ -72,9 +74,32 @@ func antigravityTurnedAway(p provider.Provider, system, said string) bool {
 	return accountAgent(p) == "antigravity" && antigravityTurnsAway(system) && antigravityRefuses(said)
 }
 
+// agForeseeing is how long after Antigravity last turned that system prompt
+// away a group still skips it for one, without asking: long enough that a
+// conversation doesn't wait on the same refusal turn after turn, short
+// enough that a block Google lifts is noticed on the next request after it.
+const agForeseeing = 6 * time.Hour
+
+// antigravityForeseen says whether p is an Antigravity account that would
+// turn body away: it carries the system prompt Antigravity refuses, and
+// Antigravity has refused it within agForeseeing. It holds for exactly the
+// requests antigravityTurnedAway would tell as the refusal, and it changes
+// nothing about the account.
+func (s *Server) antigravityForeseen(p provider.Provider, from provider.Protocol, body []byte) bool {
+	if accountAgent(p) != "antigravity" {
+		return false
+	}
+	at := s.agTurnedAway.Load()
+	if at == 0 || time.Since(time.Unix(0, at)) > agForeseeing {
+		return false
+	}
+	req, err := parse(from, body)
+	return err == nil && antigravityTurnsAway(req.System)
+}
+
 // antigravityTurnedAwayHint is what magpie adds to Antigravity's words, after
 // " — ", for the agent and the Routing page, which says it apart from them in
-// its own language (routing.js AG_TURNED_AWAY).
+// its own language (routing/client.js AG_TURNED_AWAY).
 const antigravityTurnedAwayHint = "Antigravity answers this 429 to the system prompt of Claude Code and the Claude Agent SDK (Claude Desktop's chats) whatever quota is left, so it is not a quota and waiting won't help; use another provider for these chats, or put one after Antigravity in a routing group"
 
 // turnedAwayStatus is what the agent is told when nobody is left to answer
@@ -156,7 +181,7 @@ func buildCodeAssistSent(r *Request, sent, agent string) []byte {
 	}
 	names := map[string]string{}
 	var contents []map[string]any
-	for _, m := range r.Messages {
+	for _, m := range dropSecondAnswers(r.Messages) {
 		role := "user"
 		if m.Role == "assistant" {
 			role = "model"
@@ -397,6 +422,56 @@ func buildCodeAssistSent(r *Request, sent, agent string) []byte {
 	return b
 }
 
+// dropSecondAnswers leaves out a tool result whose call an earlier result
+// already answered, with the images it carried: the first answer stands, as
+// pairToolMessages and pairToolBlocks keep it for a Chat or Messages
+// upstream. Google turns a call turn away when its functionResponse count
+// differs from its functionCall count, so a client that answers one call
+// twice (#2262) had every later turn refused. A call made again under the
+// same id takes an answer of its own, and a result with no id is left as
+// it is. msgs is not changed: a fallback builds from the same request.
+func dropSecondAnswers(msgs []Message) []Message {
+	var out []Message
+	answered := map[string]bool{}
+	for i, m := range msgs {
+		var parts []Part
+		for j, p := range m.Parts {
+			switch {
+			case p.Kind == ToolCall && p.ID != "":
+				delete(answered, p.ID)
+			case p.Kind == ToolResult && p.CallID != "" && p.Standalone == nil:
+				if answered[p.CallID] {
+					if parts == nil {
+						parts = append(make([]Part, 0, len(m.Parts)), m.Parts[:j]...)
+					}
+					if out == nil {
+						out = append(make([]Message, 0, len(msgs)), msgs[:i]...)
+					}
+					continue
+				}
+				answered[p.CallID] = true
+			}
+			if parts != nil {
+				parts = append(parts, p)
+			}
+		}
+		if out == nil {
+			continue
+		}
+		if parts != nil {
+			if len(parts) == 0 {
+				continue
+			}
+			m.Parts = parts
+		}
+		out = append(out, m)
+	}
+	if out == nil {
+		return msgs
+	}
+	return out
+}
+
 // interruptedToolNote is the result a call left unanswered is answered
 // with, the words the chat build gives such a call (pairToolMessages).
 const interruptedToolNote = "[The result of this tool call is unavailable: the turn was interrupted.]"
@@ -477,17 +552,19 @@ func pairFunctionTurns(contents []map[string]any, ag, agClaude bool) []map[strin
 }
 
 // thinkingConfig says how hard the model should think: a level for
-// Gemini 3, a budget for the rest. A model that doesn't think gets none,
-// and one whose id already says its level, at (Antigravity's
-// gemini-3.7-flash-low), is told that level and no other — the effort
-// asked for picked that id. Told no level, Antigravity's variants all but
+// Gemini 3 and later (geminiGeneration), a budget for the rest. A model
+// that doesn't think gets none, and one whose id already says its level,
+// at (Antigravity's gemini-3.7-flash-low), is told that level and no
+// other — the effort asked for picked that id. Told no level, Antigravity's variants all but
 // stop thinking once the request has tools, and give none of it back
 // (#636); Antigravity's own tiered ids, sent a level, don't.
 //
 // Gemini 3's levels: medium goes as medium to Flash, and up to high to
-// Pro, which took low and high only (3 Pro). Minimal goes only to a Flash
-// variant at minimal: 3.7 and 3.8 Flash have none (AI Studio answers 3.8's
-// with a 400), and the id here doesn't say which Flash serves it (Gemini
+// Pro, which took low and high only (3 Pro). A later Gemini is sent the
+// medium it was asked, already fitted to its own levels (fitFor):
+// gemini-4-argon has low, medium and high (#2083). Minimal goes only to a
+// Flash variant at minimal: 3.7 and 3.8 Flash have none (AI Studio
+// answers 3.8's with a 400), and the id here doesn't say which Flash serves it (Gemini
 // CLI's 3.5 Flash goes out as 3.8 Flash where that is rolled out).
 // Reasoning off otherwise (the auto mode classifier's least level) goes at
 // low, which every Gemini 3 text model takes; an image model may have no
@@ -504,7 +581,7 @@ func thinkingConfig(r *Request, model string, claude bool, at string) map[string
 		}
 	}
 	tc := map[string]any{"includeThoughts": true}
-	if strings.HasPrefix(m, "gemini-3") || strings.HasPrefix(m, "gemini-pro-agent") {
+	if gen := geminiGeneration(m); gen >= 3 || strings.HasPrefix(m, "gemini-pro-agent") {
 		effort := r.Effort
 		if at != "" {
 			effort = at
@@ -518,7 +595,7 @@ func thinkingConfig(r *Request, model string, claude bool, at string) map[string
 				level = "minimal"
 			case offEffort(effort) && !catalog.DrawsID(m):
 				level = "low"
-			case effort == "medium" && strings.Contains(m, "flash"):
+			case effort == "medium" && (strings.Contains(m, "flash") || gen > 3):
 				level = "medium"
 			}
 			tc["thinkingLevel"] = level
@@ -534,6 +611,25 @@ func thinkingConfig(r *Request, model string, claude bool, at string) map[string
 	}
 	tc["thinkingBudget"] = budget
 	return tc
+}
+
+// geminiVersion is the major version in a Gemini model's id, as the id
+// names it: gemini-4-argon, models/gemini-3.8-flash, gemini-2.5-pro.
+var geminiVersion = regexp.MustCompile(`(?:^|/)gemini-(\d+)`)
+
+// geminiGeneration is the generation of Gemini model names, 0 for an id
+// that names none (a non-Gemini model, or an alias such as
+// gemini-flash-latest, which may still be a 2.5). From Gemini 3 a model is
+// told a thinking level; Gemini 4 turns a budget away with "Thinking
+// budget is not supported for this model. Use thinking level instead."
+// (#2083), so a new generation isn't sent one either.
+func geminiGeneration(model string) int {
+	m := geminiVersion.FindStringSubmatch(model)
+	if m == nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(m[1])
+	return n
 }
 
 // plainSchema is a JSON schema cut down to what Antigravity's function

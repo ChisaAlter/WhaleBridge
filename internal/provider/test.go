@@ -50,6 +50,9 @@ func (p Provider) Test(ctx context.Context) []Result {
 		if !ok {
 			return []Result{{Protocol: proto, Model: model, Error: "no key is on for this endpoint"}}
 		}
+		if model == "" && q.zenPublic() {
+			return []Result{{Protocol: proto, Error: zenPublicNone}}
+		}
 		url, body := tiny(q, proto, UpstreamName(p, model))
 		return []Result{probe(ctx, q, proto, url, q.tested(asClient(client, proto, body)), model, testWait)}
 	}
@@ -67,8 +70,16 @@ func (p Provider) Test(ctx context.Context) []Result {
 			out = append(out, Result{Protocol: proto, Model: model, Error: "no key is on for this endpoint"})
 			continue
 		}
+		if model == "" && q.zenPublic() {
+			// an API Zen serves no free model on: public reaches none
+			// of its models, which is no fault of the key's
+			continue
+		}
 		url, body := tiny(q, proto, UpstreamName(p, model))
 		out = append(out, probe(ctx, q, proto, url, q.tested(body), model, testWait))
+	}
+	if len(out) == 0 && p.zenPublic() {
+		out = append(out, Result{Protocol: Chat, Error: zenPublicNone})
 	}
 	if p.IsRemoteMagpie() {
 		// The model list already checked its key and named its decisions.
@@ -89,7 +100,7 @@ func tiny(q Provider, proto Protocol, model string) (url, body string) {
 		body = strings.TrimSuffix(body, "}") + `,"stream":true}`
 	}
 	if q.OpenCodeFree(model) && body != "" {
-		body = zenFreeProbe(proto, body)
+		url, body = OpenCodeFreeURL(url), zenFreeProbe(proto, body)
 	}
 	if q.IsCline() && body != "" {
 		body = clineProbe(body)
@@ -160,15 +171,24 @@ func (p Provider) AsksDecideModels() bool {
 	return p.Decides() && (v == ViaSystemOne || v == ViaVercel || v == ViaCloudflare)
 }
 
+// mantleBase is base for model at the prefix Mantle serves it under
+// (MantleBase), for a Mantle provider; base for any other.
+func (p Provider) mantleBase(base, model string) string {
+	if !p.IsBedrockMantle() {
+		return base
+	}
+	return MantleBase(base, model, false)
+}
+
 func tinyBody(q Provider, proto Protocol, model string) (url, body string) {
 	switch proto {
 	case Chat:
 		if q.IsBedrock() || q.IsAzure() {
-			return q.Chat + "/chat/completions", fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":16}`, model)
+			return q.mantleBase(q.Chat, model) + "/chat/completions", fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}],"max_completion_tokens":16}`, model)
 		}
 		return q.Chat + "/chat/completions", fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"hi"}],"max_tokens":16}`, model)
 	case Responses:
-		return q.Responses + "/responses", fmt.Sprintf(`{"model":%q,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"max_output_tokens":16}`, model)
+		return q.mantleBase(q.Responses, model) + "/responses", fmt.Sprintf(`{"model":%q,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],"max_output_tokens":16}`, model)
 	case Anthropic:
 		return q.Anthropic + "/v1/messages", fmt.Sprintf(`{"model":%q,"max_tokens":16,"messages":[{"role":"user","content":"hi"}]}`, model)
 	case Gemini:
@@ -296,10 +316,11 @@ func (p Provider) testOne(ctx context.Context, model string) Result {
 	q, ok := p, true
 	if keys := p.KeysOn(); len(keys) > 0 {
 		ok = false
+		serves := p.Serving(model)
 	pick:
 		for _, want := range []Protocol{proto, ""} {
 			for _, k := range keys {
-				if k.Protocol == want && p.Serves(k, model) {
+				if k.Protocol == want && serves(k) {
 					q, ok = p.WithKey(k), true
 					break pick
 				}
@@ -362,12 +383,27 @@ func (p Provider) keyFor(proto Protocol) (Provider, bool) {
 	return p, false
 }
 
+// zenPublic is whether p is OpenCode Zen asked with the key OpenCode
+// sends signed out (public), which Zen's free models alone answer.
+func (p Provider) zenPublic() bool {
+	return p.IsOpenCode() && p.Key == OpenCodeAnonymousKey
+}
+
+// zenPublicNone is why Zen's public key has nothing to test.
+const zenPublicNone = "no free model of OpenCode Zen is listed for this API: the public key reaches only the free ones (refresh the model list, or add a Zen key for the rest)"
+
 // testModel is the model a probe of proto's endpoint asks for: the first
 // exposed one q's key sees, else the first it sees at all — preferring a
 // Claude model on the Anthropic endpoint, and one that chats to one that
-// draws on an images API.
+// draws on an images API. On OpenCode's gateway a model models.dev names
+// no API for is served on chat alone, so no other endpoint is tried with
+// it; and with Zen's public key only a free model is tried, on an API it
+// is served on, or none (z'x on Discord: Test asked public for
+// claude-fable-5 on Messages, gemini-3-flash on Gemini and big-pickle on
+// Responses, and every one failed, though big-pickle answers on chat).
 func (p Provider) testModel(q Provider, proto Protocol) string {
 	k := q.first()
+	public := q.zenPublic()
 	off := disabledNow() // a model the user disabled is never asked (#1867)
 	var pools [][]catalog.Model
 	if ms := p.Exposed(); len(ms) > 0 {
@@ -382,12 +418,19 @@ func (p Provider) testModel(q Provider, proto Protocol) string {
 			if apis := p.APIs(id); apis != nil {
 				return slices.Contains(apis, proto)
 			}
-			return proto != Anthropic || isClaude(id)
+			if p.IsOpenCode() {
+				// each model on one API, chat for the rest (openCodeEndpoints)
+				return proto == Chat || proto == Anthropic && isClaude(id)
+			}
+			return (proto != Anthropic || isClaude(id)) && !p.NamedOnlyOn(proto)
 		},
-		func(string) bool { return true },
+		func(string) bool { return !public },
 	} {
 		for _, pool := range pools {
 			for _, m := range pool {
+				if public && !p.OpenCodeFree(m.ID) {
+					continue
+				}
 				if !p.DecidesModel(m.ID) && !off(p.ID, m.ID) && want(m.ID) && (k.Key == "" || p.Serves(k, m.ID)) {
 					return m.ID
 				}
@@ -460,8 +503,8 @@ func probe(ctx context.Context, p Provider, proto Protocol, url string, body []b
 	if proto == Anthropic {
 		req.Header.Set("anthropic-version", "2023-06-01")
 	}
-	if p.IsOpenCode() {
-		OpenCodeClient(req.Header, "")
+	if OpenCodeURL(url) {
+		OpenCodeClient(req.Header, "") // a session of the probe's own
 	}
 	if p.IsCline() {
 		ClineClient(req.Header)
@@ -485,6 +528,11 @@ func probe(ctx context.Context, p Provider, proto Protocol, url string, body []b
 	if err == nil && proto == Chat {
 		// a GLM Coding Plan's key at Zhipu's pay-as-you-go endpoint
 		res, err = RetryZhipuCoding(p, req, res, func(r *http.Request) (*http.Response, error) { return p.Do(http.DefaultClient, r) })
+	}
+	if err == nil {
+		// Zhipu's Responses API refuses a key 200, in an envelope: the
+		// refusal it is, not a green check (@xanahopper on X)
+		res = ZhipuEnveloped(req, res)
 	}
 	r.Millis = time.Since(start).Milliseconds()
 	if err != nil {

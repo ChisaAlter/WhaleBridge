@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"io/fs"
 	"maps"
 	"os"
 	"path/filepath"
@@ -30,11 +31,13 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/klauspost/compress/zstd"
 	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/dirent"
+	"github.com/ChisaAlter/WhaleBridge/internal/proc"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
+	"github.com/klauspost/compress/zstd"
 )
 
 // Tokens is a count of tokens. Input excludes what was read from cache.
@@ -91,19 +94,42 @@ type Model struct {
 	Priced bool    `json:"priced"`
 }
 
+// ModelEffort is one model and reasoning effort's share of a session.
+type ModelEffort struct {
+	Model  string `json:"model"`
+	Effort string `json:"effort"`
+	Tokens
+	Reasoning int     `json:"reasoning"`
+	Cost      float64 `json:"cost"`
+	Priced    bool    `json:"priced"`
+}
+
+// CodexIdentity is a Codex thread's confirmed role and parent chain.
+type CodexIdentity struct {
+	ID            string `json:"id"`
+	Role          string `json:"role"`
+	ParentSession string `json:"parent_session,omitempty"`
+	RootSession   string `json:"root_session,omitempty"`
+}
+
 // Session is one agent session.
 type Session struct {
 	ReadOnly bool `json:"read_only,omitempty"`
 	// Gateway: seen only through magpie's gateway, with no file of the
 	// agent's on this computer (external.go)
-	Gateway bool      `json:"gateway,omitempty"`
-	Agent   string    `json:"agent"` // magpie agent id: claude, codex, opencode, pi, omp, zcode, dsh, cline, qoder, qoder-cn, grok, workbuddy, droid, cursor, hermes, alma, kimi
-	ID      string    `json:"id"`
-	Cwd     string    `json:"cwd"`
-	Title   string    `json:"title"` // the name it was given, else the agent's own title, else the first prompt
-	Start   time.Time `json:"start"`
-	Last    time.Time `json:"last"`
-	Models  []Model   `json:"models"`
+	Gateway       bool          `json:"gateway,omitempty"`
+	Agent         string        `json:"agent"` // magpie agent id: claude, codex, opencode, pi, omp, zcode, dsh, cline, qoder, qoder-cn, grok, workbuddy, droid, cursor, hermes, alma, kimi
+	ID            string        `json:"id"`
+	Cwd           string        `json:"cwd"`
+	Title         string        `json:"title"` // the name it was given, else the agent's own title, else the first prompt
+	Nickname      string        `json:"nickname,omitempty"`
+	Start         time.Time     `json:"start"`
+	Last          time.Time     `json:"last"`
+	Role          string        `json:"role,omitempty"`
+	ParentSession string        `json:"parent_session,omitempty"`
+	RootSession   string        `json:"root_session,omitempty"`
+	ModelEffort   []ModelEffort `json:"model_effort,omitempty"`
+	Models        []Model       `json:"models"`
 	Tokens
 	Cost     float64 `json:"cost"`     // USD at the effective price, for the priced models
 	Unpriced int     `json:"unpriced"` // models that spent tokens but have no known price
@@ -114,6 +140,9 @@ type Session struct {
 	Carry []Carry `json:"carry,omitempty"`
 	// Transcript says its conversation can be read (TranscriptOf)
 	Transcript bool `json:"transcript,omitempty"`
+	// Subagents are the conversations its agent started inside it, each
+	// read with SubagentTranscript (subagents.go)
+	Subagents []Subagent `json:"subagents,omitempty"`
 	// WSL is the WSL distro the session ran in, its files read through
 	// \\wsl.localhost (see wsl.go); "" for this computer's own
 	WSL string `json:"wsl,omitempty"`
@@ -139,24 +168,31 @@ const All = 5000
 
 // state is what one file's parse has come to, enough to read on from Off.
 type state struct {
-	Codex       *codexUsageState  `json:"-"`
-	Claude      *claudeUsageState `json:"-"`
-	DBRevision  string            `json:"db_revision,omitempty"`
-	Head        string            `json:"head,omitempty"`
-	HeadSize    int               `json:"head_size,omitempty"`
-	ContentHash string            `json:"content_hash,omitempty"`
-	Size        int64             `json:"size"`
-	Mod         int64             `json:"mod"` // unix nanoseconds
-	Off         int64             `json:"off"` // after the last whole line read
-	ID          string            `json:"id,omitempty"`
-	Cwd         string            `json:"cwd,omitempty"`
-	Title       string            `json:"title,omitempty"`
-	Named       string            `json:"named,omitempty"`  // the agent's own title for it
-	Custom      string            `json:"custom,omitempty"` // the name the user gave it
-	First       string            `json:"first,omitempty"`  // the first message, when no prompt looked typed
-	Start       time.Time         `json:"start"`
-	Last        time.Time         `json:"last"`
-	Models      map[string]Tokens `json:"models,omitempty"`
+	Codex                 *codexUsageState  `json:"-"`
+	Claude                *claudeUsageState `json:"-"`
+	DBRevision            string            `json:"db_revision,omitempty"`
+	Head                  string            `json:"head,omitempty"`
+	HeadSize              int               `json:"head_size,omitempty"`
+	ContentHash           string            `json:"content_hash,omitempty"`
+	Size                  int64             `json:"size"`
+	Mod                   int64             `json:"mod"` // unix nanoseconds
+	Off                   int64             `json:"off"` // after the last whole line read
+	ID                    string            `json:"id,omitempty"`
+	CodexIdentity         *CodexIdentity    `json:"codex_identity,omitempty"`
+	CodexIdentityConflict bool              `json:"codex_identity_conflict,omitempty"`
+	CodexNickname         string            `json:"codex_nickname,omitempty"`
+	CodexSpawnNames       map[string]string `json:"codex_spawn_names,omitempty"`
+	CodexSpawnConflicts   map[string]bool   `json:"codex_spawn_conflicts,omitempty"`
+	CodexAgentIDs         map[string]string `json:"codex_agent_ids,omitempty"`
+	CodexAgentConflicts   map[string]bool   `json:"codex_agent_conflicts,omitempty"`
+	Cwd                   string            `json:"cwd,omitempty"`
+	Title                 string            `json:"title,omitempty"`
+	Named                 string            `json:"named,omitempty"`  // the agent's own title for it
+	Custom                string            `json:"custom,omitempty"` // the name the user gave it
+	First                 string            `json:"first,omitempty"`  // the first message, when no prompt looked typed
+	Start                 time.Time         `json:"start"`
+	Last                  time.Time         `json:"last"`
+	Models                map[string]Tokens `json:"models,omitempty"`
 	// Days is Models again, split by the local date each message was
 	// written on: a session that runs past midnight counts on both days.
 	Days map[string]*day `json:"days,omitempty"`
@@ -311,6 +347,10 @@ func (s *state) clone() *state {
 		t := *s.Total
 		c.Total = &t
 	}
+	c.CodexSpawnNames = maps.Clone(s.CodexSpawnNames)
+	c.CodexSpawnConflicts = maps.Clone(s.CodexSpawnConflicts)
+	c.CodexAgentIDs = maps.Clone(s.CodexAgentIDs)
+	c.CodexAgentConflicts = maps.Clone(s.CodexAgentConflicts)
 	c.Days = make(map[string]*day, len(s.Days))
 	for k, v := range s.Days {
 		d := &day{Active: v.Active, Models: make(map[string]Tokens, len(v.Models)), Prompts: v.Prompts, Replies: v.Replies}
@@ -339,9 +379,11 @@ type file struct {
 	main  bool // the session's own file, not a subagent's
 	size  int64
 	mod   time.Time
-	// OpenCode and ZCode: the session, and where it is kept
-	sid string
-	oc  ocStore
+	// OpenCode and ZCode: the session, and where it is kept; parent is
+	// the session that started it, "" for one the user did
+	sid    string
+	parent string
+	oc     ocStore
 	// Cline: the session's manifest, beside its messages; Grok Build: its
 	// summary.json, beside its updates; Droid: its settings, beside its
 	// transcript
@@ -383,7 +425,7 @@ func ccFiles(agent, dir string) []file {
 	projects := filepath.Join(dir, "projects")
 	var out []file
 	for _, project := range readDirectory(projects) {
-		if !project.IsDir() && project.Type()&os.ModeSymlink == 0 {
+		if !dirent.IsFolder(projects, project) {
 			continue
 		}
 		root := filepath.Join(projects, project.Name())
@@ -394,7 +436,7 @@ func ccFiles(agent, dir string) []file {
 				if stat(&f) {
 					out = append(out, f)
 				}
-			} else if e.IsDir() || e.Type()&os.ModeSymlink != 0 {
+			} else if dirent.IsFolder(root, e) {
 				subs := filepath.Join(path, "subagents")
 				for _, sub := range readDirectory(subs) {
 					if sub.IsDir() || !strings.HasSuffix(sub.Name(), ".jsonl") {
@@ -406,7 +448,7 @@ func ccFiles(agent, dir string) []file {
 					}
 				}
 				for _, run := range readDirectory(filepath.Join(subs, "workflows")) {
-					if !run.IsDir() {
+					if !dirent.IsFolder(filepath.Join(subs, "workflows"), run) {
 						continue
 					}
 					dir := filepath.Join(subs, "workflows", run.Name())
@@ -478,12 +520,38 @@ const zstSuffix = ".zst"
 
 func codexFiles() []file { return codexFilesIn(CodexDir()) }
 
+// walkLinked is filepath.WalkDir over root, which can be a link to the
+// folder: the Codex CLI keeps .codex on another drive by making
+// ~/.codex/sessions a junction to it, and a symlink does the same
+// elsewhere. WalkDir lstat()s the root it is handed, where a link is no
+// folder at all, so it walked nothing behind it (#2233). It walks where
+// the link leads (proc.RealPath, since filepath.EvalSymlinks leaves a
+// junction as it is) and hands fn each path under root, not under the
+// link's target: an agent's folder is read back out of a session's path
+// (Codex's config.toml and state databases), and the target holds none
+// of it. A root that is no link is walked as it is.
+func walkLinked(root string, fn fs.WalkDirFunc) error {
+	walk := root
+	if fi, err := os.Lstat(root); err == nil && !fi.IsDir() {
+		if real, err := proc.RealPath(root); err == nil {
+			walk = real
+		}
+	}
+	return filepath.WalkDir(walk, func(p string, d fs.DirEntry, err error) error {
+		if walk != root {
+			if rel, err := filepath.Rel(walk, p); err == nil {
+				p = filepath.Join(root, rel)
+			}
+		}
+		return fn(p, d, err)
+	})
+}
+
 // codexFilesIn are the rollouts in a Codex folder.
 func codexFilesIn(dir string) []file {
 	var out []file
 	for _, folder := range []string{"sessions", "archived_sessions"} {
-		root := filepath.Join(dir, folder)
-		filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		walkLinked(filepath.Join(dir, folder), func(p string, d os.DirEntry, err error) error {
 			if err != nil || d.IsDir() {
 				return nil
 			}
@@ -555,7 +623,9 @@ func CachePath() string { return filepath.Join(filepath.Dir(catalog.CachePath())
 // 17: reconcile recent Claude message revisions.
 // 18: Claude Code's 1-hour cache writes apart from its 5-minute ones.
 // 19: the names the user gave Claude Code's and WorkBuddy's (custom-title).
-const cacheVersion = 19
+// 20: Codex's source and direct parent thread identity.
+// 21: Codex subagent nicknames and parent spawn task names.
+const cacheVersion = 21
 
 type cacheFile struct {
 	Version int               `json:"version"`
@@ -675,7 +745,8 @@ func writeCache(c *save) {
 
 // refresh parses those of want that changed since their parse was kept, a
 // few files at a time, and keeps the parses of every file still on disk
-// (all of them), read by List or by Stats.
+// (all of them), read by List or by Stats. With no all-set it leaves other
+// cached agents alone, for a Codex-only identity refresh.
 func refresh(want, all []file) {
 	defer func() { trimSummaryRevisions(time.Now()) }()
 	var todo []file
@@ -688,7 +759,7 @@ func refresh(want, all []file) {
 		}
 	}
 	gone := false
-	if len(cache) > 0 {
+	if len(cache) > 0 && all != nil {
 		on := make(map[string]bool, len(all))
 		for _, f := range all {
 			on[f.path] = true
@@ -949,11 +1020,15 @@ func List(limit int) []Session {
 	// indexes them all in one run the page can show, and the stats read
 	// after it has nothing left to do
 	refresh(files, files)
+	identities := codexIdentitySnapshot(files)
+	taskTitles := codexSubagentTaskTitles(files)
 
 	price := pricer()
 	out := []Session{}
 	for _, k := range keys {
 		if s, ok := assemble(groups[k], price); ok {
+			setSessionCodexIdentity(&s, identities)
+			setSessionCodexTaskTitle(&s, taskTitles)
 			out = append(out, s)
 			if len(out) == limit {
 				break
@@ -1004,6 +1079,9 @@ func assemble(fs []file, price func(string) *catalog.Price) (Session, bool) {
 			if (s.Agent == "codex" || s.Agent == "pi" || s.Agent == "omp" || s.Agent == "dsh" || s.Agent == "grok" || s.Agent == "droid") && st.ID != "" && f.path == fs[0].path {
 				s.ID = st.ID
 			}
+		}
+		if s.Agent == "codex" && st.CodexNickname != "" {
+			s.Nickname = st.CodexNickname
 		}
 		if !st.Start.IsZero() && (s.Start.IsZero() || st.Start.Before(s.Start)) {
 			s.Start = st.Start
@@ -1059,6 +1137,9 @@ func assemble(fs []file, price func(string) *catalog.Price) (Session, bool) {
 		s.Resume = resumeCommand(s.WSL, s.Agent, s.ID, s.Cwd, s.Path)
 	}
 	s.Carry, s.Transcript = carries(s), HasTranscript(s.Agent)
+	if s.Transcript {
+		s.Subagents = subagentsOf(s, fs)
+	}
 	return s, true
 }
 
@@ -1337,6 +1418,14 @@ func priceOf(s settings.Settings, model string) (catalog.Price, bool) {
 			return pr, true
 		}
 	}
+	// Grok Build's fast variant (grok-4.7-build-fast), which only the Grok
+	// CLI names, at twice its model's price, as a Grok account's call on it
+	// is (TradingLife on Discord)
+	if base, ok := provider.GrokBuildFast(bare); ok {
+		if pr, ok := catalog.PricedBy(makers(base), base); ok {
+			return pr.Times(provider.GrokFastTimes), true
+		}
+	}
 	return catalog.Price{}, false
 }
 
@@ -1424,14 +1513,19 @@ func resumeCommand(distro, agent, id, cwd, path string) string {
 func shellQuote(s string) string { return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'" }
 
 // Find is a session by agent and id: a listed one, else one Get finds
-// under agent:id.
+// under agent:id. One nothing was said in is found too, as ListAgent lists
+// it: the Sessions page shows it, and its conversation, Markdown and
+// Terminal open from it as from any other (#2273).
 func Find(agent, id string) (Session, bool) {
 	for _, s := range List(0) {
 		if s.Agent == agent && s.ID == id {
 			return s, true
 		}
 	}
-	if s, ok := Get(agent + ":" + id); ok && s.ID == id {
+	if s, ok, found := get(agent + ":" + id); found && s.ID == id {
+		if !ok {
+			listed(&s)
+		}
 		return s, true
 	}
 	return Session{}, false
@@ -1448,15 +1542,32 @@ func Titles(keys []string) map[string]string {
 		return out
 	}
 	want := make(map[string]bool, len(keys))
-	var desktopIDs []string
+	var desktopIDs, piDesktopIDs []string
 	for _, k := range keys {
 		want[k] = true
 		if id, ok := strings.CutPrefix(k, "claude-desktop:"); ok {
 			desktopIDs = append(desktopIDs, id)
+			continue
+		}
+		// PI-Desktop names its chats in pi.sqlite, which none of their files
+		// holds (#1967); a request it sent without a User-Agent of its own
+		// was counted as Pi's, so both of its names are looked up
+		if agent, id, ok := strings.Cut(k, ":"); ok && isPIDesktop(agent) {
+			piDesktopIDs = append(piDesktopIDs, id)
 		}
 	}
 	for id, name := range DesktopTitles(desktopIDs) {
 		out["claude-desktop:"+id] = name
+	}
+	if len(piDesktopIDs) > 0 {
+		names := PIDesktopTitles(piDesktopIDs)
+		for _, k := range keys {
+			if agent, id, ok := strings.Cut(k, ":"); ok && isPIDesktop(agent) {
+				if name := names[id]; name != "" {
+					out[k] = name
+				}
+			}
+		}
 	}
 	mu.Lock()
 	defer mu.Unlock()
@@ -1475,9 +1586,21 @@ func Titles(keys []string) map[string]string {
 		return out
 	}
 	refresh(fs, files)
+	parents := codexTaskParentFiles(fs, files)
+	if len(parents) > 0 {
+		refresh(parents, files)
+	}
+	titleFiles := append(append([]file(nil), fs...), parents...)
+	taskTitles := codexSubagentTaskTitles(titleFiles)
+	identities := codexIdentitySnapshot(fs)
 	price := pricer()
 	for k, g := range groups {
-		if s, ok := assemble(g, price); ok && s.Title != "" {
+		if s, ok := assemble(g, price); ok {
+			setSessionCodexIdentity(&s, identities)
+			setSessionCodexTaskTitle(&s, taskTitles)
+			if s.Title == "" {
+				continue
+			}
 			out[k] = s.Title
 		}
 	}
@@ -1487,6 +1610,13 @@ func Titles(keys []string) map[string]string {
 // Get is the session whose files are grouped under key (a Summary's Key),
 // however long ago it was at work.
 func Get(key string) (Session, bool) {
+	s, ok, _ := get(key)
+	return s, ok
+}
+
+// get is Get, and whether key has files at all: ok is false for a session
+// nothing was said in, which found still says is there.
+func get(key string) (s Session, ok, found bool) {
 	mu.Lock()
 	defer mu.Unlock()
 	loadCache()
@@ -1499,8 +1629,25 @@ func Get(key string) (Session, bool) {
 		}
 	}
 	if len(fs) == 0 {
-		return Session{}, false
+		return Session{}, false, false
 	}
-	refresh(fs, files)
-	return assemble(fs, pricer())
+	var identities map[string]CodexIdentity
+	var taskTitles map[codexTaskTitle]string
+	if strings.HasPrefix(key, "codex:") {
+		var codexFiles []file
+		for _, f := range files {
+			if f.agent == "codex" {
+				codexFiles = append(codexFiles, f)
+			}
+		}
+		refresh(codexFiles, files)
+		identities = codexIdentitySnapshot(codexFiles)
+		taskTitles = codexSubagentTaskTitles(codexFiles)
+	} else {
+		refresh(fs, files)
+	}
+	s, ok = assemble(fs, pricer())
+	setSessionCodexIdentity(&s, identities)
+	setSessionCodexTaskTitle(&s, taskTitles)
+	return s, ok, true
 }

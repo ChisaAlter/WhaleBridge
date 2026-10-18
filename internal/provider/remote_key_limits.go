@@ -40,9 +40,11 @@ const errRemoteNoKeyLimit = "remote magpie is too old to tell this key's limit; 
 type GatewayKeyLimit struct {
 	// Limited is false for a key the remote holds to no limit.
 	Limited bool `json:"limited"`
-	// Period is "day", "week", "month" or "days" (a cycle of Days days).
+	// Period is "day", "week", "month", "days" (a cycle of Days days) or
+	// "hours" (of Hours hours).
 	Period string    `json:"period,omitempty"`
 	Days   int       `json:"days,omitempty"`
+	Hours  int       `json:"hours,omitempty"`
 	Start  time.Time `json:"start,omitzero"`
 	Reset  time.Time `json:"reset,omitzero"`
 	Calls  int       `json:"calls,omitempty"`
@@ -56,25 +58,30 @@ type GatewayKeyLimit struct {
 }
 
 // remoteKeyAnswer is RemoteKeyLimitPath's answer (budget.Status, as the
-// gateway's keyLimit sends it).
+// gateway's keyLimit sends it): Limit the one holding the key most,
+// Limits each of its limits (#2227), from a magpie that has them.
 type remoteKeyAnswer struct {
-	Limited *bool  `json:"limited"`
-	Key     string `json:"key"`
-	Limit   *struct {
-		Period     string    `json:"period"`
-		Days       int       `json:"days"`
-		Start      time.Time `json:"start"`
-		Reset      time.Time `json:"reset"`
-		Calls      int       `json:"calls"`
-		Tokens     int64     `json:"tokens"`
-		Cost       float64   `json:"cost"`
-		Unpriced   int       `json:"unpriced"`
-		TokenLimit int64     `json:"tokenLimit"`
-		CostLimit  float64   `json:"costLimit"`
-		TokensLeft int64     `json:"tokensLeft"`
-		CostLeft   float64   `json:"costLeft"`
-		Spent      bool      `json:"spent"`
-	} `json:"limit"`
+	Limited *bool            `json:"limited"`
+	Key     string           `json:"key"`
+	Limit   *remoteKeyLimit  `json:"limit"`
+	Limits  []remoteKeyLimit `json:"limits"`
+}
+
+type remoteKeyLimit struct {
+	Period     string    `json:"period"`
+	Days       int       `json:"days"`
+	Hours      int       `json:"hours"`
+	Start      time.Time `json:"start"`
+	Reset      time.Time `json:"reset"`
+	Calls      int       `json:"calls"`
+	Tokens     int64     `json:"tokens"`
+	Cost       float64   `json:"cost"`
+	Unpriced   int       `json:"unpriced"`
+	TokenLimit int64     `json:"tokenLimit"`
+	CostLimit  float64   `json:"costLimit"`
+	TokensLeft int64     `json:"tokensLeft"`
+	CostLeft   float64   `json:"costLeft"`
+	Spent      bool      `json:"spent"`
 }
 
 type remoteKeyRead struct {
@@ -117,10 +124,12 @@ func remoteKeyCards(ctx context.Context, p Provider, fresh bool, only string) []
 	names, keys := remoteKeys(p)
 	out := make([]SubscriptionQuota, len(keys))
 	var wg sync.WaitGroup
+	var slots keySlots
 	for i := range keys {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
+			defer slots.take(ctx, p.ID)()
 			out[i] = remoteKeyCardOf(ctx, p, names[i], keys[i], fresh && (only == "" || only == names[i]))
 		}()
 	}
@@ -167,27 +176,39 @@ func remoteKeyCardOf(ctx context.Context, p Provider, name, key string, fresh bo
 }
 
 // keyLimitCard is what a key's card shows of the remote's answer: a
-// window for each cap, named for its period, or one window with no limit.
+// window for each cap of each of its limits, named for its period, or one
+// window with no limit. What the card says of the key itself is of the
+// limit holding it most.
 func keyLimitCard(a *remoteKeyAnswer) (*GatewayKeyLimit, []QuotaWindow) {
 	l := a.Limit
 	if !*a.Limited || l == nil {
 		return &GatewayKeyLimit{}, []QuotaWindow{{Name: "Limit", Unlimited: true}}
 	}
-	g := &GatewayKeyLimit{Limited: true, Period: l.Period, Days: l.Days, Start: l.Start, Reset: l.Reset, Calls: l.Calls, Spent: l.Spent, Unpriced: l.Unpriced}
-	reset := l.Reset
+	g := &GatewayKeyLimit{Limited: true, Period: l.Period, Days: l.Days, Hours: l.Hours, Start: l.Start, Reset: l.Reset, Calls: l.Calls, Spent: l.Spent, Unpriced: l.Unpriced}
+	all := a.Limits
+	if len(all) == 0 { // a magpie from before #2227 tells one
+		all = []remoteKeyLimit{*l}
+	}
 	var ws []QuotaWindow
 	share := func(used, limit float64) float64 { return math.Min(100, math.Round(used/limit*1000)/10) }
+	for _, x := range all {
+		reset := x.Reset
+		if x.TokenLimit > 0 {
+			ws = append(ws, QuotaWindow{Name: keyWindowName("Tokens", x.Period), Used: share(float64(x.Tokens), float64(x.TokenLimit)), ResetsAt: &reset,
+				Amount: float64(x.Tokens), Limit: float64(x.TokenLimit), Unit: "tokens"})
+		}
+		if x.CostLimit > 0 {
+			ws = append(ws, QuotaWindow{Name: keyWindowName("Spend", x.Period), Used: share(x.Cost, x.CostLimit), ResetsAt: &reset,
+				Amount: math.Round(x.Cost*100) / 100, Limit: x.CostLimit, Unit: "USD"})
+		}
+	}
 	if l.TokenLimit > 0 {
 		left := l.TokensLeft
 		g.TokensLeft = &left
-		ws = append(ws, QuotaWindow{Name: keyWindowName("Tokens", l.Period), Used: share(float64(l.Tokens), float64(l.TokenLimit)), ResetsAt: &reset,
-			Amount: float64(l.Tokens), Limit: float64(l.TokenLimit), Unit: "tokens"})
 	}
 	if l.CostLimit > 0 {
 		left := l.CostLeft
 		g.CostLeft = &left
-		ws = append(ws, QuotaWindow{Name: keyWindowName("Spend", l.Period), Used: share(l.Cost, l.CostLimit), ResetsAt: &reset,
-			Amount: math.Round(l.Cost*100) / 100, Limit: l.CostLimit, Unit: "USD"})
 	}
 	if ws == nil { // limited, with no cap it tells: an answer we can't read
 		return &GatewayKeyLimit{}, []QuotaWindow{{Name: "Limit", Unlimited: true}}

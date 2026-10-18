@@ -78,8 +78,10 @@ var (
 // Filtered runs fn with every file written through this package passed
 // through f first: f gets the path (a link's target) and the bytes about to
 // be written, and returns the bytes to write. Writes from elsewhere while
-// fn runs pass through f too, so f changes only what it is sure of. One
-// Filtered runs at a time.
+// fn runs pass through f too, so f changes only what it is sure of, and
+// waits on nothing: it runs under whatever lock the writer holds
+// (settings.Save's, which settings.Load waits on). One Filtered runs at a
+// time.
 func Filtered(f func(path string, data []byte) []byte, fn func() error) error {
 	filtering.Lock()
 	defer filtering.Unlock()

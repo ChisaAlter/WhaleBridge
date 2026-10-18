@@ -111,6 +111,11 @@ func (c *cliIdentity) get() (user, plan string, ok bool) {
 			c.at = time.Unix(1, 0)
 		}
 	}
+	if leftAlone(c.name) {
+		// switched off or removed: the CLI isn't asked, what it said last
+		// is served
+		return c.user, c.plan, c.ok
+	}
 	if c.at.IsZero() {
 		// never answered: waited for, but only so long and only once — a
 		// request looks several times, and a CLI that takes longer is

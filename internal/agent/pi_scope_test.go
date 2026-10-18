@@ -162,6 +162,11 @@ func TestPiEnabledModelsFollowRename(t *testing.T) {
 			if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Chat: "https://api.deepseek.com/v1", Key: "k", Models: []string{"pro", "flash"}}); err != nil {
 				t.Fatal(err)
 			}
+			// a provider whose id only shares a prefix; its model is offered,
+			// so the sync after the rename keeps its entry (#2055)
+			if err := provider.Save(provider.Provider{ID: "deepseekx", Name: "DeepSeekX", Chat: "https://deepseekx.invalid/v1", Key: "k", Models: []string{"flash"}}); err != nil {
+				t.Fatal(err)
+			}
 			settings := filepath.Join(append([]string{home}, append(c.dir, "settings.json")...)...)
 			os.MkdirAll(filepath.Dir(settings), 0o755)
 			os.WriteFile(settings, []byte(`{

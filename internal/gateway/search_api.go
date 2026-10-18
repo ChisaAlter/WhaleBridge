@@ -12,7 +12,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
-	"sync"
+	"time"
 	"unicode/utf8"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
@@ -35,9 +35,13 @@ type foundPage struct {
 	Age              string // how old the search said it is, "" when it didn't
 }
 
-// canSearch is whether magpie can answer its web_search tool: a provider
-// searches for it, or a search API does.
+// canSearch is whether magpie can answer its web_search tool: plugins/search
+// is on (searchServed), and a provider searches for it, or a search API
+// does.
 func canSearch() bool {
+	if !searchServed() {
+		return false
+	}
 	if _, _, ok := searcher(); ok {
 		return true
 	}
@@ -101,6 +105,10 @@ func SearcherUnused() string {
 
 // apiSearch asks the search APIs, in their order, until one answers.
 func (s *Server) apiSearch(ctx context.Context, query string) (string, []Hit, error) {
+	query, err := maskedQuery(query, nil)
+	if err != nil {
+		return "", nil, err
+	}
 	var errs []error
 	for _, a := range provider.SearchAPIs() {
 		pages, err := s.askSearchAPIKeys(ctx, a, query)
@@ -118,42 +126,37 @@ func (s *Server) apiSearch(ctx context.Context, query string) (string, []Hit, er
 	return "", nil, errors.Join(errs...)
 }
 
-// searchKeyAt is, by vendor, the key of its several (SearchAPI.Keys) that
-// last answered, so each search doesn't first spend a request on one
-// that is out of credit.
-var searchKeyAt sync.Map
-
-// askSearchAPIKeys asks a search API with its keys: from the one that last
-// answered, on to the next while one is refused (out of credit, rate
-// limited, turned away; #1477). Anything else, such as no answer in time,
-// isn't about the key, and the next isn't tried.
+// askSearchAPIKeys asks a search API with its keys, in searchKeyOrder:
+// on to the next while one is refused (out of credit, rate limited,
+// turned away; #1477), which then rests (searchRestFor). Anything else, such as
+// no answer in time, isn't about the key, and the next isn't tried.
 func (s *Server) askSearchAPIKeys(ctx context.Context, a provider.SearchAPI, query string) ([]foundPage, error) {
 	keys := a.Keys()
 	if len(keys) == 0 {
 		keys = []string{""}
 	}
-	start := 0
-	if v, ok := searchKeyAt.Load(a.Vendor); ok {
-		start = v.(int) % len(keys)
-	}
 	var errs []error
-	for n := range keys {
-		i := (start + n) % len(keys)
+	for _, i := range searchKeyOrder(a, keys, time.Now()) {
 		one := a
 		one.Key = keys[i]
 		ctx, cancel := context.WithTimeout(ctx, searchTimeout/4)
 		pages, err := s.askSearchAPI(ctx, one, query)
 		cancel()
 		if err == nil {
-			searchKeyAt.Store(a.Vendor, i)
+			wakeSearchKey(a.Vendor, keys[i])
 			return pages, nil
 		}
+		var r searchRefused
+		refused := errors.As(err, &r)
+		if refused && keys[i] != "" {
+			d, why := searchRestFor(a.Vendor, r.status, r.retryAfter, time.Now())
+			restSearchKey(a.Vendor, keys[i], d, why, time.Now())
+		}
 		if len(keys) > 1 {
-			err = fmt.Errorf("key %d: %w", i+1, err)
+			err = fmt.Errorf("%s: %w", keyLabel(i, keys[i]), err)
 		}
 		errs = append(errs, err)
-		var r searchRefused
-		if !errors.As(err, &r) {
+		if !refused {
 			break
 		}
 	}
@@ -164,8 +167,9 @@ func (s *Server) askSearchAPIKeys(ctx context.Context, a provider.SearchAPI, que
 // by its status: 401/403 turned away, 402/432/433 out of credit (Tavily's
 // plan and pay-as-you-go limits), 429 rate limited.
 type searchRefused struct {
-	status int
-	msg    string
+	status     int
+	msg        string
+	retryAfter string // its Retry-After, "" when it said none
 }
 
 func (e searchRefused) Error() string { return e.msg }
@@ -291,8 +295,13 @@ func (s *Server) askSearchAPI(ctx context.Context, a provider.SearchAPI, query s
 				msg = e.Message
 			}
 		}
+		// an API that says the key back in its error doesn't get it into
+		// magpie's logs or the model's turn
+		if a.Key != "" {
+			msg = strings.ReplaceAll(msg, a.Key, provider.MaskSearchKey(a.Key))
+		}
 		if keyRefusal(res.StatusCode) {
-			return nil, searchRefused{res.StatusCode, msg}
+			return nil, searchRefused{res.StatusCode, msg, res.Header.Get("Retry-After")}
 		}
 		return nil, errors.New(msg)
 	}

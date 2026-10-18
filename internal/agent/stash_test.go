@@ -69,3 +69,23 @@ func TestUnreadStashKeptAside(t *testing.T) {
 		t.Fatalf("stash.json is %v; it holds keys", fi.Mode().Perm())
 	}
 }
+
+// stashLoad reads a stash.json that is valid JSON but not the stash's map
+// (an array) as empty too: it is kept aside like one cut short, not taken
+// as a stash because json.Valid passes it (#2263).
+func TestUnreadStashArrayKeptAside(t *testing.T) {
+	stashHome(t)
+	p := stashPath()
+	os.MkdirAll(filepath.Dir(p), 0o755)
+	if err := os.WriteFile(p, []byte(`[]`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stash(map[string]string{"pi.was": "x"})
+	bad, _ := filepath.Glob(p + ".bad-*")
+	if len(bad) != 1 {
+		t.Fatalf("kept aside: %v", bad)
+	}
+	if b, _ := os.ReadFile(bad[0]); string(b) != `[]` {
+		t.Fatalf("kept aside as %q", b)
+	}
+}

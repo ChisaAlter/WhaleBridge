@@ -219,7 +219,7 @@ func startClaudeSignIn(s *signInFlow) error {
 			l, lerr := claudeSignedIn(cli, dir, s.proxy)
 			if lerr == nil {
 				var using bool
-				if using, lerr = addLogin(l); lerr == nil {
+				if lerr = s.keep(func() (err error) { using, err = addLogin(l); return err }); lerr == nil {
 					cleanup()
 					s.finish(SignInState{State: "done", User: l.User, Plan: l.Plan, Using: using})
 					return

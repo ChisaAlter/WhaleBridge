@@ -654,6 +654,17 @@ func writeTOML(path string, lines []string) error {
 	return WriteAtomic(path, data)
 }
 
+// WriteTOMLFile writes lines back as a TOML file, validating the result first
+// so an edit that would leave the document invalid is refused rather than
+// saved. Line endings follow the file's existing ones (joinLinesLike).
+func WriteTOMLFile(path string, lines []string) error {
+	return writeTOML(path, lines)
+}
+
+// SplitLines splits file text into lines the way the TOML editors here do,
+// keeping a trailing newline as an empty final element.
+func SplitLines(s string) []string { return splitLines(s) }
+
 func validateTOML(data []byte) error {
 	// Check syntax first so EOF errors use the same nil-highlight-safe
 	// diagnostics as reads, before the decoder checks TOML definitions.

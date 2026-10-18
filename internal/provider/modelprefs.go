@@ -270,7 +270,11 @@ func setModelEfforts(ref string, efforts []string) (bool, error) {
 	}
 	s := settings.Load()
 	key := p.ID + "/" + model
-	if slices.Equal(s.ModelEfforts[key], keep) {
+	// levels given, or all of them again, take back a word that it takes
+	// no reasoning ask (SetModelReasonless)
+	reasonless := s.ModelReasonless[key]
+	delete(s.ModelReasonless, key)
+	if slices.Equal(s.ModelEfforts[key], keep) && !reasonless {
 		return false, nil
 	}
 	if len(keep) == 0 {
@@ -285,6 +289,50 @@ func setModelEfforts(ref string, efforts []string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// SetModelReasonless says whether a provider's model, spelt
+// "provider/model", takes no reasoning ask, whatever its list says: on,
+// it offers no levels (Efforts, the agents' lists, a group's) and the
+// gateway sends it no reasoning field on any API — Chat's
+// reasoning_effort, Responses' reasoning, Anthropic's thinking and
+// output_config effort — as it does a model known not to think
+// (yuexian7 on Discord: models.dev lists a model with reasoning, and the
+// vendor answers reasoning_effort with 422 while the request without it
+// works). Off gives it the levels it had again.
+func SetModelReasonless(ref string, on bool) error {
+	return touchedIf(setModelReasonless(ref, on))
+}
+
+func setModelReasonless(ref string, on bool) (bool, error) {
+	p, model, err := splitRef(ref)
+	if err != nil {
+		return false, err
+	}
+	s := settings.Load()
+	key := p.ID + "/" + model
+	if s.ModelReasonless[key] == on {
+		return false, nil
+	}
+	if on {
+		if s.ModelReasonless == nil {
+			s.ModelReasonless = map[string]bool{}
+		}
+		s.ModelReasonless[key] = true
+		delete(s.ModelEfforts, key) // none kept of none offered
+	} else {
+		delete(s.ModelReasonless, key)
+	}
+	if err := settings.Save(s); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// Reasonless reports whether the user said pid's model takes no reasoning
+// ask (SetModelReasonless).
+func Reasonless(pid, model string) bool {
+	return heldSettings().ModelReasonless[pid+"/"+model]
 }
 
 // ModelEfforts are the reasoning levels the user kept of the provider's
@@ -437,14 +485,17 @@ func modelAPI(proto Protocol) bool {
 // place of Price, what the user said it costs (SetModelPrice, #819), and
 // Kind "" what its vendor's list says it makes (SetModelKind, #1399).
 type ModelPref struct {
-	Name      *string        `json:"name,omitempty"`
-	Efforts   *[]string      `json:"efforts,omitempty"`
-	Images    *bool          `json:"images,omitempty"`
-	OwnImages bool           `json:"ownImages,omitempty"`
-	API       *string        `json:"api,omitempty"`
-	Same      *string        `json:"same,omitempty"`
-	Price     *catalog.Price `json:"price,omitempty"`
-	OwnPrice  bool           `json:"ownPrice,omitempty"`
+	Name    *string   `json:"name,omitempty"`
+	Efforts *[]string `json:"efforts,omitempty"`
+	// Reasonless, set, is SetModelReasonless's word: true for no
+	// reasoning ask, false to take that back
+	Reasonless *bool          `json:"reasonless,omitempty"`
+	Images     *bool          `json:"images,omitempty"`
+	OwnImages  bool           `json:"ownImages,omitempty"`
+	API        *string        `json:"api,omitempty"`
+	Same       *string        `json:"same,omitempty"`
+	Price      *catalog.Price `json:"price,omitempty"`
+	OwnPrice   bool           `json:"ownPrice,omitempty"`
 	// Kind is what the model makes, as SetModelKind takes it: "image",
 	// "video", or "" for what its vendor's list and name say (#1399)
 	Kind *string `json:"kind,omitempty"`
@@ -471,6 +522,11 @@ func SetModelPrefs(pid string, prefs map[string]ModelPref) error {
 			}
 			if m.Efforts != nil {
 				if err := set(setModelEfforts(ref, *m.Efforts)); err != nil {
+					return err
+				}
+			}
+			if m.Reasonless != nil {
+				if err := set(setModelReasonless(ref, *m.Reasonless)); err != nil {
 					return err
 				}
 			}
@@ -520,7 +576,9 @@ func SetModelPrefs(pid string, prefs map[string]ModelPref) error {
 // setModelSame says which model a provider's model, spelt "provider/model",
 // is the same as, for one a vendor names its own way (Volcengine Ark's
 // dated ids, kyzhouxu on #583): the routing groups magpie finds merge it
-// with that model from every other provider (autoGroups). The name is a
+// with that model from every other provider (autoGroups), and a call to
+// it no list prices is costed at that model's maker's price (SamePriceIn,
+// #2344). The name is a
 // model's id as any vendor spells it ("deepseek-v4.1-flash", or with a
 // vendor's prefix); "" — or a name that is the model's own however spelt —
 // merges it by its own id again.
@@ -610,9 +668,9 @@ func renameModelPrefs(s *settings.Settings, from, to string) bool {
 	// well, and are not one of the per-model preference maps: they say
 	// which models are shown, not what a model is called or costs
 	// (and so is the order they are listed in, the ones picked for an agent
-	// shown only its picks, and the ones sent fast)
+	// shown only its picks, and the ones sent fast or Ultrafast)
 	hidden := false
-	for _, m := range []map[string][]string{s.HiddenModels, s.PickedModels, s.OrderedModels, s.FastPicks} {
+	for _, m := range []map[string][]string{s.HiddenModels, s.PickedModels, s.OrderedModels, s.FastPicks, s.UltraPicks} {
 		for _, ids := range m {
 			for i, id := range ids {
 				if rest, ok := strings.CutPrefix(id, from+"/"); ok {
@@ -674,6 +732,14 @@ func Labels(es []Entry) []string {
 // this one's Provider in model names Off leaves out as well (ARNO on
 // Discord: "· Relay A" and "· routing group" stayed under Off).
 func (e Entry) PlainName() string { return cmp.Or(e.Plain, e.Name) }
+
+// Thinks is whether the model thinks, as /v1/models says it and every
+// agent's list is told it: a model with levels, or one marked Reasoning
+// with a thinking switch alone. An export that read the levels alone
+// marked Trae CN's kimi-k3-max, which always thinks and has no levels
+// magpie knows, not reasoning for Pi, and `magpie pi effort high` was
+// clamped to off (#2380).
+func (e Entry) Thinks() bool { return e.Reasoning || len(e.Efforts) > 0 }
 
 // The ways the agents' lists name models (SuffixMode): every name with its
 // provider's after it, as by default; all but the names the user gave

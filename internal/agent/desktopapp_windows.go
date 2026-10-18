@@ -18,3 +18,29 @@ func installedWindowsStorePackages() []string {
 	names, _ := key.ReadSubKeyNames(-1)
 	return names
 }
+
+// registeredWindowsApp reads what an electron-builder installer
+// registered for the app with guid (registeredIn), for the current user
+// or for all users, in the 64-bit view and then the 32-bit one.
+func registeredWindowsApp(guid string) (dir, version string) {
+	return registeredIn(guid, readRegistry)
+}
+
+func readRegistry(hive, path, name string) string {
+	root := registry.CURRENT_USER
+	if hive == "HKLM" {
+		root = registry.LOCAL_MACHINE
+	}
+	for _, view := range []uint32{registry.WOW64_64KEY, registry.WOW64_32KEY} {
+		k, err := registry.OpenKey(root, path, registry.QUERY_VALUE|view)
+		if err != nil {
+			continue
+		}
+		v, _, _ := k.GetStringValue(name)
+		k.Close()
+		if v != "" {
+			return v
+		}
+	}
+	return ""
+}

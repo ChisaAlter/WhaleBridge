@@ -238,6 +238,8 @@ func useCodexReset(ctx context.Context, user, why string) (ResetOutcome, error) 
 	subscriptionUsageCache.at = time.Time{}
 	subscriptionUsageCache.data = nil
 	subscriptionUsageCache.Unlock()
+	// the menu bar reads the account afresh now, not at its next tick (#2357)
+	toldUsage()
 	return out, nil
 }
 
@@ -247,7 +249,7 @@ func codexUserToken(ctx context.Context, user string) (who, tok, accountID strin
 	// the one signed in now, read from Codex's own file: the list of those
 	// kept may not have caught up with it yet
 	if live, ok := liveLogin("codex"); user == "" || ok && strings.EqualFold(live.User, user) {
-		tok, accountID, err = codexToken(ctx, codexAuthPath())
+		tok, accountID, err = codexToken(ctx, codexHome())
 		return live.User, tok, accountID, err
 	}
 	for _, l := range Logins("codex") {

@@ -106,7 +106,7 @@ func (p pluginCheckinProvider) checkiner(now func() time.Time) checkiner {
 	return checkiner{path: pluginCheckinPath(), now: now, mu: &pluginCheckinMu, by: pluginCheckinBy(p.ID), label: p.ID, accounts: func() []checkinAcct {
 		var out []checkinAcct
 		for _, a := range p.accounts {
-			out = append(out, checkinAcct{User: a.User, On: a.On, key: a.key, do: a.do})
+			out = append(out, checkinAcct{User: a.User, On: a.On, key: a.key, provider: a.card, do: a.do})
 		}
 		return out
 	}}

@@ -260,18 +260,24 @@ func TestAgentHTTPModelListsStayPerAgentAndKeepInUse(t *testing.T) {
 func TestAgentHTTPNewBuiltinsAreDiscoverable(t *testing.T) {
 	a := newAgentHTTP(t)
 	rows := readAgentRows(t, a)
-	if len(rows) != 58 {
-		t.Fatalf("builtin Agent count = %d, want 58", len(rows))
+	// 63 upstream registrations less Claude Science, which is connected by
+	// restarting its daemon and is not offered here.
+	if len(rows) != 62 {
+		t.Fatalf("builtin Agent count = %d, want 62", len(rows))
 	}
 	ids := make([]string, 0, len(rows))
 	for _, row := range rows {
 		ids = append(ids, row.ID)
 	}
-	for _, id := range []string{"deveco", "stepcode", "prime-agent", "copilot-jetbrains", "qwen", "ante", "astrbot", "jcode", "grok-app", "workbuddy-ai", "snow"} {
+	for _, id := range []string{"deveco", "stepcode", "prime-agent", "copilot-jetbrains", "qwen", "ante", "astrbot", "jcode", "grok-app", "workbuddy-ai", "snow", "lody", "mothx", "openpencil", "raycast"} {
 		if !slices.Contains(ids, id) {
 			t.Fatalf("new builtin %s missing from actual Agent endpoint", id)
 		}
 	}
+	if slices.Contains(ids, "claude-science") {
+		t.Fatal("Claude Science is listed, but connecting it starts its daemon")
+	}
+	a.call("POST", "agent/connect", map[string]string{"id": "claude-science"}, http.StatusBadRequest)
 }
 
 func newAgentHTTP(t *testing.T) providerHTTP {

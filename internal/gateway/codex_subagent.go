@@ -8,10 +8,11 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/usage"
 )
 
-// SubagentPick is a Codex subagent's request put on the model the user
-// set for Codex's subagents (provider.CodexSubagentModel), in place of
-// the one its lead asked for in spawn_agent (willz on Discord). Kept says
-// why it went on the model asked for instead, "" when it was put on To.
+// SubagentPick is a subagent's request put on the model the user set for
+// its agent's subagents, in place of the one its lead asked for: Codex's
+// (provider.CodexSubagentModel, willz on Discord) or Claude Desktop's
+// (provider.DesktopSubagentModel). Kept says why it went on the model
+// asked for instead, "" when it was put on To.
 type SubagentPick struct {
 	Asked string `json:"asked"`
 	To    string `json:"to"`

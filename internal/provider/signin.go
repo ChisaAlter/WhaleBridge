@@ -49,6 +49,18 @@ const codexScopes = "openid profile email offline_access api.connectors.read api
 // signInTimeout is how long a sign-in waits for the browser.
 var signInTimeout = 10 * time.Minute
 
+// devicePollFloor is the least a device sign-in (Copilot, Factory, ZCode)
+// waits between asking whether the user is done, whatever interval the
+// vendor gave, 0 among them. A var: the tests' fakes give 0, and a second
+// for each of their polls was most of their time (#2051).
+var devicePollFloor = time.Second
+
+// devicePoll is the wait between a device sign-in's polls for a vendor's
+// interval in seconds.
+func devicePoll(seconds int) time.Duration {
+	return max(time.Duration(seconds)*time.Second, devicePollFloor)
+}
+
 // SignInState is where a sign-in stands, for the window to show.
 type SignInState struct {
 	ID            string `json:"id"`
@@ -86,24 +98,37 @@ type SignInState struct {
 }
 
 type signInFlow struct {
-	mu            sync.Mutex
-	st            SignInState
-	verifier      string
-	state         string
-	redirect      string
-	srv           *http.Server
-	stop          func() // ends an agent's own login command, when that is the sign-in
-	kiro          *kiroFlow
-	site          string           // where to sign in, for an agent with more than one (ZCode: "zai" or "bigmodel")
-	plugin        string           // a plugin's sign-in session, finished with the code pasted back
-	claude        *claudeCLISignIn // Claude Code's own sign-in, run by magpie
-	pluginPorts   []string         // loopback callback ports of this plugin sign-in
-	nonce, hostID string           // ChatGPT API dynamic client registration
+	mu       sync.Mutex
+	st       SignInState
+	verifier string
+	state    string
+	redirect string
+	srv      *http.Server
+	stop     func() // ends an agent's own login command, when that is the sign-in
+	kiro     *kiroFlow
+	site     string           // where to sign in, for an agent with more than one (ZCode: "zai" or "bigmodel")
+	plugin   string           // a plugin's sign-in session, finished with the code pasted back
+	claude   *claudeCLISignIn // Claude Code's own sign-in, run by magpie
+	// pluginPorts are where a plugin's browser sign-in comes back to on
+	// this machine, for its address pasted (pluginsignin_paste.go)
+	pluginPorts []string
+	// pluginKey is a plugin's browser sign-in also finished by a key made
+	// on KeysURL and pasted: its provider and "api" method, as the plugin
+	// lists it (pluginsignin_paste.go)
+	pluginKey *pluginKeyWay
+
+	// nonce and hostID are a ChatGPT API sign-in's: what its ID token must
+	// carry, and this machine's id it registers magpie for (chatgpt_api.go)
+	nonce, hostID string
 	// claimed is a callback being traded for the account: the browser's own
 	// or a pasted address, whichever came first
-	claimed  bool
-	finished bool // first outcome owns account publication
-	done     chan struct{}
+	claimed bool
+	// finished is an outcome being recorded: the first finish's, which for a
+	// sign-in done reads as done once the account is shown again
+	finished bool
+	// kept is the account stored (keep): a cancel after it is too late
+	kept bool
+	done chan struct{}
 
 	// proxy is the one the sign-in's requests go through, as netproxy.With
 	// takes it: the one the account's will go through once it is signed in
@@ -130,8 +155,44 @@ type SignInOptions struct {
 // via is ctx for the sign-in's requests: through its proxy, so the vendor
 // sees an account signed in from where its requests will come from, not
 // signed in through the global proxy and used through its own (#1663).
+// It carries the sign-in too, for keepLogin.
 func (s *signInFlow) via(ctx context.Context) context.Context {
-	return netproxy.With(ctx, s.proxy)
+	return context.WithValue(netproxy.With(ctx, s.proxy), signInKey{}, s)
+}
+
+type signInKey struct{}
+
+// errSignInOver is a sign-in's account not kept: it was canceled, or
+// finished otherwise, while its token was being fetched (#2054).
+var errSignInOver = errors.New("the sign-in was canceled; start it again")
+
+// keepLogin stores the account a sign-in signed in to, store being the
+// write, only while the sign-in ctx carries (via) is live. Every sign-in's
+// write of its account goes through here or keep, so one the user canceled
+// while its token was being fetched adds no account and replaces no
+// tokens. Outside a sign-in it is store.
+func keepLogin(ctx context.Context, store func() error) error {
+	if s, ok := ctx.Value(signInKey{}).(*signInFlow); ok {
+		return s.keep(store)
+	}
+	return store()
+}
+
+// keep runs store under the flow's lock unless the flow is over. Cancel
+// takes the same lock (finish), so either the cancel comes first and
+// nothing is written, or the account is kept and the cancel is too late:
+// the sign-in then goes on to read as done, as the account is listed.
+func (s *signInFlow) keep(store func() error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finished {
+		return errSignInOver
+	}
+	if err := store(); err != nil {
+		return err
+	}
+	s.kept = true
+	return nil
 }
 
 // pickProxy sets the proxy a sign-in to agent goes through.
@@ -494,6 +555,9 @@ func SubmitSignInCallback(id, raw string) error {
 	if s.pluginPorts != nil {
 		return s.pluginCallback(raw)
 	}
+	if s.pluginKey != nil {
+		return s.pastedPluginKey(raw)
+	}
 	if s.claude != nil {
 		return s.claudePaste(raw)
 	}
@@ -650,7 +714,7 @@ func (s *signInFlow) status() SignInState {
 // finish records the outcome once and lets the callback server go.
 func (s *signInFlow) finish(out SignInState) bool {
 	s.mu.Lock()
-	if s.finished {
+	if s.finished || s.kept && out.State == "canceled" {
 		s.mu.Unlock()
 		return false
 	}
@@ -752,7 +816,7 @@ func (s *signInFlow) callback(w http.ResponseWriter, r *http.Request) {
 	}
 	if err == nil {
 		var using bool
-		if using, err = addLogin(l); err == nil {
+		if err = keepLogin(ctx, func() (err error) { using, err = addLogin(l); return err }); err == nil {
 			s.finish(SignInState{State: "done", User: l.User, Plan: l.Plan, Using: using})
 			signInPage(w, true, "You're signed in", fmt.Sprintf("%s is added to magpie. You can close this tab.", l.User))
 			return
@@ -767,7 +831,7 @@ func (s *signInFlow) callback(w http.ResponseWriter, r *http.Request) {
 func (s *signInFlow) googleDone(ctx context.Context, w http.ResponseWriter, app googleApp, code string) {
 	g, plan, err := googleExchange(ctx, app, code, s.verifier, s.redirect)
 	if err == nil {
-		err = addGoogleLogin(app.agent, g.user, plan, g.auth)
+		err = keepLogin(ctx, func() error { return addGoogleLogin(app.agent, g.user, plan, g.auth) })
 	}
 	if err != nil {
 		s.finish(SignInState{State: "failed", Error: err.Error()})
@@ -958,7 +1022,8 @@ func addLogin(l savedLogin) (using bool, err error) {
 	if using {
 		switch l.Agent {
 		case "codex":
-			err = writePrivate(codexAuthPath(), append(bytes.TrimSpace(l.Auth), '\n'))
+			// where Codex's config.toml keeps it (#2367)
+			err = saveCodexLogin(codexHome(), l.Auth)
 		case "claude":
 			err = putClaudeLogin(l)
 		}

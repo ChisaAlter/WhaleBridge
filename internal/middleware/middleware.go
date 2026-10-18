@@ -54,8 +54,15 @@ type mw struct {
 	events  map[string]bool
 	options []byte // the plugin's options, as JSON
 	pool    sync.Pool
+	// strats are its strategies and onUse its onUsage (points.go), which
+	// run in pt
+	strats []strat
+	onUse  moejs.Hook
+	hasUse bool
+	pt     *points
 
 	calls, nanos, failures atomic.Int64
+	orders, rows, dropped  atomic.Int64 // strategy calls, onUsage calls, rows dropped
 	lastErr                atomic.Pointer[string]
 	logged                 atomic.Int64 // lines logged this minute, and the minute
 }
@@ -65,6 +72,9 @@ type set struct {
 	stamp string
 	list  []*mw
 	errs  map[string]string // by spec: why it didn't load
+	// hooked: some module of list has onRequest, onEvent or onResponse
+	hooked      bool
+	droppedSaid atomic.Int64
 }
 
 var (
@@ -144,6 +154,7 @@ func load(st string) *set {
 			continue
 		}
 		s.list = append(s.list, m)
+		s.hooked = s.hooked || m.hasReq || m.hasEv || m.hasResp
 	}
 	return s
 }
@@ -174,8 +185,11 @@ func compile(e plugin.Entry, file string) (*mw, error) {
 	m.onReq, m.hasReq = in.hook("onRequest")
 	m.onEv, m.hasEv = in.hook("onEvent")
 	m.onResp, m.hasResp = in.hook("onResponse")
-	if !m.hasReq && !m.hasEv && !m.hasResp {
-		return nil, errors.New("exports none of onRequest, onEvent and onResponse")
+	if err := m.discover(in); err != nil {
+		return nil, err
+	}
+	if !m.hasReq && !m.hasEv && !m.hasResp && len(m.strats) == 0 && !m.hasUse {
+		return nil, errors.New("exports none of onRequest, onEvent, onResponse, strategies and onUsage")
 	}
 	if names, ok := in.strings("events"); ok {
 		m.events = map[string]bool{}
@@ -404,6 +418,15 @@ type State struct {
 	AvgMicro float64  `json:"avgMicros"`
 	Failures int64    `json:"failures"`
 	Last     string   `json:"lastError,omitempty"`
+	// Strategies are the routings it serves ("<plugin>/<name>"), Orders
+	// how many times they were asked; Usage says it has onUsage, Rows how
+	// many rows it was given and Dropped how many it missed, the queue
+	// full
+	Strategies []string `json:"strategies,omitempty"`
+	Orders     int64    `json:"orders,omitempty"`
+	Usage      bool     `json:"usage,omitempty"`
+	Rows       int64    `json:"rows,omitempty"`
+	Dropped    int64    `json:"dropped,omitempty"`
 }
 
 // States are the middleware plugins, by spec.
@@ -423,6 +446,10 @@ func States() map[string]State {
 				st.Hooks = append(st.Hooks, h.name)
 			}
 		}
+		for _, x := range m.strats {
+			st.Strategies = append(st.Strategies, m.routing(x.name))
+		}
+		st.Orders, st.Usage, st.Rows, st.Dropped = m.orders.Load(), m.hasUse, m.rows.Load(), m.dropped.Load()
 		for n := range m.events {
 			st.Events = append(st.Events, n)
 		}

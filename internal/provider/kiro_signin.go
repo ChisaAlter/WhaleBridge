@@ -272,7 +272,8 @@ func (s *signInFlow) kiroCallback(w http.ResponseWriter, r *http.Request) {
 		fail(err.Error())
 		return
 	}
-	user, err := addKiroLogin(home)
+	var user string
+	err = keepLogin(ctx, func() (err error) { user, err = addKiroLogin(home); return err })
 	if err != nil {
 		removeKiroHome(home)
 		fail(err.Error())

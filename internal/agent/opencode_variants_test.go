@@ -27,9 +27,26 @@ func TestOpenCodeVariants(t *testing.T) {
 		// and high of its own
 		{nil, `{}`},
 	} {
-		b, err := json.Marshal(openCodeVariants(c.efforts))
+		b, err := json.Marshal(openCodeVariants(c.efforts, false))
 		if err != nil || string(b) != c.want {
 			t.Errorf("%v: got %s (%v), want %s", c.efforts, b, err, c.want)
+		}
+	}
+	// a model Codex's /fast is asked of: each level again, fast, after them,
+	// the tier both as OpenCode 1 sends an option (service_tier as it is)
+	// and as OpenCode 2 does (extraBody); fast alone with no levels (#2379)
+	for _, c := range []struct {
+		efforts []string
+		want    string
+	}{
+		{[]string{"high", "low"}, `{"low":{"reasoningEffort":"low"},"high":{"reasoningEffort":"high"},` +
+			`"low-fast":{"extraBody":{"service_tier":"priority"},"reasoningEffort":"low","service_tier":"priority"},` +
+			`"high-fast":{"extraBody":{"service_tier":"priority"},"reasoningEffort":"high","service_tier":"priority"}}`},
+		{nil, `{"fast":{"extraBody":{"service_tier":"priority"},"service_tier":"priority"}}`},
+	} {
+		b, err := json.Marshal(openCodeVariants(c.efforts, true))
+		if err != nil || string(b) != c.want {
+			t.Errorf("fast %v: got %s (%v), want %s", c.efforts, b, err, c.want)
 		}
 	}
 }
@@ -215,7 +232,9 @@ func TestOpenCodeWritesVariants(t *testing.T) {
 // thinking switch alone, gets no variants in opencode.json — under Xiaomi's
 // preset or a relay of the user's alike — and no thinking levels in Pi:
 // OpenCode offered it the resellers' levels up to max, which Xiaomi turns
-// away with a 400 (#214). A model no maker lists keeps the resellers'.
+// away with a 400 (#214). A model no maker lists keeps the resellers'. Pi is
+// told it reasons, as /v1/models says (#2380), with no map, so Pi offers
+// its own off to high and never xhigh or max.
 func TestOpenCodeNoResellerLevelsForSwitchModel(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
@@ -284,7 +303,7 @@ func TestOpenCodeNoResellerLevelsForSwitchModel(t *testing.T) {
 		switch m.ID {
 		case "xiaomi/mimo-v2.6-flash", "relay/mimo-v2.6-flash":
 			seen++
-			if m.Reasoning || m.Levels != nil {
+			if !m.Reasoning || m.Levels != nil {
 				t.Errorf("pi %s: reasoning %v, levels %v", m.ID, m.Reasoning, m.Levels)
 			}
 		case "relay/open-model":

@@ -188,3 +188,63 @@ func TestKimiNoConfig(t *testing.T) {
 		t.Fatalf("reset:\n%s", b)
 	}
 }
+
+// What the user set on magpie's provider table in Kimi Code's config.toml
+// stays through every sync and pick (#2030's siblings): headers, env and a
+// default model of its own. The type, address and key stay magpie's.
+func TestKimiKeepsTheUsersSettings(t *testing.T) {
+	home := syncHome(t)
+	t.Setenv("KIMI_SHARE_DIR", "")
+	path := filepath.Join(home, ".kimi", "config.toml")
+	os.MkdirAll(filepath.Dir(path), 0o755)
+	os.WriteFile(path, []byte("default_model = \"x\"\n"), 0o644)
+	a := kimi(home)
+	f := a.Field("model")
+	if err := f.Set("magpie/relay/glm-4.6"); err != nil {
+		t.Fatal(err)
+	}
+	raw := readFile(path)
+	if !strings.Contains(raw, "[providers.magpie]\n") {
+		t.Fatalf("no table:\n%s", raw)
+	}
+	raw = strings.Replace(raw, "[providers.magpie]\n", "[providers.magpie]\ndefault_model = \"relay/glm-4.6\"\ncustom_headers = { X-Mine = \"1\" }\nenv = { HTTPS_PROXY = \"http://proxy:8080\" }\n", 1)
+	os.WriteFile(path, []byte(raw), 0o644)
+	edit.SetTOMLKey(path, "providers.magpie", "base_url", "http://127.0.0.1:1/v1")
+	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Key: "k", Chat: "http://127.0.0.1:1/v1", Models: []string{"pro"}}); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if err := a.Sync(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(when string) {
+		t.Helper()
+		var c struct {
+			Providers map[string]struct {
+				Type    string            `toml:"type"`
+				BaseURL string            `toml:"base_url"`
+				APIKey  string            `toml:"api_key"`
+				Default string            `toml:"default_model"`
+				Headers map[string]string `toml:"custom_headers"`
+				Env     map[string]string `toml:"env"`
+			} `toml:"providers"`
+		}
+		raw := readFile(path)
+		if err := toml.Unmarshal([]byte(raw), &c); err != nil {
+			t.Fatalf("%v\n%s", err, raw)
+		}
+		p := c.Providers[magpieID]
+		if p.Default != "relay/glm-4.6" || p.Headers["X-Mine"] != "1" || p.Env["HTTPS_PROXY"] != "http://proxy:8080" {
+			t.Errorf("%s: the user's settings not kept:\n%s", when, raw)
+		}
+		if p.Type != "kimi" || p.BaseURL == "http://127.0.0.1:1/v1" || p.BaseURL == "" || p.APIKey == "" {
+			t.Errorf("%s: magpie's own parts not written:\n%s", when, raw)
+		}
+	}
+	check("sync")
+	if err := f.Set("magpie/deepseek/pro"); err != nil {
+		t.Fatal(err)
+	}
+	check("pick")
+}

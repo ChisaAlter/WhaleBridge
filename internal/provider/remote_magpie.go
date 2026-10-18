@@ -93,6 +93,7 @@ func (p *Provider) remoteMagpieEndpoints() {
 		"/v1/messages/count_tokens", "/v1/messages",
 		"/v1/chat/completions", "/v1/responses", "/v1/systemone",
 		"/v1/embeddings", "/v1/rerank",
+		"/v1/audio/transcriptions", "/v1/audio/translations",
 		"/v1/images/generations", "/v1/images/edits",
 		"/v1/videos", "/v1",
 	} {
@@ -122,18 +123,36 @@ func (p Provider) listHeaders() map[string]string {
 	return h
 }
 
+// listHeadersAt is listHeaders for a list asked at u: at OpenCode's
+// gateway with a session of the list's own (OpenCodeSession), unless the
+// user set one on the provider.
+func (p Provider) listHeadersAt(u string) map[string]string {
+	h := p.listHeaders()
+	if !OpenCodeURL(u) {
+		return h
+	}
+	for k := range h {
+		if strings.EqualFold(k, "x-opencode-session") {
+			return h
+		}
+	}
+	h = maps.Clone(h)
+	if h == nil {
+		h = map[string]string{}
+	}
+	id := openCodeSession("")
+	h["X-Opencode-Session"], h["X-Opencode-Session-Id"] = id, id
+	return h
+}
+
 // remotePrice is what a remote magpie's list said the model costs there,
 // if it said.
 func (p Provider) remotePrice(model string) (catalog.Price, bool) {
 	if !p.IsRemoteMagpie() {
 		return catalog.Price{}, false
 	}
-	ms, _, ok := p.live()
-	if !ok {
-		return catalog.Price{}, false
-	}
-	for _, m := range ms {
-		if m.ID == model && m.Price != nil {
+	for _, m := range p.liveByID(model) {
+		if m.Price != nil {
 			return *m.Price, true
 		}
 	}

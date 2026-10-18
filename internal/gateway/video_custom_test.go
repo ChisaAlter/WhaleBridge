@@ -14,6 +14,7 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/access"
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
 // openAIVideos is an upstream serving OpenAI's Videos API under /v1, as a
@@ -163,7 +164,7 @@ func TestCustomProviderMakesVideos(t *testing.T) {
 		t.Fatalf("no model named: %d %s", code, raw)
 	}
 	// another magpie asking this one for its video models is told of it
-	if objs := videomakerObjects(); len(objs) != 1 || objs[0]["id"] != "studio/vid-1" {
+	if objs := videomakerObjects(httptest.NewRequest("GET", "/v1/models", nil)); len(objs) != 1 || objs[0]["id"] != "studio/vid-1" {
 		t.Fatalf("videomakerObjects %v", objs)
 	}
 }
@@ -361,5 +362,45 @@ func TestCustomProviderVideoTheUserMarks(t *testing.T) {
 	}
 	if got := ids(Drawers(p)); len(got) != 0 {
 		t.Fatalf("drawers after unmarking %v", got)
+	}
+}
+
+// #1399 (shen-joe): Agnes's videos API answers 400 "mode 不能为空" to a
+// body without mode, and magpie passed on only model, prompt, seconds and
+// size. The reporter's own request now reaches the vendor with mode and
+// aspect_ratio as sent; a text field passed on so is masked as the prompt
+// is.
+func TestCustomProviderVideoKeepsTheCallersFields(t *testing.T) {
+	fresh(t)
+	up := newOpenAIVideos(t)
+	saveFetched(t, provider.Provider{ID: "agnes-cn", Name: "Agnes", Chat: up.URL + "/v1", Key: "sk-agnes", Models: []string{"agnes-video-2.5-flash"}})
+	if err := provider.SetModelKind("agnes-cn/agnes-video-2.5-flash", "video"); err != nil {
+		t.Fatal(err)
+	}
+	h := New().upstreamHandler()
+	code, _, raw := asKey(t, h, "", "POST", "/v1/videos", `{"model": "agnes-cn/agnes-video-2.5-flash","mode": "text","aspect_ratio": "16:9","size":"720P","seconds":"10","prompt": "海浪拍打礁石，慢镜头"}`)
+	if code != 200 {
+		t.Fatalf("%d %s", code, raw)
+	}
+	var sent map[string]any
+	json.Unmarshal([]byte(up.bodies[0]), &sent)
+	want := map[string]any{"model": "agnes-video-2.5-flash", "mode": "text", "aspect_ratio": "16:9", "size": "720P", "seconds": "10", "prompt": "海浪拍打礁石，慢镜头"}
+	for k, v := range want {
+		if sent[k] != v {
+			t.Fatalf("%s: sent %v, want %v (%s)", k, sent[k], v, up.bodies[0])
+		}
+	}
+
+	st := settings.Load()
+	st.RedactWords = []string{"Nightjar"}
+	if err := settings.Save(st); err != nil {
+		t.Fatal(err)
+	}
+	code, _, raw = asKey(t, h, "", "POST", "/v1/videos", `{"model":"agnes-cn/agnes-video-2.5-flash","mode":"text","prompt":"waves","negative_prompt":"no Nightjar","extra":{"notes":["Nightjar"]}}`)
+	if code != 200 {
+		t.Fatalf("%d %s", code, raw)
+	}
+	if b := up.bodies[1]; strings.Contains(b, "Nightjar") || !strings.Contains(b, `"mode":"text"`) {
+		t.Fatalf("sent %s", b)
 	}
 }

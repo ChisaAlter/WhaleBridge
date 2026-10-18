@@ -908,16 +908,10 @@ func StartWith(ctx context.Context, name, serverURL string, app *App) (State, er
 		if t.Scope != "" {
 			r2.Scope = t.Scope
 		}
-		if err := update(func(m map[string]*Record) bool { m[name] = &r2; return true }); err != nil {
-			f.finish(State{State: "failed", Error: err.Error()})
+		if err := f.keep(name, r2); err != nil {
 			page(w, http.StatusOK, "Magpie couldn't keep the sign-in: "+err.Error())
 			return
 		}
-		// the agents are given magpie's address before the sign-in is said done
-		if Changed != nil {
-			Changed(name)
-		}
-		f.finish(State{State: "done"})
 		page(w, http.StatusOK, "Magpie is signed in to "+name+". Every agent given it in the Library uses this sign-in. You can close this tab.")
 	})
 	f.srv = &http.Server{Handler: mux, ReadHeaderTimeout: 10 * time.Second}
@@ -941,6 +935,31 @@ func (f *flow) status() State {
 	return f.st
 }
 
+// keep commits the callback only while the flow is still live. Cancel or
+// timeout and the write take the same lock, so a late token cannot save a
+// sign-in the user already ended, or replace their previous sign-in.
+func (f *flow) keep(name string, r Record) error {
+	f.mu.Lock()
+	if f.finished {
+		f.mu.Unlock()
+		return errors.New("the sign-in has ended; start it again")
+	}
+	err := update(func(m map[string]*Record) bool { m[name] = &r; return true })
+	f.finished = true
+	f.mu.Unlock()
+	if err != nil {
+		f.end(State{State: "failed", Error: err.Error()})
+		return err
+	}
+	// The commit won over cancellation; give the agents the new address
+	// outside the flow's lock, before saying the sign-in is done.
+	if Changed != nil {
+		Changed(name)
+	}
+	f.end(State{State: "done"})
+	return nil
+}
+
 func (f *flow) finish(st State) {
 	f.mu.Lock()
 	if f.finished {
@@ -948,6 +967,13 @@ func (f *flow) finish(st State) {
 		return
 	}
 	f.finished = true
+	f.mu.Unlock()
+	f.end(st)
+}
+
+// end is called once by the operation that claimed finished.
+func (f *flow) end(st State) {
+	f.mu.Lock()
 	f.st.State, f.st.Error = st.State, st.Error
 	f.mu.Unlock()
 	close(f.done)

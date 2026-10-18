@@ -160,8 +160,10 @@ func addDevinLogin(ctx context.Context, home string) (user, plan string, err err
 	if !ownOK {
 		own = ""
 	}
-	return user, plan, addSideLogin(savedLogin{Agent: "devin", User: user, Plan: plan, Home: home}, own,
-		func(l savedLogin) { removeDevinHome(l.Home) })
+	return user, plan, keepLogin(ctx, func() error {
+		return addSideLogin(savedLogin{Agent: "devin", User: user, Plan: plan, Home: home}, own,
+			func(l savedLogin) { removeDevinHome(l.Home) })
+	})
 }
 
 // devinAlsoOn is the Devin accounts in use behind the first.

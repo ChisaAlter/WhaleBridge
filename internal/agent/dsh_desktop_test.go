@@ -51,6 +51,8 @@ const dshDesktopPatch = "# Your patch layer for this dsh profile, applied after 
 // installed the folder is no sign of an uninstall: its version is shown
 // instead, on macOS and Windows alike.
 func TestDshDesktopAppIsNoMissingCLI(t *testing.T) {
+	// the Mac app: on Windows ~\.dsh is never gone (#2300), whatever is here
+	judgeFor(t, "darwin")
 	home := t.TempDir()
 	t.Setenv("HOME", home)
 	t.Setenv("USERPROFILE", home)
@@ -206,5 +208,244 @@ func TestDshDesktopProfileMadeWhileServing(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(desktop); string(b) != own {
 		t.Fatalf("the user's profile written:\n%s", b)
+	}
+}
+
+// #2279 (liangjinyuan-sihan): DeepSeek Harness Desktop installed and not yet
+// opened has no ~/.dsh, so the Agents page had no DeepSeek Harness row and
+// magpie nowhere to write: with no profile, a model picked went to
+// config.yaml, which no dsh since 0.1.5 reads. The app now counts as dsh
+// here, and its profile is made as the app's first start makes it — dsh's
+// template — with magpie's route in it. The app keeps a patch list it
+// finds (initProfile writes only missing files), so its first start adds
+// its package.json beside it. Disconnect before then takes it out again;
+// the user's own key in dsh's store survives both.
+func TestDshDesktopNeverOpened(t *testing.T) {
+	home, dir, _ := dshRouteHome(t)
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", t.TempDir()) // no dsh CLI
+	apps := t.TempDir()
+	was := appFolders
+	appFolders = func() []string { return []string{apps} }
+	t.Cleanup(func() { appFolders = was })
+	desktop := filepath.Join(dir, "profiles", "desktop", "cordis.patch.yml")
+	read := func(p string) string { b, _ := os.ReadFile(p); return string(b) }
+
+	if dsh(home).Detected() {
+		t.Fatal("neither app nor CLI, yet detected")
+	}
+	installApp(t, apps, "DeepSeek Harness.app", dshAppPlist)
+	a := dsh(home)
+	if !a.Detected() || a.CLIMissing() {
+		t.Fatalf("the desktop app alone: detected %v, CLI missing %v", a.Detected(), a.CLIMissing())
+	}
+	if a.Path != desktop {
+		t.Fatalf("names %s, not the desktop app's profile", a.Path)
+	}
+	if dshProfileTemplate != dshDesktopPatch {
+		t.Fatal("the template magpie writes isn't dsh's")
+	}
+
+	// the user's own key in dsh's store, set before magpie came
+	creds := filepath.Join(dir, ".credentials.yaml")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(creds, []byte("version: 1\nrefs:\n  MINE_API_KEY: sk-mine\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := a.Pick("model", "magpie/deepseek/flash"); err != nil {
+		t.Fatal(err)
+	}
+	s := read(desktop)
+	if !strings.HasPrefix(s, strings.TrimSuffix(dshDesktopPatch, "[]\n")) || !strings.Contains(s, "apiKeyEnv: "+dshKeyRef) || !strings.Contains(s, "provider: "+dshRoute) {
+		t.Fatalf("the desktop profile magpie made:\n%s", s)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "config.yaml")); err == nil {
+		t.Fatal("wrote config.yaml, which dsh 0.2 doesn't read")
+	}
+	if c := read(creds); !strings.Contains(c, "MINE_API_KEY: sk-mine") || !strings.Contains(c, dshKeyRef+": ") {
+		t.Fatalf("dsh's key store:\n%s", c)
+	}
+	a = dsh(home)
+	if !a.Wired() || a.Check() != "" || a.Drift() != nil {
+		t.Fatalf("not wired: wired %v, check %q, drift %+v", a.Wired(), a.Check(), a.Drift())
+	}
+	if n := a.Notice(); !strings.Contains(n, noticeDsh5.String()) {
+		t.Fatalf("notice: %q", n)
+	}
+
+	// Disconnect before the app ever opened: what magpie made goes, the
+	// user's key stays
+	if err := a.Disconnect(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "profiles")); !os.IsNotExist(err) {
+		t.Fatalf("the profile magpie made outlived Disconnect: %v\n%s", err, read(desktop))
+	}
+	if c := read(creds); !strings.Contains(c, "MINE_API_KEY: sk-mine") || strings.Contains(c, dshKeyRef) {
+		t.Fatalf("dsh's key store after Disconnect:\n%s", c)
+	}
+
+	// connected again, and the app's first start: its files beside
+	// magpie's patch list, which it keeps
+	a = dsh(home)
+	if err := a.Pick("model", "magpie/deepseek/flash"); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{"package.json": "{\n  \"name\": \"dsh-profile-desktop\"\n}\n", "pnpm-workspace.yaml": "packages:\n  - .\n"} {
+		if err := os.WriteFile(filepath.Join(filepath.Dir(desktop), name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	a = dsh(home)
+	if n := a.Notice(); strings.Contains(n, noticeDsh5.String()) {
+		t.Fatalf("an opened app said never opened: %q", n)
+	}
+	// a model the user picks in the app is theirs, and stays on Disconnect
+	own := strings.Replace(read(desktop), "provider: "+dshRoute, "provider: deepseek-official", 1)
+	own = strings.Replace(own, `model: "deepseek/flash"`, "model: deepseek-v4-pro", 1)
+	if err := os.WriteFile(desktop, []byte(own), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Disconnect(); err != nil {
+		t.Fatal(err)
+	}
+	s = read(desktop)
+	if !strings.Contains(s, "model: deepseek-v4-pro") || strings.Contains(s, "apiKeyEnv: "+dshKeyRef) {
+		t.Fatalf("the opened app's profile after Disconnect:\n%s", s)
+	}
+	if !isFile(filepath.Join(filepath.Dir(desktop), "package.json")) {
+		t.Fatal("the app's own files went")
+	}
+}
+
+// #2279: DeepSeek Harness Desktop's Windows installer lets the user pick
+// its folder, and registers it under HKCU\Software\<its guid>; an app there
+// is found, with the version its Uninstall entry gives.
+func TestDshDesktopRegisteredFolder(t *testing.T) {
+	apps, picked := t.TempDir(), t.TempDir()
+	wasFolders, wasReg := appFolders, windowsRegisteredApp
+	appFolders = func() []string { return []string{apps} }
+	reg := map[string][2]string{}
+	windowsRegisteredApp = func(guid string) (string, string) { r := reg[guid]; return r[0], r[1] }
+	t.Cleanup(func() { appFolders, windowsRegisteredApp = wasFolders, wasReg })
+	a := &Agent{ID: "dsh", Name: "DeepSeek Harness", Bin: "dsh"}
+	if a.HasApp() {
+		t.Fatal("nothing installed, yet an app")
+	}
+	// registered, its folder since emptied by hand: not installed
+	reg["1bf39983-50d0-5fe0-9ef4-cece76f67c5e"] = [2]string{picked, "0.2.0-rc.2"}
+	if a.HasApp() || a.AppVersion() != "" {
+		t.Fatal("a registered folder without the app taken for it")
+	}
+	if err := os.WriteFile(filepath.Join(picked, "DeepSeek Harness.exe"), []byte("MZ"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if !a.HasApp() || a.AppVersion() != "0.2.0-rc.2" {
+		t.Fatalf("the app in its registered folder: has %v, version %q", a.HasApp(), a.AppVersion())
+	}
+	if (&Agent{ID: "dsh@wsl:Ubuntu", WSL: "Ubuntu", Bin: "dsh"}).HasApp() {
+		t.Fatal("WSL twin has the Windows app")
+	}
+}
+
+// #2325: DeepSeek Harness Desktop installed to D:\tools\dsh was not found.
+// Its installer registers the folder under HKCU for the current user and
+// under HKLM for all users, and its Uninstall entry names the exe too.
+func TestDshDesktopRegisteredAnyHive(t *testing.T) {
+	const guid = "1bf39983-50d0-5fe0-9ef4-cece76f67c5e"
+	own := `Software\` + guid
+	uninstall := `Software\Microsoft\Windows\CurrentVersion\Uninstall\` + guid
+	for _, c := range []struct {
+		name     string
+		reg      map[string]string // hive|key|name
+		dir, ver string
+	}{
+		{"nothing registered", nil, "", ""},
+		{"per user", map[string]string{"HKCU|" + own + "|InstallLocation": `D:\tools\dsh`, "HKCU|" + uninstall + "|DisplayVersion": "0.2.0"}, `D:\tools\dsh`, "0.2.0"},
+		{"for all users", map[string]string{"HKLM|" + own + "|InstallLocation": `D:\tools\dsh`, "HKLM|" + uninstall + "|DisplayVersion": "0.2.1"}, `D:\tools\dsh`, "0.2.1"},
+		{"the Uninstall entry's own folder", map[string]string{"HKLM|" + uninstall + "|InstallLocation": `"D:\tools\dsh"`}, `D:\tools\dsh`, ""},
+		{"the Uninstall entry's icon", map[string]string{"HKCU|" + uninstall + "|DisplayIcon": `D:\tools\dsh\DeepSeek Harness.exe,0`}, `D:\tools\dsh`, ""},
+		{"the Uninstall entry's uninstaller", map[string]string{"HKCU|" + uninstall + "|UninstallString": `"D:\tools\dsh\Uninstall DeepSeek Harness.exe" /currentuser`}, `D:\tools\dsh`, ""},
+		{"an icon that is no exe", map[string]string{"HKCU|" + uninstall + "|DisplayIcon": `D:\tools\dsh\icon.ico`}, "", ""},
+	} {
+		read := func(hive, key, name string) string { return c.reg[hive+"|"+key+"|"+name] }
+		dir, ver := registeredIn(guid, read)
+		if dir != c.dir || ver != c.ver {
+			t.Errorf("%s: got %q %q, want %q %q", c.name, dir, ver, c.dir, c.ver)
+		}
+	}
+}
+
+// sungoku (#2325, macOS 15.8.1, magpie 0.1.1253): DeepSeek Harness.app in
+// /Applications/AI, a folder of the user's own, and no dsh CLI; the Agents
+// page said 未找到 CLI. The app is found one folder down in an app folder,
+// and wherever Spotlight has its bundle id; a bundle of another id there
+// is still not dsh's, nor is an app inside another app's bundle.
+func TestDshDesktopAppInASubfolder(t *testing.T) {
+	// the Mac app: on Windows ~\.dsh is never gone (#2300), whatever is here
+	judgeFor(t, "darwin")
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Setenv("DSH_HOME", "")
+	t.Setenv("PATH", t.TempDir()) // no dsh CLI
+	apps := t.TempDir()
+	var spotlit []string
+	wasFolders, wasSpot := appFolders, spotlightApps
+	appFolders = func() []string { return []string{apps} }
+	spotlightApps = func(id string) []string {
+		if id != "com.deepseek.dsh" {
+			return nil
+		}
+		return spotlit
+	}
+	t.Cleanup(func() { appFolders, spotlightApps = wasFolders, wasSpot })
+	desktop := filepath.Join(home, ".dsh", "profiles", "desktop", "cordis.patch.yml")
+	if err := os.MkdirAll(filepath.Dir(desktop), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(desktop, []byte(dshDesktopPatch), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	a := dsh(home)
+	a.Bin = "magpie-test-gone-dsh"
+	if !a.CLIMissing() {
+		t.Fatal("no app, no CLI: not missing")
+	}
+
+	// another app's bundle holding one of that name is no folder of apps
+	installApp(t, filepath.Join(apps, "Other.app"), "DeepSeek Harness.app", dshAppPlist)
+	if !a.CLIMissing() {
+		t.Fatal("an app inside another app's bundle taken for the desktop app")
+	}
+
+	// another bundle id in /Applications/AI is not dsh's
+	installApp(t, filepath.Join(apps, "AI"), "DeepSeek Harness.app", strings.Replace(dshAppPlist, "com.deepseek.dsh", "com.example.other", 1))
+	if !a.CLIMissing() {
+		t.Fatal("another bundle id in a subfolder taken for the desktop app")
+	}
+
+	// sungoku's: /Applications/AI/DeepSeek Harness.app
+	os.RemoveAll(filepath.Join(apps, "AI"))
+	installApp(t, filepath.Join(apps, "AI"), "DeepSeek Harness.app", dshAppPlist)
+	if a.CLIMissing() || a.AppVersion() != "0.2.0-rc.2" {
+		t.Fatalf("app in /Applications/AI: missing %v, version %q", a.CLIMissing(), a.AppVersion())
+	}
+
+	// deeper, or on another disk: where Spotlight has it, under any name
+	os.RemoveAll(filepath.Join(apps, "AI"))
+	elsewhere := t.TempDir()
+	installApp(t, filepath.Join(elsewhere, "Tools", "AI"), "DSH.app", dshAppPlist)
+	if !a.CLIMissing() {
+		t.Fatal("found with Spotlight saying nothing")
+	}
+	spotlit = []string{filepath.Join(elsewhere, "Tools", "AI", "DSH.app")}
+	if a.CLIMissing() || a.AppVersion() != "0.2.0-rc.2" {
+		t.Fatalf("app Spotlight knows: missing %v, version %q", a.CLIMissing(), a.AppVersion())
 	}
 }

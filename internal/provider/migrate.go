@@ -1316,12 +1316,26 @@ func releasePlugin(ctx context.Context, name string) error {
 }
 
 // RemovePlugin removes the plugin named, the built-ins moved onto it moved
-// back to themselves first.
+// back to themselves first, and sets aside the model picks of its
+// providers it leaves in providers.json (plugin_left.go).
 func RemovePlugin(ctx context.Context, name string) error {
 	if err := releasePlugin(ctx, name); err != nil {
 		return err
 	}
-	return plugin.Remove(ctx, name)
+	// what it served is read while it is still on the list
+	spec := installedSpec(name)
+	ids, known := pluginRecordIDs(spec)
+	pkg := plugin.PackageName(spec)
+	if err := plugin.Remove(ctx, name); err != nil {
+		return err
+	}
+	if spec == "" || !known {
+		return nil
+	}
+	if err := setAside(pkg, ids); err != nil {
+		return fmt.Errorf("%s is removed; its model picks were left in providers.json: %w", name, err)
+	}
+	return nil
 }
 
 // SetPluginOff turns the plugin named off, the built-ins moved onto it

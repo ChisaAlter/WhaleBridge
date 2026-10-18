@@ -28,6 +28,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/lastgood"
 )
 
 const (
@@ -89,6 +91,12 @@ func writeBalanceHist(h balanceHist) {
 		return
 	}
 	path := balanceHistPath()
+	// readBalanceHist reads a file that doesn't parse as no history: it is
+	// kept aside before it is written over, and not written over when it
+	// can't be
+	if lastgood.KeepUnparsed(path, lastgood.Into[balanceHist]) != nil {
+		return
+	}
 	_ = os.MkdirAll(filepath.Dir(path), 0o700)
 	_ = writeFileAtomic(path, b)
 }

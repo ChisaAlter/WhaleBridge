@@ -206,7 +206,7 @@ func btoi(b bool) int {
 
 // Templates are every template as the user's models make it now.
 func Templates() []Template {
-	ms, ds := templateModels(), Deciders()
+	ms, ds := templateModels(), OfferedDeciders(nil)
 	out := make([]Template, 0, len(TemplateKinds))
 	for _, k := range TemplateKinds {
 		out = append(out, templateOf(k, ms, ds))
@@ -220,7 +220,7 @@ func MakeTemplate(kind string) (Template, error) {
 	if !slices.Contains(TemplateKinds, kind) {
 		return Template{}, fmt.Errorf("no template %q: one of %s", kind, strings.Join(TemplateKinds, ", "))
 	}
-	t := templateOf(kind, templateModels(), Deciders())
+	t := templateOf(kind, templateModels(), OfferedDeciders(nil))
 	if t.Why != "" {
 		return t, fmt.Errorf("%s", t.Why)
 	}

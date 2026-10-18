@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/filememo"
 	"github.com/ChisaAlter/WhaleBridge/internal/lastgood"
 	"github.com/ChisaAlter/WhaleBridge/internal/netproxy"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
@@ -89,13 +90,14 @@ type call struct {
 	// A fetch's head and chunks wait here, in the order they came, until
 	// the body's reader takes them: the host's reader queues them without
 	// ever waiting on one request's consumer (see push).
-	stream  bool
-	mu      sync.Mutex
-	queue   []message
-	queued  int           // the queued chunks' decoded bytes
-	over    error         // why the call was given up on
-	stopped bool          // the call is over for good: nothing more is queued
-	wake    chan struct{} // buffered 1: something was queued, or the call is over
+	stream      bool
+	cancellable bool // a gateway request owns asynchronous I/O, without a stream slot
+	mu          sync.Mutex
+	queue       []message
+	queued      int           // the queued chunks' decoded bytes
+	over        error         // why the call was given up on
+	stopped     bool          // the call is over for good: nothing more is queued
+	wake        chan struct{} // buffered 1: something was queued, or the call is over
 
 	// window is this call's credit in charged bytes (a frame's payload plus
 	// frameOverhead) and owed is how much of it the child has spent and the
@@ -342,7 +344,7 @@ func (c *call) transitionLocked(event callEvent, why error, answer *message) fun
 			}{c.over.Error()}}
 			c.terminal = &m
 		}
-		if event == callCancelled && c.state == callActive && c.stream {
+		if event == callCancelled && c.state == callActive && (c.stream || c.cancellable) {
 			c.state = callAborting
 		} else {
 			c.state = callReleased
@@ -499,6 +501,8 @@ type Loaded struct {
 	// serves, that plugin's spec: the host runs one plugin per provider
 	// id (Prefer)
 	ServedBy map[string]string `json:"servedBy,omitempty"`
+	// Tools are the tools its tool hook gives (tools.go)
+	Tools []Tool `json:"tools,omitempty"`
 }
 
 // Clash is a provider id more than one plugin signs in to. The host runs
@@ -552,6 +556,8 @@ var (
 	// onChange are told a sign-in or the plugins changed.
 	onChange   []func()
 	onChangeMu sync.Mutex
+	// onChangeNow are run before changed or listed returns (OnChangeNow)
+	onChangeNow []func()
 )
 
 // telling counts the hooks told of a change or of a sign-in (OnChange,
@@ -573,6 +579,19 @@ func OnChange(f func()) {
 	onChangeMu.Unlock()
 }
 
+// OnChangeNow registers f to be run at once when a plugin sign-in, the
+// plugins or their listing change, before anything after it is answered:
+// an "auth" event is read before the reply to the sign-in that saved it,
+// so a look made once the sign-in returns doesn't get what was built
+// before it (#2449). OnChange's are told in the background, where a busy
+// machine may run them after that look. f must be quick: the host's
+// replies wait for it.
+func OnChangeNow(f func()) {
+	onChangeMu.Lock()
+	onChangeNow = append(onChangeNow, f)
+	onChangeMu.Unlock()
+}
+
 var (
 	onSignInMu sync.Mutex
 	onSignIn   func(provider, account, said string)
@@ -587,13 +606,51 @@ func OnSignIn(f func(provider, account, said string)) {
 	onSignInMu.Unlock()
 }
 
+var (
+	onListedMu sync.Mutex
+	onListed   []func()
+)
+
+// OnListed registers f to be told when the plugins have listed their
+// providers and models anew and the list is another than the one kept
+// before: a plugin signed in to lists its account's models only once the
+// host has answered, after OnChange was told of the sign-in.
+func OnListed(f func()) {
+	onListedMu.Lock()
+	onListed = append(onListed, f)
+	onListedMu.Unlock()
+}
+
+func listed() {
+	changedNow()
+	onListedMu.Lock()
+	fs := append([]func(){}, onListed...)
+	onListedMu.Unlock()
+	for _, f := range fs {
+		tell(f)
+	}
+}
+
 func changed() {
 	forgetProviders()
+	changedNow()
 	onChangeMu.Lock()
 	fs := append([]func(){}, onChange...)
 	onChangeMu.Unlock()
 	for _, f := range fs {
 		tell(f)
+	}
+}
+
+func changedNow() {
+	// the sign-ins are read again, even by a request holding the files it
+	// read (filememo.Hold): a sign-in just saved is in what comes next
+	filememo.Look(AuthPath())
+	onChangeMu.Lock()
+	fs := append([]func(){}, onChangeNow...)
+	onChangeMu.Unlock()
+	for _, f := range fs {
+		f()
 	}
 }
 
@@ -749,6 +806,12 @@ func get(ctx context.Context) (*host, error) {
 	checkList()
 	hostMu.Lock()
 	defer hostMu.Unlock()
+	return getLocked(ctx)
+}
+
+// getLocked requires hostMu. Gateway hooks bound both the lock wait and
+// startup with their request-hook budget.
+func getLocked(ctx context.Context) (*host, error) {
 	if hostStale.Swap(false) && current != nil {
 		go current.retire()
 		current = nil
@@ -797,6 +860,28 @@ func start(ctx context.Context) (*host, error) {
 	return h, nil
 }
 
+var (
+	catalogSyncing  sync.WaitGroup
+	catalogCancelMu sync.Mutex
+	catalogCancels  = map[int]context.CancelFunc{}
+	catalogCancelID int
+	syncCatalog     = catalog.SyncIfMissing // a var for tests
+)
+
+func cancelCatalogSyncs() {
+	catalogCancelMu.Lock()
+	cancels := make([]context.CancelFunc, 0, len(catalogCancels))
+	for _, c := range catalogCancels {
+		cancels = append(cancels, c)
+	}
+	catalogCancels = map[int]context.CancelFunc{}
+	catalogCancelMu.Unlock()
+	for _, c := range cancels {
+		c()
+	}
+	catalogSyncing.Wait()
+}
+
 // startOn starts the host on the bun given; crashed is whether it died
 // before it started.
 func startOn(ctx context.Context, bun string) (*host, bool, error) {
@@ -813,10 +898,28 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 	}
 	if catalog.Source() == "" {
 		// a plugin's provider has the models models.dev lists for it, as in
-		// OpenCode; a magpie that has never fetched them does first
-		cctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-		_ = catalog.Sync(cctx)
-		cancel()
+		// OpenCode; sync in the background so starting the host never stalls
+		// on models.dev (#1922, #1928).
+		cctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		catalogCancelMu.Lock()
+		catalogCancelID++
+		id := catalogCancelID
+		catalogCancels[id] = cancel
+		catalogCancelMu.Unlock()
+
+		catalogSyncing.Add(1)
+		go func() {
+			defer catalogSyncing.Done()
+			defer func() {
+				catalogCancelMu.Lock()
+				delete(catalogCancels, id)
+				catalogCancelMu.Unlock()
+				cancel()
+			}()
+			if err := syncCatalog(cctx); err == nil {
+				forgetProviders()
+			}
+		}()
 	}
 	// the host outlives the request that started it
 	proxy := hostProxy(env()) // what bunCommand gives it
@@ -864,13 +967,14 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 		Spec    string         `json:"spec"`
 		Target  string         `json:"target"`
 		Options map[string]any `json:"options,omitempty"`
+		Gateway string         `json:"gateway,omitempty"`
 	}
 	var items []item
 	for _, e := range l.Plugins {
 		// a plugin that is only gateway middleware or an agent runs in
 		// magpie (internal/middleware, internal/agentplug), not here
 		if !e.Off && !InMagpieOnly(Target(e.Spec)) {
-			items = append(items, item{e.Spec, Target(e.Spec), e.Options})
+			items = append(items, item{e.Spec, Target(e.Spec), e.Options, Gateway(Target(e.Spec))})
 		}
 	}
 	var res struct {
@@ -878,13 +982,18 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 	}
 	ictx, cancel := context.WithTimeout(ctx, 2*time.Minute)
 	defer cancel()
+	catalogPath := catalog.Source()
+	if catalogPath == "" {
+		catalogPath = catalog.CachePath()
+	}
 	err = h.call(ictx, "init", map[string]any{
 		"authPath":      AuthPath(),
-		"modelsDevPath": catalog.Source(),
+		"modelsDevPath": catalogPath,
 		"piPath":        pi,
 		"directory":     settings.Dir(),
 		"config":        l.Config,
 		"prefer":        l.Prefer,
+		"options":       settings.Load().PluginOptions,
 		"plugins":       items,
 	}, &res)
 	if err != nil {
@@ -893,6 +1002,7 @@ func startOn(ctx context.Context, bun string) (*host, bool, error) {
 		return nil, crashed, fmt.Errorf("starting plugins: %w", err)
 	}
 	h.loaded = res.Plugins
+	noteTools(res.Plugins)
 	for _, p := range res.Plugins {
 		if p.Error != "" {
 			log.Printf("plugin %s didn't load: %s", p.Spec, p.Error)
@@ -1292,6 +1402,9 @@ func (h *host) call(ctx context.Context, method string, params, out any) error {
 	if err != nil {
 		return err
 	}
+	c.mu.Lock()
+	c.cancellable = method == "gatewayRequest"
+	c.mu.Unlock()
 	if err := h.enqueueCall(ctx, map[string]any{"id": id, "method": method, "params": params}, nil, c); err != nil {
 		c.settle(err)
 		return err

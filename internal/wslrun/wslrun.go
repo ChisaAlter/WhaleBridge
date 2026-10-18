@@ -120,15 +120,24 @@ var up struct {
 }
 
 // upAge is how long running's answer is kept: a distro stopped is seen
-// within it.
-const upAge = 3 * time.Second
+// within it. upFailedAge is how long a failed one is: wsl.exe that timed out
+// is asked again only after it, as each ask can hold its caller (and the
+// lock) the whole 10s and leaves a wsl.exe behind (#2341).
+const (
+	upAge       = 3 * time.Second
+	upFailedAge = 30 * time.Second
+)
 
 // running are the distros running, as wsl.exe -l --running says (which
 // starts none) at most upAge ago; ok is false when it couldn't say.
 func running() (names []string, ok bool) {
 	up.Lock()
 	defer up.Unlock()
-	if up.at.IsZero() || time.Since(up.at) > upAge {
+	age := upAge
+	if !up.ok {
+		age = upFailedAge
+	}
+	if up.at.IsZero() || time.Since(up.at) > age {
 		b, err := Run(10*time.Second, "-l", "--running", "-q")
 		up.names, up.ok, up.at = Distros(b), err == nil, time.Now()
 		if err != nil {

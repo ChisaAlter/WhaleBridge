@@ -14,8 +14,8 @@ import (
 )
 
 // A search API given several keys (#1477) goes on to the next when one is
-// out of credit (Tavily's 432), and starts the next search from the one
-// that answered. A failure that isn't about the key (a 500) doesn't spend
+// out of credit (Tavily's 432), and the next search doesn't start from the
+// keys refused, which rest (search_pool_test.go). A failure that isn't about the key (a 500) doesn't spend
 // the other keys.
 func TestSearchAPIKeysTakeTurns(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())
@@ -55,7 +55,7 @@ func TestSearchAPIKeysTakeTurns(t *testing.T) {
 	}
 	took := func() []string { mu.Lock(); defer mu.Unlock(); return slices.Clone(asked) }
 
-	searchKeyAt.Delete("tavily")
+	forgetSearchKeys()
 	if said, err := search("tvly-spent, tvly-bad\ntvly-good"); err != nil || !strings.Contains(said, "go1.27.1") {
 		t.Fatalf("spent, bad, good: %q, %v", said, err)
 	}
@@ -66,10 +66,10 @@ func TestSearchAPIKeysTakeTurns(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := took(); !slices.Equal(got, []string{"tvly-good"}) {
-		t.Errorf("the next search asked with %v, want the key that answered first", got)
+		t.Errorf("the next search asked with %v, want the key that answered, the others resting", got)
 	}
 
-	searchKeyAt.Delete("tavily")
+	forgetSearchKeys()
 	if _, err := search("tvly-down,tvly-good"); err == nil {
 		t.Error("a 500 on the first key went on to the next")
 	}
@@ -77,9 +77,9 @@ func TestSearchAPIKeysTakeTurns(t *testing.T) {
 		t.Errorf("asked with %v after a 500, want the first key alone", got)
 	}
 
-	searchKeyAt.Delete("tavily")
+	forgetSearchKeys()
 	_, err := search("tvly-spent,tvly-bad")
-	if err == nil || !strings.Contains(err.Error(), "key 1:") || !strings.Contains(err.Error(), "usage limit") || !strings.Contains(err.Error(), "key 2:") {
+	if err == nil || !strings.Contains(err.Error(), "key 1 (") || !strings.Contains(err.Error(), "usage limit") || !strings.Contains(err.Error(), "key 2 (") {
 		t.Errorf("every key refused: %v", err)
 	}
 

@@ -118,15 +118,19 @@ func Run(version string) error {
 		return err
 	}
 	defer listener.Close()
+	defer serveBuiltins()()
+	// A DSH config another writer holds, or one the component cannot edit yet,
+	// must not keep the gateway down: the error shows as the sync status and
+	// the channel is written again once the write succeeds.
 	if err := syncDSH(); err != nil {
-		return err
+		setDSHSyncError(err)
+		log.Printf("鲸桥启动时 DSH 同步失败，将在后台重试: %v", err)
+		go retryDSHSync(ctx, 5*time.Second, time.Minute)
 	}
 	syncManagedAgents()
 	stopCatalogSync := watchDSHCatalog(ctx)
 	defer stopCatalogSync()
 	server := gateway.New()
-	stopOTel := usage.StartOTel()
-	defer stopOTel()
 	gateway.ArchiveBucket = func() (gateway.Putter, bool) { b, ok := davsync.S3Bucket(); return b, ok }
 	go davsync.Run(ctx)
 	failures := make(chan error, 2)
@@ -515,6 +519,33 @@ func dshSyncError() string {
 	return catalogSyncState.err
 }
 
+func setDSHSyncError(err error) {
+	catalogSyncState.Lock()
+	defer catalogSyncState.Unlock()
+	catalogSyncState.err = ""
+	if err != nil {
+		catalogSyncState.err = err.Error()
+	}
+}
+
+// retryDSHSync writes the DSH channel again with a growing wait until one
+// write succeeds or the component stops.
+func retryDSHSync(ctx context.Context, wait, limit time.Duration) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+		err := syncConfiguration()
+		setDSHSyncError(err)
+		if err == nil {
+			return
+		}
+		wait = min(wait*2, limit)
+	}
+}
+
 // Background supplier refreshes and automatic cloud sync also change the
 // DSH model list. Queue the callback because provider writes can occur inside
 // an API mutation; the worker then sees the latest atomically stored catalog.
@@ -537,13 +568,10 @@ func watchDSHCatalog(ctx context.Context) func() {
 				return
 			case <-wake:
 				err := syncConfiguration()
-				catalogSyncState.Lock()
-				catalogSyncState.err = ""
+				setDSHSyncError(err)
 				if err != nil {
-					catalogSyncState.err = err.Error()
 					log.Printf("鲸桥后台 DSH 同步失败: %v", err)
 				}
-				catalogSyncState.Unlock()
 			}
 		}
 	}()

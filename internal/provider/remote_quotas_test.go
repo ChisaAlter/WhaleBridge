@@ -216,6 +216,36 @@ func TestCachedCardsAskNobody(t *testing.T) {
 	}
 }
 
+// The status line's report (#1997) is the cards as last read, as Quota:
+// nothing is read for it, however old they are.
+func TestKeptQuotaReportAsksNobody(t *testing.T) {
+	azureHome(t)
+	c := &subscriptionUsageCache
+	c.Lock()
+	keep, keepAt := c.data, c.at
+	c.data = []SubscriptionQuota{{Provider: "codex", Name: "Codex", User: "a@x.com", Windows: []QuotaWindow{{Name: "5 hours", Used: 62, ResetSecs: 3600}}}}
+	c.at = time.Now().Add(-time.Hour)
+	c.Unlock()
+	t.Cleanup(func() {
+		c.Lock()
+		c.data, c.at = keep, keepAt
+		c.Unlock()
+	})
+	qs := KeptQuotaReport(time.Now())
+	if len(qs) != 1 || qs[0].Provider != "codex" || qs[0].Kind != "subscription" || len(qs[0].Windows) != 1 || qs[0].Windows[0].Used != 62 || qs[0].Windows[0].ResetsAt == nil {
+		t.Fatalf("report: %+v", qs)
+	}
+	if SubscriptionUsageReading() {
+		t.Error("the report started a read")
+	}
+	c.Lock()
+	at := c.at
+	c.Unlock()
+	if time.Since(at) < 30*time.Minute {
+		t.Error("the cache was read again")
+	}
+}
+
 // A remote magpie's history comes with its cards' ids.
 func TestRemoteQuotaHistories(t *testing.T) {
 	remoteQuotaHome(t, &fakePeer{})

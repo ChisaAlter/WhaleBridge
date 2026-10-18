@@ -30,8 +30,31 @@ import (
 )
 
 // jevSure is how confident Jev must be of an intent for it to count.
-// Confidence runs from 0, every option as likely, to 1, one certain.
+// Confidence runs from 0, every option as likely, to 1, one certain, as
+// System One gives it (provider.Confidence), read from the answer's
+// probabilities wherever it has them (sureOf).
 const jevSure = 0.4
+
+// sureOf is how sure an answer is of its choice on jevSure's scale: from
+// the probability it gave each option where it gave two or more, else the
+// confidence it said. A decision model's own confidence field is
+// calibrated its own way: Cloudflare's clef-flash says 0.2866 of a
+// 提醒我明天下午三点给 Dora 打电话 it put at about 0.68 (@VersunPan on X),
+// where the same model run in MLX-Serve says its top probability, and Jev
+// says the top over an even spread. Its probabilities say the same thing on
+// every one, and an even spread of them is still 0.
+func sureOf(confidence float64, ps map[string]any) float64 {
+	n := 0
+	for _, v := range ps {
+		if _, ok := v.(float64); ok {
+			n++
+		}
+	}
+	if n < 2 {
+		return confidence
+	}
+	return provider.Confidence(ps)
+}
 
 // noIntent is the option Jev picks for a message that is none of the
 // intents.
@@ -189,9 +212,10 @@ func readJev(b []byte, intents []string, levels bool, prev before) (verdict, err
 	var out struct {
 		Model   string `json:"model"`
 		Answers map[string]struct {
-			Choice     string  `json:"choice"`
-			Score      float64 `json:"score"`
-			Confidence float64 `json:"confidence"`
+			Choice        string         `json:"choice"`
+			Score         float64        `json:"score"`
+			Confidence    float64        `json:"confidence"`
+			Probabilities map[string]any `json:"probabilities"`
 		} `json:"answers"`
 		Usage struct {
 			Input  int `json:"input_tokens"`
@@ -203,8 +227,8 @@ func readJev(b []byte, intents []string, levels bool, prev before) (verdict, err
 	}
 	var v verdict
 	if a, ok := out.Answers["intent"]; ok && len(intents) > 0 && !levels {
-		v.Sure = a.Confidence
-		if a.Choice != noIntent && a.Confidence >= jevSure {
+		v.Sure = sureOf(a.Confidence, a.Probabilities)
+		if a.Choice != noIntent && v.Sure >= jevSure {
 			v.Intent = intentNamed(intents, a.Choice)
 		}
 	}
@@ -213,9 +237,9 @@ func readJev(b []byte, intents []string, levels bool, prev before) (verdict, err
 		// is torn, the conversation stays at the level of the turn before
 		// (继续，再加一个基准测试 after a 复杂任务 came out 0.54 to 0.46),
 		// and a turn with none before takes the likelier
-		v.Sure = a.Confidence
+		v.Sure = sureOf(a.Confidence, a.Probabilities)
 		v.Intent = intentNamed(intents, a.Choice)
-		if was := intentNamed(intents, prev.Intent); a.Confidence < jevSure && was != "" {
+		if was := intentNamed(intents, prev.Intent); v.Sure < jevSure && was != "" {
 			v.Intent = was
 		}
 	}
@@ -461,97 +485,36 @@ func (s *Server) serveSystemOne(w http.ResponseWriter, r *http.Request) {
 		writeError(w, provider.Chat, http.StatusForbidden, keyModelError(keyWho, asked))
 		return
 	}
+	// its keys or accounts in its routing's order, each asked until one
+	// answers (decideKeys): one out of quota rests, and the next takes the
+	// request (fflake33 on Discord). One the user set not to serve the
+	// model is never asked; with every one so, the request is refused
+	cs, pl := s.decideKeys(p, model)
+	barred := len(cs) == 0 && len(pl.left) > 0 && !slices.ContainsFunc(pl.left, func(w Weighed) bool { return !w.Barred })
 	// and held to some accounts (#905): the decision model's provider must
-	// have one the key may use, the call spend landing on it as any's —
-	// and asked on one such key, not the provider's first, which may be
-	// one the key may not: of the keys in use, the first the key may use
-	// and that is let serve the model, the request refused without one.
-	// A provider with no key asks as it is: an account's tokens, or none
-	// at all
+	// have one the key may use and that is let serve the model, the call
+	// spend landing on it as any's, and only those are asked
 	if accWho, accHeld := accountHolds(r); accHeld {
-		if !accountServes(accWho, p, model) {
+		if !accountServes(accWho, p, model) || barred {
 			writeError(w, provider.Chat, http.StatusForbidden, keyAccountsError(accWho, asked))
 			return
 		}
-		if p.Account == nil && p.Key != "" {
-			kept := false
-			for _, k := range p.KeysOn() {
-				if q := p.WithKey(k); accountAllowed(accWho, candidate{p: q, model: model}) && p.AccountServes(q.AccountID(), model) {
-					p, kept = q, true
-					break
-				}
-			}
-			if !kept {
-				writeError(w, provider.Chat, http.StatusForbidden, keyAccountsError(accWho, asked))
-				return
-			}
+		var held bool
+		if cs, pl, held = allowedCandidates(accWho, cs, pl, nil); len(cs) == 0 && held {
+			writeError(w, provider.Chat, http.StatusForbidden, keyAccountsError(accWho, asked))
+			return
 		}
 	}
-	seat := decideSeat(p, model)
-	var used Usage
-	who := callerOf(r)
-	tr := s.trace.beginFor(r, Route{Time: start, Agent: who.agent, Session: sessionOf(r.Header), Model: asked, Provider: p.ID,
-		Order: []Weighed{seat}, Tries: []Try{{ID: seat.ID, Model: model, Start: start}}})
-	end := func(status int, msg string, tokens int) {
-		ms := time.Since(start).Milliseconds()
-		s.trace.update(tr, func(t *Route) {
-			try := &t.Tries[0]
-			try.Done, try.Status, try.Millis, try.Error = true, status, ms, msg
-			if status >= 400 {
-				try.Fail = failure(status, []byte(msg))
-			}
-			t.Done, t.Status, t.Error, t.Millis, t.Tokens = true, status, msg, ms, tokens
-			t.Usage = routeUsage(p.ID, model, used)
-		})
-	}
-	status, b, header, err := s.postDecide(r.Context(), p, model, body)
-	ctype := header.Get("Content-Type")
-	if err != nil {
-		writeError(w, provider.Chat, http.StatusBadGateway, err.Error())
-		end(http.StatusBadGateway, err.Error(), 0)
+	if barred {
+		writeError(w, provider.Chat, http.StatusForbidden, barredError(asked, pl.left))
 		return
 	}
-	var use struct {
-		Model string `json:"model"` // the one that answered, when the reply says
-		Usage struct {
-			Input  int `json:"input_tokens"`
-			Output int `json:"output_tokens"`
-		} `json:"usage"`
+	cs = probeOne(cs) // of those resting, only the one back soonest (#1799)
+	if len(cs) == 0 {
+		writeError(w, provider.Chat, http.StatusServiceUnavailable, fmt.Sprintf("no key or account of %s may be asked %s now", p.Name, model))
+		return
 	}
-	_ = decodeJSON(b, &use)
-	errMsg := ""
-	if status >= 300 {
-		errMsg = provider.APIError(b, fmt.Sprintf("%d %s", status, http.StatusText(status)))
-	}
-	tokens := use.Usage.Input + use.Usage.Output
-	used = Usage{Input: use.Usage.Input, Output: use.Usage.Output}
-	var keyID, keyName string
-	if p.Account == nil && p.Key != "" {
-		keyID, keyName = provider.KeyID(p.Key), p.KeyName
-	}
-	appendUsage(r, usage.Record{RouteID: tr.ID, Time: start, Agent: who.agent, Via: who.via, Provider: p.ID, Host: p.Where(), Model: model, Requested: asked, Served: use.Model,
-		ProviderKeyID: keyID, ProviderKeyName: keyName, ProviderAccount: accountOf(p),
-		Input: use.Usage.Input, Output: use.Usage.Output, Millis: time.Since(start).Milliseconds(), Status: status})
-	end(status, errMsg, tokens)
-	if ctype == "" || status < 300 {
-		ctype = "application/json"
-	}
-	w.Header().Set("Content-Type", ctype)
-	w.WriteHeader(status)
-	w.Write(b)
-}
-
-// decideSeat is the one account a System One request is sent to: a decision
-// provider has no pool of conversation keys, only the key it is asked with.
-func decideSeat(p provider.Provider, model string) Weighed {
-	w := Weighed{ID: p.ID, Provider: p.ID, Name: p.Name, Icon: p.Icon, Preset: p.Preset, Model: model, Kind: "provider"}
-	if p.Key != "" {
-		w.Kind, w.Who = "key", p.KeyName
-		if w.Who == "" {
-			w.Who = provider.Mask(p.Key)
-		}
-	}
-	return w
+	s.serveDecideTries(w, r, body, asked, start, cs, pl, nil)
 }
 
 // withEffort asks a request, in the client's own API, for reasoning at

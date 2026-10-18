@@ -2,7 +2,6 @@ package proc
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -20,16 +19,24 @@ import (
 // size and time.
 func FindTool(name string) string {
 	return Unwrap(name, looked("find\x00"+name, func() lookAnswer {
-		if p, err := exec.LookPath(name); err == nil {
+		if p, err := lookPath(name); err == nil {
 			return lookAnswer{path: p}
 		}
-		return lookAnswer{path: toolIn(name, runtime.GOOS, findDirs())}
+		dirs := findDirs()
+		if !mayBeIn(name, dirs) {
+			return lookAnswer{}
+		}
+		return lookAnswer{path: toolIn(name, runtime.GOOS, dirs)}
 	}).path)
 }
 
 // sandboxVar is testenv.Marker, which proc can't import: the home a test
 // binary's testenv.Isolate made.
 const sandboxVar = "MAGPIE_TEST_SANDBOX"
+
+// Isolated reports whether this is a test binary testenv isolated, where
+// nothing of the machine's own (its folders, its registry) is read.
+func Isolated() bool { return os.Getenv(sandboxVar) != "" }
 
 // SystemDirs are paths of the machine's own, outside any home (Homebrew's
 // /opt/homebrew/bin, /usr/local/bin, an app in /Applications, the

@@ -29,6 +29,21 @@ func GetJSON(path, keyPath string) (string, bool) {
 	return r.String(), true
 }
 
+// GetJSONRaw is the value at a dot-separated key path as it is written in
+// the file (a string with its quotes, a number, true), for putting back
+// exactly as it was (a json.RawMessage given to SetJSON).
+func GetJSONRaw(path, keyPath string) (string, bool) {
+	raw, err := Read(path)
+	if err != nil || len(raw) == 0 {
+		return "", false
+	}
+	r := gjson.GetBytes(jsonc.ToJSONInPlace(raw), keyPath)
+	if !r.Exists() {
+		return "", false
+	}
+	return r.Raw, true
+}
+
 // SetJSON sets one or more key paths in a JSON/JSONC file, preserving
 // comments, key order and indentation. Missing files and parents are created.
 func SetJSON(path string, kvs ...KV) error {

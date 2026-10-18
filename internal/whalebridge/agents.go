@@ -53,6 +53,25 @@ func externalAgent(a *agent.Agent) bool {
 	return id != "dsh"
 }
 
+// unlistedAgents are the clients the component does not offer to connect.
+// Claude Science is connected by stopping its daemon and starting it again
+// on the gateway; the component never starts a client for the user.
+var unlistedAgents = map[string]bool{agent.ScienceID: true}
+
+func listedAgent(a *agent.Agent) bool {
+	id, _, _ := strings.Cut(a.ID, "@wsl:")
+	return externalAgent(a) && !unlistedAgents[id]
+}
+
+// findListedAgent is agent.Find limited to the clients this page offers.
+func findListedAgent(id string) (*agent.Agent, error) {
+	a, err := agent.Find(id)
+	if bare, _, _ := strings.Cut(id, "@wsl:"); err == nil && unlistedAgents[bare] {
+		return nil, fmt.Errorf("鲸桥不提供 %s 的接入", a.Name)
+	}
+	return a, err
+}
+
 func managedAgentsPath() string { return filepath.Join(appdir.Config(), "agents.json") }
 
 // Only a connection the user explicitly made here receives catalog updates.
@@ -216,7 +235,7 @@ func agentRows() []agentRow {
 		SyncError: dshSyncError(),
 	}}
 	for _, a := range agent.All() {
-		if !externalAgent(a) {
+		if !listedAgent(a) {
 			continue
 		}
 		vals := a.Values()
@@ -287,7 +306,7 @@ func agentAction(action string) http.HandlerFunc {
 		}
 		mutations.Lock()
 		defer mutations.Unlock()
-		a, err := agent.Find(input.ID)
+		a, err := findListedAgent(input.ID)
 		if err != nil {
 			agentFailure(w, err, http.StatusBadRequest)
 			return
@@ -401,6 +420,10 @@ type agentModel struct {
 	FastFor string `json:"fastFor,omitempty"`
 	Fast    bool   `json:"fast,omitempty"`
 	OwnFast bool   `json:"ownFast,omitempty"`
+	// CanUltra: a fast pick of it can go as Ultrafast (a Codex account offers
+	// the tier on the model); Ultra: the agent's requests for it do.
+	CanUltra bool `json:"canUltra,omitempty"`
+	Ultra    bool `json:"ultra,omitempty"`
 }
 
 func agentModelList(a *agent.Agent) []agentModel {
@@ -409,6 +432,7 @@ func agentModelList(a *agent.Agent) []agentModel {
 	off := provider.ModelOff(id)
 	vals := a.Values()
 	out := []agentModel{}
+	var ultra map[string]bool
 	for _, e := range listed {
 		m := agentModel{ID: e.ID, Name: e.Name, Group: e.Provider.Name, Context: e.Context, Hidden: off(e.ID)}
 		if m.Name == "" {
@@ -432,6 +456,10 @@ func agentModelList(a *agent.Agent) []agentModel {
 		}
 		if e.Group == "" && provider.CanFast(e.Provider, e.Model) {
 			m.FastFor, m.Fast, m.OwnFast = id, provider.IsFastPick(id, e.ID), provider.OwnFast(e.Provider, e.Model)
+			if ultra == nil {
+				ultra = provider.UltraModels()
+			}
+			m.CanUltra, m.Ultra = provider.UltraOn(e.Provider, e.Model, ultra), provider.IsUltraPick(id, e.ID)
 		}
 		out = append(out, m)
 	}
@@ -455,7 +483,7 @@ func agentModelRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("GET /api/agent-models/{id}", func(w http.ResponseWriter, r *http.Request) {
 		mutations.Lock()
 		defer mutations.Unlock()
-		a, err := agent.Find(r.PathValue("id"))
+		a, err := findListedAgent(r.PathValue("id"))
 		if err != nil {
 			agentFailure(w, err, 400)
 			return
@@ -476,7 +504,7 @@ func agentModelRoutes(mux *http.ServeMux) {
 		}
 		mutations.Lock()
 		defer mutations.Unlock()
-		a, err := agent.Find(r.PathValue("id"))
+		a, err := findListedAgent(r.PathValue("id"))
 		if err == nil && externalAgent(a) {
 			err = managedAgent(a)
 		}
@@ -530,6 +558,9 @@ func agentModelRoutes(mux *http.ServeMux) {
 		var in struct {
 			ID, For, Ref string
 			Fast         bool
+			// Tier, when sent: "" the usual speed, "priority" fast,
+			// "ultrafast" Ultrafast where the account offers it
+			Tier *string
 		}
 		if err := decode(w, r, &in); err != nil {
 			agentFailure(w, err, 400)
@@ -540,21 +571,23 @@ func agentModelRoutes(mux *http.ServeMux) {
 		if in.ID == "" {
 			in.ID = in.For
 		}
-		a, err := agent.Find(in.ID)
+		a, err := findListedAgent(in.ID)
 		if err == nil && externalAgent(a) {
 			err = managedAgent(a)
 		}
 		if err == nil && in.For != "" && in.For != a.ListsFor() {
 			err = fmt.Errorf("模型名单不属于这个 Agent")
 		}
-		if err == nil {
+		if err == nil && in.Tier != nil {
+			err = provider.SetFastTier(a.ListsFor(), in.Ref, *in.Tier)
+		} else if err == nil {
 			err = provider.SetFastPick(a.ListsFor(), in.Ref, in.Fast)
 		}
 		if err != nil {
 			agentFailure(w, err, 400)
 			return
 		}
-		writeJSON(w, map[string]any{"ok": true, "fast": provider.IsFastPick(a.ListsFor(), in.Ref)})
+		writeJSON(w, map[string]any{"ok": true, "fast": provider.IsFastPick(a.ListsFor(), in.Ref), "ultra": provider.IsUltraPick(a.ListsFor(), in.Ref)})
 	})
 }
 

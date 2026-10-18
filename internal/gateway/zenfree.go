@@ -12,7 +12,10 @@ import (
 // OpenCode Zen's free models (-free) are served to OpenCode alone: a
 // request must carry OpenCode's headers (provider.OpenCodeClient), be
 // streamed, and offer tools named bash and read, or Zen answers 403
-// "OpenCode's free tier can only be used from within OpenCode". The user
+// "OpenCode's free tier can only be used from within OpenCode", and since
+// mid-October 2026 be asked at the inference API's URL, not Zen's
+// (provider.OpenCodeFreeURL), with bash and read each taking a parameter
+// (provider.OpenCodeToolSchemas). The user
 // allowed magpie to ask them as OpenCode does, on this route only. So a
 // request to one is never relayed as it came: it is translated (which
 // always streams upstream, and gathers the stream into one reply for a
@@ -22,7 +25,8 @@ import (
 //     Code's Bash and Read) is offered under the lowercase name, and the
 //     model's calls of it go back to the client under the client's own;
 //   - a missing bash or read (Codex's shell and exec_command are not bash)
-//     is offered as a stub that says never to call it. tool_choice is left
+//     is offered as a stub that says never to call it, with OpenCode's own
+//     parameters. tool_choice is left
 //     as the client sent it. A call of a stub is never handed on: it is
 //     left out of the reply, and a turn that called nothing else ends there,
 //     with what the model said so far (a short note when it said nothing),
@@ -54,7 +58,7 @@ func zenFreeTools(r *Request) *zenTools {
 			}
 			continue
 		}
-		tools = append(tools, Tool{Name: need, Description: provider.OpenCodeStub, Schema: json.RawMessage(`{"type":"object","properties":{}}`)})
+		tools = append(tools, Tool{Name: need, Description: provider.OpenCodeStub, Schema: json.RawMessage(provider.OpenCodeToolSchemas[need])})
 		z.stubs[need] = true
 	}
 	r.Tools = tools

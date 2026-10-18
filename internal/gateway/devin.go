@@ -461,6 +461,7 @@ func buildDevin(r *Request, uid, key string) []byte {
 	// the caller's tools, and any the conversation used that it no longer
 	// offers
 	offered := map[string]bool{}
+	gemini := strings.Contains(strings.ToLower(uid), "gemini")
 	tool := func(name, desc string, schema json.RawMessage) {
 		if len(bytes.TrimSpace(schema)) == 0 || string(bytes.TrimSpace(schema)) == "null" {
 			schema = json.RawMessage(`{"type":"object","properties":{}}`)
@@ -473,7 +474,11 @@ func buildDevin(r *Request, uid, key string) []byte {
 		// request" to a tool whose parameters have a root anyOf, oneOf or
 		// allOf (#1196: Codex desktop's automation_update), as Anthropic
 		// does behind Factory (#646)
-		out = out.bytes(10, pb{}.str(1, name).str(2, desc).bytes(3, objectSchema(schema)))
+		schema = objectSchema(schema)
+		if gemini {
+			schema = devinGeminiSchema(schema)
+		}
+		out = out.bytes(10, pb{}.str(1, name).str(2, desc).bytes(3, schema))
 	}
 	for _, t := range tools {
 		desc := t.Description
@@ -490,6 +495,179 @@ func buildDevin(r *Request, uid, key string) []byte {
 		}
 	}
 	return out.str(21, uid)
+}
+
+// devinGeminiSchema is a tool's parameters as Devin's Gemini models take
+// them. Devin answers "There is an issue with this request, please try a
+// different model" (invalid_argument) to a Gemini model offered a tool
+// whose schema, at any depth, has a type that is a list (["string","null"],
+// as zod-to-json-schema writes a nullable field), an array with no items,
+// items that are a list or true, or properties or an enum with no type
+// (7eleven on Discord, ZCode on gemini-4-argon); its Claude models and
+// swe-2 take all of them, so only a Gemini uid gets this. A list type
+// becomes its one type, nullable when it had "null", or anyOf of each; such
+// an array's items become {} (a one-schema list, that schema); a schema
+// with properties, or the root, is an object; an enum's type comes from its
+// values, and an enum of mixed values goes. A schema needing none of it is
+// sent as it came. The plugin does the same (geminiSchema, devin 0.1.17).
+func devinGeminiSchema(schema json.RawMessage) json.RawMessage {
+	d := json.NewDecoder(bytes.NewReader(schema))
+	d.UseNumber()
+	var m map[string]any
+	if d.Decode(&m) != nil || m == nil {
+		return schema
+	}
+	changed := false
+	if _, ok := m["type"]; !ok {
+		m["type"], changed = "object", true
+		if _, ok := m["properties"]; !ok {
+			m["properties"] = map[string]any{}
+		}
+	}
+	if !geminiSchemaIn(m, 0) && !changed {
+		return schema
+	}
+	b, err := json.Marshal(m)
+	if err != nil {
+		return schema
+	}
+	return b
+}
+
+// geminiSchemaIn rewrites s in place as devinGeminiSchema says, and
+// whether it changed anything.
+func geminiSchemaIn(s map[string]any, depth int) bool {
+	if depth > 32 {
+		return false
+	}
+	changed := false
+	sub := func(v any) {
+		if m, ok := v.(map[string]any); ok && geminiSchemaIn(m, depth+1) {
+			changed = true
+		}
+	}
+	for _, k := range []string{"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"} {
+		if m, ok := s[k].(map[string]any); ok {
+			for _, v := range m {
+				sub(v)
+			}
+		}
+	}
+	for _, k := range []string{"anyOf", "oneOf", "allOf", "prefixItems"} {
+		if l, ok := s[k].([]any); ok {
+			for _, v := range l {
+				sub(v)
+			}
+		}
+	}
+	for _, k := range []string{"additionalProperties", "not", "if", "then", "else", "contains"} {
+		sub(s[k])
+	}
+	if list, ok := s["type"].([]any); ok {
+		changed = true
+		var some []string
+		null := false
+		seen := map[string]bool{}
+		for _, t := range list {
+			ts, _ := t.(string)
+			if ts == "" || seen[ts] {
+				continue
+			}
+			seen[ts] = true
+			if ts == "null" {
+				null = true
+			} else {
+				some = append(some, ts)
+			}
+		}
+		if null && len(some) > 0 {
+			s["nullable"] = true
+		}
+		switch {
+		case len(some) == 1:
+			s["type"] = some[0]
+		case len(some) == 0 && null:
+			s["type"] = "null"
+		case len(some) == 0:
+			delete(s, "type")
+		default:
+			delete(s, "type")
+			branches, _ := s["anyOf"].([]any)
+			for _, t := range some {
+				b := map[string]any{"type": t}
+				if t == "array" {
+					b["items"] = map[string]any{}
+				}
+				branches = append(branches, b)
+			}
+			s["anyOf"] = branches
+		}
+	}
+	_, typed := s["type"]
+	if vals, ok := s["enum"].([]any); ok && !typed {
+		changed = true
+		kinds := map[string]bool{}
+		var kept []any
+		for _, v := range vals {
+			switch x := v.(type) {
+			case nil:
+				s["nullable"] = true
+				continue
+			case string:
+				kinds["string"] = true
+			case bool:
+				kinds["boolean"] = true
+			case json.Number:
+				if strings.ContainsAny(x.String(), ".eE") {
+					kinds["number"] = true
+				} else {
+					kinds["integer"] = true
+				}
+			default:
+				kinds["other"] = true
+			}
+			kept = append(kept, v)
+		}
+		one := ""
+		if len(kinds) == 1 {
+			for k := range kinds {
+				one = k
+			}
+		} else if len(kinds) == 2 && kinds["integer"] && kinds["number"] {
+			one = "number"
+		}
+		if one != "" && one != "other" {
+			s["type"], s["enum"], typed = one, kept, true
+		} else {
+			delete(s, "enum")
+		}
+	}
+	if _, ok := s["properties"].(map[string]any); ok && !typed {
+		s["type"], typed, changed = "object", true, true
+	}
+	_, hasItems := s["items"]
+	if s["type"] == "array" || (!typed && hasItems) {
+		switch it := s["items"].(type) {
+		case map[string]any:
+			sub(it)
+		case []any:
+			changed = true
+			s["items"] = map[string]any{}
+			if len(it) == 1 {
+				if m, ok := it[0].(map[string]any); ok {
+					geminiSchemaIn(m, depth+1)
+					s["items"] = m
+				}
+			}
+		default:
+			changed = true
+			s["items"] = map[string]any{}
+		}
+		if s["type"] != "array" {
+			s["type"], changed = "array", true
+		}
+	}
+	return changed
 }
 
 // devinToolDescriptions is what each tool says of itself, for the

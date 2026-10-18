@@ -421,7 +421,7 @@ func vscodeGroupJSON(k vscodeKind, vendor string) map[string]any {
 		if output <= 0 {
 			output = 8192
 		}
-		output = min(output, context/4)
+		output = outputOr(m, min(output, context/4))
 		entry := map[string]any{
 			"id": m.ID, "name": m.Name, "url": vscodeURL(),
 			"toolCalling": true, "vision": m.Images,

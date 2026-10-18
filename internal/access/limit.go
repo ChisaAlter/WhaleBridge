@@ -4,14 +4,16 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"time"
 )
 
 // Limit is a gateway key's budget for a window: a calendar one in local
 // time (#585), a day from midnight, a week from Monday's midnight, a
-// month from the 1st's; or a cycle of Days days (#1509, period "days"),
-// the first from when the limit was set, each next one Days×24h after
-// the last. Tokens counts each call's uncached input, output (reasoning
+// month from the 1st's; or a cycle of Days days (#1509, period "days")
+// or of Hours hours (#2102, period "hours", a subscription's 5-hour
+// window's pace), the first from when the limit was set, each next one a
+// cycle after the last. Tokens counts each call's uncached input, output (reasoning
 // included) and cache writes, and its cache reads too when CacheReads is
 // set; Cost is an estimate in US dollars at the prices magpie shows on
 // the Usage page, not a vendor's bill. A cap of 0 is no cap; a limit with
@@ -19,23 +21,93 @@ import (
 type Limit struct {
 	Period string `json:"period"`
 	// Days is a "days" limit's cycle, 1 to MaxDays; 0 for the others.
-	Days       int     `json:"days,omitempty"`
+	Days int `json:"days,omitempty"`
+	// Hours is an "hours" limit's cycle, 1 to MaxHours; 0 for the others.
+	Hours      int     `json:"hours,omitempty"`
 	Tokens     int64   `json:"tokens,omitempty"`
 	Cost       float64 `json:"cost,omitempty"`
 	CacheReads bool    `json:"cacheReads,omitempty"`
-	// Since is magpie's, never the caller's (Update sets it): for "days",
-	// when the first cycle began, the limit set or last reset; for a
+	// Since is magpie's, never the caller's (Update sets it): for "days"
+	// and "hours", when the first cycle began, the limit set or last reset; for a
 	// calendar period, when it was last reset, so a call before it in
 	// the same window doesn't count. Zero for a calendar limit never
 	// reset, as every limit from before #1509 is.
 	Since time.Time `json:"since,omitzero"`
 }
 
+// MaxLimits is how many limits one key can have (#2227).
+const MaxLimits = 5
+
+// Limits are k's limits, its Limit first; none for a key with no limit.
+// Each holds the key on its own: a request passes only while all of them
+// have something left.
+func (k Key) Limits() []*Limit { return limitsOf(k.Limit, k.More) }
+
+// Limits are the limits who's key holds it to, as Key.Limits.
+func (who Identity) Limits() []*Limit { return limitsOf(who.Limit, who.More) }
+
+func limitsOf(first *Limit, more []Limit) []*Limit {
+	var out []*Limit
+	if first.Limited() {
+		out = append(out, first)
+	}
+	for i := range more {
+		if more[i].Limited() {
+			out = append(out, &more[i])
+		}
+	}
+	return out
+}
+
+// limitList is a copy of k's limits, to change and set back.
+func (k *Key) limitList() []Limit {
+	var out []Limit
+	for _, l := range k.Limits() {
+		out = append(out, *l)
+	}
+	return out
+}
+
+// setLimits keeps ls as k's limits: the first as Limit, so a magpie from
+// before #2227 still holds the key to it, the rest as More.
+func (k *Key) setLimits(ls []Limit) {
+	k.Limit, k.More = nil, nil
+	if len(ls) > 0 {
+		first := ls[0]
+		k.Limit = &first
+		k.More = slices.Clone(ls[1:])
+	}
+	if len(k.More) == 0 {
+		k.More = nil
+	}
+}
+
+// sameWindow: l and o count in the same window, so two limits of one key
+// that do are one limit with two caps.
+func (l *Limit) sameWindow(o *Limit) bool {
+	return l.Period == o.Period && l.Days == o.Days && l.Hours == o.Hours
+}
+
 // Periods are the windows a limit can be set for.
-var Periods = []string{"day", "week", "month", "days"}
+var Periods = []string{"day", "week", "month", "days", "hours"}
 
 // MaxDays is the longest "days" cycle, ten years.
 const MaxDays = 3650
+
+// MaxHours is the longest "hours" cycle, a year; a longer one is a
+// "days" cycle.
+const MaxHours = 8760
+
+// cycle is a "days" or "hours" limit's cycle, 0 for a calendar one.
+func (l *Limit) cycle() time.Duration {
+	switch l.Period {
+	case "days":
+		return time.Duration(min(max(l.Days, 1), MaxDays)) * 24 * time.Hour
+	case "hours":
+		return time.Duration(min(max(l.Hours, 1), MaxHours)) * time.Hour
+	}
+	return 0
+}
 
 // Limited: l caps something.
 func (l *Limit) Limited() bool { return l != nil && (l.Tokens > 0 || l.Cost > 0) }
@@ -58,23 +130,32 @@ func (l *Limit) Valid() (*Limit, error) {
 	}
 	switch v.Period {
 	case "day", "week", "month":
-		v.Days = 0
+		v.Days, v.Hours = 0, 0
 	case "days":
+		v.Hours = 0
 		if v.Days < 1 || v.Days > MaxDays {
 			return nil, fmt.Errorf("A limit's cycle is a whole number of days from 1 to %d", MaxDays)
 		}
+	case "hours":
+		v.Days = 0
+		if v.Hours < 1 || v.Hours > MaxHours {
+			return nil, fmt.Errorf("A limit's cycle is a whole number of hours from 1 to %d", MaxHours)
+		}
 	default:
-		return nil, errors.New("A limit's period is day, week, month or every N days")
+		return nil, errors.New("A limit's period is day, week, month, every N days or every N hours")
 	}
 	v.Cost = math.Round(v.Cost*1e4) / 1e4
 	return &v, nil
 }
 
-// Per is the window as a sentence ends it: "day", "week", "month" or
-// "10-day cycle".
+// Per is the window as a sentence ends it: "day", "week", "month",
+// "10-day cycle" or "5-hour cycle".
 func (l *Limit) Per() string {
-	if l.Period == "days" {
+	switch l.Period {
+	case "days":
 		return fmt.Sprintf("%d-day cycle", l.Days)
+	case "hours":
+		return fmt.Sprintf("%d-hour cycle", l.Hours)
 	}
 	return l.Period
 }
@@ -82,30 +163,30 @@ func (l *Limit) Per() string {
 // sinceOf is the Since a limit set as next keeps, with prev the key's
 // limit before: its own while the period and cycle stay the same (a new
 // cap doesn't restart the window), else a new cycle from now for "days"
-// and none for a calendar period.
+// and "hours", and none for a calendar period.
 func sinceOf(prev, next *Limit, now time.Time) time.Time {
-	if prev != nil && prev.Period == next.Period && prev.Days == next.Days && (next.Period != "days" || !prev.Since.IsZero()) {
+	cyclic := next.cycle() > 0
+	if prev != nil && prev.Period == next.Period && prev.Days == next.Days && prev.Hours == next.Hours && (!cyclic || !prev.Since.IsZero()) {
 		return prev.Since
 	}
-	if next.Period == "days" {
+	if cyclic {
 		return now
 	}
 	return time.Time{}
 }
 
-// epoch is where a "days" cycle written by hand without a Since runs from.
+// epoch is where a cycle written by hand without a Since runs from.
 var epoch = time.Unix(0, 0)
 
 // Window is the window l counts in at now, in now's location: when it
-// began and when the next begins. A "days" cycle is counted in absolute
-// time, 24h a day whatever the clocks do, so a restart or a change of
+// began and when the next begins. A "days" or "hours" cycle is counted
+// in absolute time, 24h a day whatever the clocks do, so a restart or a change of
 // time zone or summer time keeps it; one with no Since runs from the Unix
 // epoch. A calendar window starts at Since instead when the key was reset
 // in it.
 func (l *Limit) Window(now time.Time) (start, reset time.Time) {
 	loc := now.Location()
-	if l.Period == "days" {
-		n := time.Duration(min(max(l.Days, 1), MaxDays)) * 24 * time.Hour
+	if n := l.cycle(); n > 0 {
 		anchor := l.Since
 		if anchor.Before(epoch) {
 			anchor = epoch

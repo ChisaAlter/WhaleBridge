@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"github.com/ChisaAlter/WhaleBridge/internal/testenv"
 )
@@ -103,4 +104,70 @@ func TestFxDetected(t *testing.T) {
 	if !fx(home).Detected() {
 		t.Error("~/.fx is not taken for the agent")
 	}
+}
+
+// What the user set on magpie's provider in fx's settings stays through
+// every sync and pick, as T3 Code's did after #2030: the reviewer model fx's
+// auto permission mode asks, and a tool_choice_mode turned to omit. The
+// address, auth and model list stay magpie's; an auth the user changed goes
+// back whole, as fx refuses an env beside type none.
+func TestFxKeepsTheUsersSettings(t *testing.T) {
+	home := syncHome(t)
+	path := filepath.Join(home, ".fx", "settings.json")
+	os.MkdirAll(filepath.Dir(path), 0o755)
+	os.WriteFile(path, []byte(`{"theme":"dark","providers":{"local":{"protocol":"openai-chat-completions","base_url":"http://localhost:11434/v1","auth":{"type":"none"}}}}`), 0o644)
+	a := fx(home)
+	f := a.Field("model")
+	if err := f.Set("magpie/relay/glm-4.6"); err != nil {
+		t.Fatal(err)
+	}
+	if err := edit.SetJSON(path,
+		edit.KV{Path: "providers.magpie.reviewer_model", Value: "relay/glm-4.6"},
+		edit.KV{Path: "providers.magpie.tool_choice_mode", Value: "omit"},
+		edit.KV{Path: "providers.magpie.auth", Value: map[string]any{"type": "bearer", "env": "MY_KEY"}},
+		edit.KV{Path: "providers.magpie.base_url", Value: "http://127.0.0.1:1/v1"},
+		edit.KV{Path: "providers.magpie.model_metadata", Value: map[string]any{"gone/old": map[string]any{}}},
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Key: "k", Chat: "http://127.0.0.1:1/v1", Models: []string{"pro"}}); err != nil {
+		t.Fatal(err)
+	}
+	for range 3 {
+		if err := a.Sync(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	check := func(when string) {
+		t.Helper()
+		var s struct {
+			Theme     string `json:"theme"`
+			Providers map[string]struct {
+				ReviewerModel  string         `json:"reviewer_model"`
+				ToolChoiceMode string         `json:"tool_choice_mode"`
+				BaseURL        string         `json:"base_url"`
+				Auth           map[string]any `json:"auth"`
+				ModelMetadata  map[string]any `json:"model_metadata"`
+			} `json:"providers"`
+		}
+		raw := readFile(path)
+		if err := json.Unmarshal([]byte(raw), &s); err != nil {
+			t.Fatalf("%v\n%s", err, raw)
+		}
+		p := s.Providers[magpieID]
+		if p.ReviewerModel != "relay/glm-4.6" || p.ToolChoiceMode != "omit" {
+			t.Errorf("%s: the user's settings not kept:\n%s", when, raw)
+		}
+		if p.BaseURL == "http://127.0.0.1:1/v1" || p.BaseURL == "" || len(p.Auth) != 1 || p.Auth["type"] != "none" || p.ModelMetadata["gone/old"] != nil || p.ModelMetadata["deepseek/pro"] == nil {
+			t.Errorf("%s: magpie's own parts not written:\n%s", when, raw)
+		}
+		if s.Theme != "dark" || s.Providers["local"].BaseURL == "" {
+			t.Errorf("%s: the user's other settings changed:\n%s", when, raw)
+		}
+	}
+	check("sync")
+	if err := f.Set("magpie/deepseek/pro"); err != nil {
+		t.Fatal(err)
+	}
+	check("pick")
 }

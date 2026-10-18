@@ -42,6 +42,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -181,8 +182,10 @@ func VertexWholePath(model string) string {
 
 // vertexTest is the smallest request for model at a Vertex AI provider:
 // answered whole, after as little thinking as the model takes (Gemini 3
-// low, which each of them takes; 2.5 Pro 128 tokens, which it can't go
-// under; 2.5's Flash none).
+// and later low, which each of them takes — Gemini 4 Argon's least of
+// low, medium and high, and it turns a budget away (#2083), while left
+// untold it thinks at medium, past the 16 tokens; 2.5 Pro 128 tokens,
+// which it can't go under; 2.5's Flash none).
 func vertexTest(q Provider, model string) (string, string) {
 	think := `"thinkingConfig":{"thinkingLevel":"low"},`
 	switch m := strings.ToLower(model); {
@@ -190,15 +193,31 @@ func vertexTest(q Provider, model string) (string, string) {
 		think = `"thinkingConfig":{"thinkingBudget":128},`
 	case strings.HasPrefix(m, "gemini-2.5"):
 		think = `"thinkingConfig":{"thinkingBudget":0},`
-	case !strings.HasPrefix(m, "gemini-3"):
+	case vertexGeneration(m) < 3:
 		think = ""
 	}
 	return q.Base(Gemini) + "/publishers/google/models/" + url.PathEscape(model) + ":generateContent",
 		`{"contents":[{"role":"user","parts":[{"text":"hi"}]}],"generationConfig":{` + think + `"maxOutputTokens":16}}`
 }
 
+// vertexGen is the major version a Gemini id names: gemini-4-argon,
+// gemini-3.8-flash.
+var vertexGen = regexp.MustCompile(`^gemini-(\d+)`)
+
+// vertexGeneration is the Gemini generation model names, 0 for an id that
+// names none (an alias such as gemini-flash-latest, which may be a 2.5).
+func vertexGeneration(model string) int {
+	m := vertexGen.FindStringSubmatch(model)
+	if m == nil {
+		return 0
+	}
+	n, _ := strconv.Atoi(m[1])
+	return n
+}
+
 // vertexModels are the Gemini models a location serves, as each answered
-// on 2026-10-06: every one at global; Gemini 3's Flash models at us and
+// on 2026-10-06: every one at global (and Gemini 4 Argon, there since
+// 2026-10-13, #2155); Gemini 3's Flash models at us and
 // eu, which serve no Pro, preview or 2.5; Gemini 2.5 at a region, where a
 // few add one more (asia-northeast1's gemini-3.5-flash), typed in by hand.
 func vertexModels(loc string) []string {

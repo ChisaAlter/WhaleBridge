@@ -84,12 +84,18 @@ func Held(ctx context.Context) error {
 // "" too: a request magpie makes for one provider while serving another's
 // (a web search asked of Codex in a turn served by a provider set to
 // "direct", #1522) goes through its own provider's proxy, never the one
-// it was made under.
+// it was made under. A provider's leave not to check its certificate
+// (WithUncheckedTLS) goes the same way: it is the outer provider's, and
+// dropped here.
 func With(ctx context.Context, choice string) context.Context {
-	if choice = strings.TrimSpace(choice); choice == "" && choiceOf(ctx) == "" {
+	if choice = strings.TrimSpace(choice); choice == "" && choiceOf(ctx) == "" && uncheckedOf(ctx) == nil {
 		return ctx
 	}
-	return context.WithValue(ctx, choiceKey{}, choice)
+	ctx = context.WithValue(ctx, choiceKey{}, choice)
+	if uncheckedOf(ctx) != nil {
+		ctx = context.WithValue(ctx, uncheckedKey{}, map[string]bool(nil))
+	}
+	return ctx
 }
 
 // Choice is the proxy ctx names (With), "" when it names none — for a CLI
@@ -124,8 +130,10 @@ var HTTP1 func(u *url.URL) bool
 // requests going through one proxy and never carried to another — HTTP/2
 // ones, which a transport shares by host whatever proxy they were dialled
 // through, among them. A request HTTP1 names goes through a clone kept
-// for HTTP/1.1 (http1Only). A host whose IPv6 is taken but goes nowhere is
-// dialed over IPv4 (v4Fallback).
+// for HTTP/1.1 (http1Only), and one to a host whose certificate the
+// provider's user said not to check (WithUncheckedTLS) through a clone
+// kept for that host alone (uncheckTLS). A host whose IPv6 is taken but
+// goes nowhere is dialed over IPv4 (v4Fallback).
 func Dispatch(base *http.Transport) http.RoundTripper {
 	v4Fallback(base)
 	return &dispatch{base: base, own: map[route]*http.Transport{}}
@@ -138,14 +146,16 @@ type dispatch struct {
 }
 
 // route is what a request needs of its transport other than base: a
-// provider's own proxy, HTTP/1.1 only, or both.
+// provider's own proxy, HTTP/1.1 only, the host:port whose certificate is
+// not checked, or any of them together.
 type route struct {
-	choice string
-	h1     bool
+	choice    string
+	h1        bool
+	unchecked string
 }
 
 func (d *dispatch) RoundTrip(req *http.Request) (*http.Response, error) {
-	r := route{choice: choiceOf(req.Context()), h1: HTTP1 != nil && HTTP1(req.URL)}
+	r := route{choice: choiceOf(req.Context()), h1: HTTP1 != nil && HTTP1(req.URL), unchecked: uncheckedHost(req)}
 	if r == (route{}) {
 		return v4Retry(d.base, req)
 	}
@@ -178,6 +188,9 @@ func (d *dispatch) transport(r route) *http.Transport {
 	}
 	if r.h1 {
 		http1Only(t)
+	}
+	if r.unchecked != "" {
+		uncheckTLS(t)
 	}
 	d.own[r] = t
 	return t

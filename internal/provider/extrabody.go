@@ -26,7 +26,13 @@ package provider
 // answers its Test. A request that only counts tokens gets none of them,
 // nor one to another API (embeddings, images, video, a decision API's):
 // the fields are for asking the model for a reply. Neither does a
-// signed-in account's: its body is the agent's own, as its headers are.
+// signed-in account's: its body is the agent's own, as its headers are —
+// except a ChatGPT (Codex) account's, whose requests magpie builds as Codex
+// CLI would (codexBody), and which take fields Codex CLI adds by choice
+// (access_programs, OpenAI's Daybreak, magpie-releases#18). On it the
+// fields codexBody decides for the backend to answer at all — not stored,
+// tool_choice auto, its reasoning carried — can't be set either
+// (codexOwned).
 
 import (
 	"bytes"
@@ -59,6 +65,24 @@ func (e *ExtraBody) UnmarshalJSON(b []byte) error {
 // by, and the conversation itself — its messages, input or contents, its
 // system prompt and instructions, its tools.
 var ExtraBodyReserved = []string{"model", "stream", "messages", "input", "contents", "system", "systemInstruction", "system_instruction", "instructions", "tools"}
+
+// codexOwned are the fields of a ChatGPT account's request that extraBody
+// can't set beside ExtraBodyReserved: codexBody sets them on every request
+// as Codex CLI does, and the backend turns a request away without them
+// (store true, a request that keeps nothing without its sealed reasoning).
+var codexOwned = []string{"store", "tool_choice", "include"}
+
+// extraBodyTakes says p's requests take extraBody's fields, and which
+// fields beside ExtraBodyReserved it can't set.
+func (p Provider) extraBodyTakes() (owned []string, ok bool) {
+	switch {
+	case p.Account == nil:
+		return nil, true
+	case p.Account.Agent == "codex":
+		return codexOwned, true
+	}
+	return nil, false
+}
 
 // SessionPlaceholder is what a string value of extraBody writes for the
 // conversation's id.
@@ -118,7 +142,8 @@ func cleanExtraBody(e ExtraBody) ExtraBody {
 // package's comment says; session is the conversation's id for
 // ${sessionId}. A body that isn't a JSON object goes as it came.
 func (p Provider) WithExtraBody(body []byte, session string) []byte {
-	if len(p.ExtraBody) == 0 || p.Account != nil {
+	owned, takes := p.extraBodyTakes()
+	if len(p.ExtraBody) == 0 || !takes {
 		return body
 	}
 	dec := json.NewDecoder(bytes.NewReader(body))
@@ -130,7 +155,7 @@ func (p Provider) WithExtraBody(body []byte, session string) []byte {
 	changed := false
 	for k, raw := range p.ExtraBody {
 		n, forced := extraName(k)
-		if n == "" || slices.Contains(ExtraBodyReserved, n) {
+		if n == "" || slices.Contains(ExtraBodyReserved, n) || slices.Contains(owned, n) {
 			continue
 		}
 		if _, has := m[n]; has && !forced {

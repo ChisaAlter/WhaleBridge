@@ -64,16 +64,21 @@ type cRequest struct {
 	ServiceTier         string          `json:"service_tier,omitempty"`
 	PromptCacheKey      string          `json:"prompt_cache_key,omitempty"`
 	ResponseFormat      json.RawMessage `json:"response_format,omitempty"`
+	// not a Chat field: OpenCode merges a model's options into its body
+	// whichever API it speaks, and a Codex model it asks on Chat is asked
+	// on Responses (Request.AccessPrograms)
+	AccessPrograms json.RawMessage `json:"access_programs,omitempty"`
 }
 
 func parseChat(body []byte) (*Request, error) {
+	body = liftMessageTools(body) // a request handle didn't see (#2322)
 	var c cRequest
 	if err := decodeJSON(body, &c); err != nil {
 		return nil, fmt.Errorf("invalid request: %v", err)
 	}
 	r := &Request{Model: c.Model, MaxTokens: c.MaxCompletionTokens, Temp: c.Temperature, TopP: c.TopP,
-		Stream: c.Stream, Effort: effortOf(c.ReasoningEffort), Parallel: c.ParallelToolCalls, Fast: c.ServiceTier == "priority", Tier: c.ServiceTier,
-		CacheKey: c.PromptCacheKey, Format: openAIFormat(c.ResponseFormat)}
+		Stream: c.Stream, Effort: effortOf(c.ReasoningEffort), Parallel: c.ParallelToolCalls, Fast: c.ServiceTier == "priority" || c.ServiceTier == "ultrafast", Ultrafast: c.ServiceTier == "ultrafast", Tier: c.ServiceTier,
+		CacheKey: c.PromptCacheKey, Format: openAIFormat(c.ResponseFormat), AccessPrograms: c.AccessPrograms}
 	if r.MaxTokens == 0 {
 		r.MaxTokens = c.MaxTokens
 	}
@@ -229,11 +234,22 @@ func dataURL(p Part) string {
 // built-in's, for show, which Cursor's is none, and its fast mode was lost
 // on every request magpie translated (#1360).
 func buildHost(p provider.Provider) string {
-	if p.IsPlugin() && p.PluginProvider() == "cursor" {
-		return "cursor"
+	if p.IsPlugin() {
+		switch id := p.PluginProvider(); id {
+		case "cursor", provider.CommandCodePlanID, "devin", "qoder", "qoder-cn":
+			// the plugin's own id, never the built-in's API host a moved
+			// account shows (api.commandcode.ai), which lost a moved Command
+			// Code Go conversation its reasoning
+			return id
+		}
 	}
 	return p.Host()
 }
+
+// failedAsText are the plugins whose vendor has no failed mark on a tool
+// result: the built-in said it in the text, "Error: " first (devin.go,
+// qoder.go), and so the chat request to the plugin says it there too.
+var failedAsText = map[string]bool{"devin": true, "qoder": true, "qoder-cn": true}
 
 // chatReplaysReasoning is whether a Chat upstream wants a turn's reasoning
 // back in reasoning_content: DeepSeek's models wherever they are served
@@ -413,7 +429,16 @@ func buildChat(r *Request, model, host string, rejectTemp bool) []byte {
 					}
 					out += note
 				}
-				tools = append(tools, map[string]any{"role": "tool", "tool_call_id": p.CallID, "content": out})
+				if p.IsError && failedAsText[host] {
+					out = "Error: " + out
+				}
+				tool := map[string]any{"role": "tool", "tool_call_id": p.CallID, "content": out}
+				if p.IsError && host == "cursor" {
+					// Cursor's plugin reads it, as the built-in told Cursor
+					// isError; another chat upstream has no such field
+					tool["is_error"] = true
+				}
+				tools = append(tools, tool)
 				seeLater(p)
 			}
 		}
@@ -771,6 +796,8 @@ type cUsage struct {
 	CachedTokens             int `json:"cached_tokens"`
 	CacheReadInputTokens     int `json:"cache_read_input_tokens"`
 	CacheCreationInputTokens int `json:"cache_creation_input_tokens"`
+	// Credit is what WorkBuddy says the request cost in its plan's credits
+	Credit *float64 `json:"credit"`
 	// what a plugin's step collected of its conversation's earlier steps,
 	// which their own replies couldn't count (the Cursor plugin's usage
 	// events that showed late, yetone/magpie#1053): billed with the step,
@@ -806,6 +833,9 @@ func (u cUsage) usage() Usage {
 	}
 	if u.CompletionTokensDetails != nil {
 		out.Reasoning = u.CompletionTokensDetails.ReasoningTokens
+	}
+	if c := u.Credit; c != nil && *c >= 0 {
+		out.Credits = c
 	}
 	if d := u.MagpieDeferred; d != nil && d.PromptTokens+d.CompletionTokens > 0 {
 		out.Deferred = &Usage{Input: max(d.PromptTokens-d.CachedTokens-d.CacheWriteTokens, 0), Output: d.CompletionTokens,
@@ -900,6 +930,36 @@ func (d *chatDecoder) text(s string, emit func(Event)) {
 	}
 }
 
+// markedThought sends a piece of text Gemini marked as a thought
+// (extra_content.google.thought) as thinking. AI Studio's OpenAI-compatible
+// API may still wrap it in <thought> tags, and mark only the chunk with the
+// opening one: "<thought>…" marked, then "</thought>接下来我将调用 probe"
+// not (#2098). The tags are read as text's are, so that the close is
+// found in the unmarked chunk and left out of the answer; a marked chunk
+// that could be no tag's start is thinking as it is.
+func (d *chatDecoder) markedThought(s string, emit func(Event)) {
+	if s == "" {
+		return
+	}
+	tagged := d.thought || d.lead != ""
+	if lead := strings.TrimLeft(s, " \n"); !tagged && !d.past {
+		tagged = lead == ""
+		for open := range thoughtTags {
+			tagged = tagged || strings.HasPrefix(lead, open) || strings.HasPrefix(open, lead)
+		}
+	}
+	if !tagged {
+		emit(Event{Kind: KThink, Text: s})
+		return
+	}
+	d.text(s, func(ev Event) {
+		if ev.Kind == KText {
+			ev.Kind = KThink
+		}
+		emit(ev)
+	})
+}
+
 // end gives back what text was held to see whether a tag began.
 func (d *chatDecoder) end(emit func(Event)) {
 	if d.lead == "" {
@@ -992,13 +1052,12 @@ func (d *chatDecoder) decode(data string, emit func(Event)) error {
 		} else {
 			decodeJSON(c.Delta.Content, &content)
 		}
-		if c.Delta.ExtraContent.Google.Thought {
-			t, content = t+content, ""
-		}
 		if t != "" {
 			emit(Event{Kind: KThink, Text: t})
 		}
-		if content != "" {
+		if c.Delta.ExtraContent.Google.Thought {
+			d.markedThought(content, emit)
+		} else if content != "" {
 			d.text(content, emit)
 		}
 		if len(c.Delta.ToolCalls) > 0 {
@@ -1029,7 +1088,7 @@ func (d *chatDecoder) decode(data string, emit func(Event)) error {
 			emit(Event{Kind: KStop, Stop: stopFromChat(c.FinishReason)})
 		}
 	}
-	if ch.Usage != nil && (ch.Usage.PromptTokens > 0 || ch.Usage.CompletionTokens > 0 || ch.Usage.MagpieDeferred != nil) {
+	if ch.Usage != nil && (ch.Usage.PromptTokens > 0 || ch.Usage.CompletionTokens > 0 || ch.Usage.MagpieDeferred != nil || ch.Usage.Credit != nil) {
 		emit(Event{Kind: KUsage, Usage: ch.Usage.usage()})
 	}
 	return nil
@@ -1162,6 +1221,7 @@ func (e *chatEncoder) event(ev Event) {
 		if ev.Code != "" {
 			failed["code"] = ev.Code // preserve the upstream error type, including refusals
 		}
+		saidError(failed, ev.Said)
 		e.w.event("", map[string]any{"error": failed})
 	}
 	e.col.add(ev)

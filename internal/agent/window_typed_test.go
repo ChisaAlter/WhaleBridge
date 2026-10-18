@@ -7,6 +7,7 @@ import (
 
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
+	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
@@ -110,5 +111,51 @@ func TestTypedWindowReachesCodexAndClaudeCode(t *testing.T) {
 	must(a.Field("model").Set("group/flash"))
 	if c := env(claudeCompactEnv); c != "300000" {
 		t.Errorf("Claude Code on the group with Compact at 300K: %q", c)
+	}
+}
+
+// #2224 (Zypixh): a group that follows its smallest member is told that
+// member's window, and when the user typed it (500K on the provider for
+// gpt-6.1-sol) Claude Desktop and Codex run to it whole, as they do for a
+// group set to 500K itself, not to magpie's default 272K. A group in a
+// group passes it on. A group whose smallest member's window nobody typed
+// keeps the default.
+func TestSmallestMemberTypedWindow(t *testing.T) {
+	home, path := desktopWindowSandbox(t)
+	must := func(err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	must(provider.Save(provider.Provider{ID: "w", Name: "W", Key: "k", Chat: "http://127.0.0.1:1/v1",
+		Models: []string{"sol", "other"}, Contexts: map[string]int{"sol": 500000}}))
+	must(catalog.SaveLive("w", "http://127.0.0.1:1/v1", []catalog.Model{{ID: "sol", Context: 1000000}, {ID: "other", Context: 600000}}))
+	must(provider.SaveGroup(provider.Group{ID: "pool", Name: "Pool", Members: []string{"w/sol", "v/glm"}, Context: provider.ContextSmallest}))
+	must(provider.SaveGroup(provider.Group{ID: "outer", Name: "Outer", Members: []string{"group/pool", "v/glm"}, Context: provider.ContextSmallest}))
+	must(provider.SaveGroup(provider.Group{ID: "plain", Name: "Plain", Members: []string{"w/other", "v/glm"}, Context: provider.ContextSmallest}))
+
+	// Codex: the gateway's list and its context_window
+	must(codex(home).Fields[0].Set("group/pool"))
+	compacts := map[string]int{}
+	for _, m := range provider.CodexListed() {
+		compacts[m.ID] = m.Compact
+	}
+	for id, want := range map[string]int{"group/pool": 500000, "group/outer": 500000, "group/plain": 0} {
+		if compacts[id] != want {
+			t.Errorf("Codex: the gateway's list compacts %s at %d; want %d", id, compacts[id], want)
+		}
+	}
+
+	// Claude Desktop: each group's own autoCompactWindow
+	must(claudeDesktop(home).Field("provider").Set("magpie"))
+	ids := map[string]string{}
+	for _, e := range provider.Catalog() {
+		ids[e.ID] = gateway.DesktopID(e)
+	}
+	for id, want := range map[string]string{"group/pool": "500000", "group/outer": "500000", "group/plain": "272000"} {
+		if v, _ := edit.GetJSON(path, budgetPath(ids[id])); v != want {
+			t.Errorf("Claude Desktop: %s (%s) compacts at %q; want %q", id, ids[id], v, want)
+		}
 	}
 }

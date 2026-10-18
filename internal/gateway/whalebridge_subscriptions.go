@@ -22,6 +22,7 @@ func StartWhaleBridgeSubscriptions(ctx context.Context) {
 	go provider.KeepPluginsCheckedIn(ctx)
 	go provider.KeepWhaleBridgeRetiringMoved(ctx)
 	go provider.KeepPluginsListed(ctx)
+	go provider.KeepListsFresh(ctx) // a provider's own RefreshEvery
 	go provider.WatchQuotas(ctx, whaleBridgeQuotaWake, recordWhaleBridgeQuotaAlert)
 	go plugin.KeepUpdated(ctx)
 	go plugin.KeepBunUpdated(ctx)

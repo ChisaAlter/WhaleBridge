@@ -39,6 +39,7 @@ import (
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/lastgood"
 )
 
 // loginSwitchEvery is how often the account each agent is on is looked at.
@@ -142,8 +143,8 @@ func usedPast(q SubscriptionQuota, share float64, now time.Time) bool {
 // accounts that are on in magpie, in the order they were saved, whose
 // allowance is known and not spent. ok is false when the agent should stay.
 func NextLogin(ctx context.Context, agent string) (from, to string, back, ok bool) {
-	if accountRemoved(agent) {
-		return "", "", false, false // magpie has no say in its sign-in
+	if leftAlone(agent) {
+		return "", "", false, false // magpie has no say in its sign-in, or was told to leave it be
 	}
 	var spares []Login
 	var first *Login
@@ -297,6 +298,11 @@ func setLoginReturn(agent string, r loginReturn) {
 		m[agent] = r
 	}
 	b, err := json.MarshalIndent(m, "", "  ")
+	if err == nil {
+		// readLoginReturns reads a file that doesn't parse as none: it is
+		// kept aside before it is written over
+		err = lastgood.KeepUnparsed(loginReturnsPath(), lastgood.Into[map[string]loginReturn])
+	}
 	if err == nil {
 		err = writePrivate(loginReturnsPath(), append(b, '\n'))
 	}

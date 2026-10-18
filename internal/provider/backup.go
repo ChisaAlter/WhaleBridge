@@ -182,7 +182,7 @@ func AddPlugins(ctx context.Context, es []plugin.Entry) (added []string, failed 
 			continue
 		}
 		here[plugin.Name(e.Spec)] = true
-		got, err := addPlugin(ctx, e.Spec)
+		got, err := AddPlugin(ctx, e.Spec)
 		if err == nil && e.Off {
 			err = plugin.SetOff(got.Spec, true)
 		}
@@ -213,9 +213,17 @@ func NotSignedIn(ps []Provider) []string {
 	for _, p := range All() {
 		have[p.ID] = true
 	}
+	return notSignedIn(ps, have)
+}
+
+// notSignedIn is NotSignedIn with the ids of the providers here given.
+func notSignedIn(ps []Provider, have map[string]bool) []string {
 	var out []string
 	for _, p := range ps {
-		if p.ID == "" || !OnlyPicks(p) || p.Hidden || have[p.ID] || slices.Contains(out, p.ID) {
+		// the same subscription signed in here under its other id (a
+		// built-in moved onto its plugin on one computer and not on the
+		// other, #1940) is signed in
+		if p.ID == "" || !OnlyPicks(p) || p.Hidden || have[p.ID] || have[samePlace(p.ID)] || slices.Contains(out, p.ID) {
 			continue
 		}
 		out = append(out, p.ID)

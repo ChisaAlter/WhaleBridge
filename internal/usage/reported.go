@@ -83,9 +83,9 @@ func catchUpReported(path string) error {
 // whether it was written. The records must already be checked: each has
 // a RequestID.
 //
-// Nothing else the gateway does on a call happens: no OTel span (the call
-// is the client's, which can send its own), and no caller key's budget is
-// spent, since the call didn't go through magpie.
+// Nothing else the gateway does on a call happens: no observer sees it
+// (the call is the client's, which can send its own), and no caller key's
+// budget is spent, since the call didn't go through magpie.
 func IngestReported(recs []Record) ([]bool, error) {
 	reported.ingest.Lock()
 	defer reported.ingest.Unlock()

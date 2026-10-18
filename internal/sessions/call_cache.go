@@ -33,10 +33,15 @@ import (
 // one is.
 // v12: a ZCode call's input leaves out the cache, and its output the
 // reasoning counted twice, as its session's summary does (#1947).
+// v13: a call after a compaction carries how long the compaction took
+// (Compact): Claude Code's compact_boundary durationMs, Codex's compaction
+// call's own time.
+// v14: Codex calls keep the thread that made the request.
+// v15: Codex calls keep the compaction marker independently of its duration.
 // What each version names is what a cache of the one before it cannot serve:
 // the version is part of the directory's name, so a cache written by an older
 // one is never read (pruneCalls).
-const callCacheVersion = "calls-v12"
+const callCacheVersion = "calls-v15"
 
 const maxKeptCalls = 131072
 const maxKeptFiles = 64
@@ -184,6 +189,7 @@ var wholeCallReaders = map[string]func(file) (*callFile, bool){
 	"kimi":         readKimiCalls, // #1607
 	"pi":           readPiCalls,   // #1951
 	"omp":          readPiCalls,
+	"agy":          readAgyCalls, // #2097
 }
 
 func readCalls(f file) *callFile {
@@ -275,7 +281,7 @@ func readCalls(f file) *callFile {
 type callPatch struct {
 	Index int
 	Call  Call
-	Text  [12]uint32
+	Text  [13]uint32
 	Began time.Time
 }
 type callFrame struct {
@@ -308,8 +314,8 @@ func (s callDiskState) restore() *callFile {
 		AsstEnd: s.AsstEnd, Session: s.Session, Requested: s.Requested, LastUser: s.LastUser, LastAsst: s.LastAsst}
 }
 
-func callText(c *Call) [12]*string {
-	return [12]*string{&c.Agent, &c.Session, &c.Model, &c.Requested, &c.Effort, &c.Cwd, &c.Upstream, &c.AccountID, &c.UserID, &c.Error, &c.ErrorText, &c.File}
+func callText(c *Call) [13]*string {
+	return [13]*string{&c.Agent, &c.Session, &c.ThreadID, &c.Model, &c.Requested, &c.Effort, &c.Cwd, &c.Upstream, &c.AccountID, &c.UserID, &c.Error, &c.ErrorText, &c.File}
 }
 
 func loadCalls(f file) *callFile {

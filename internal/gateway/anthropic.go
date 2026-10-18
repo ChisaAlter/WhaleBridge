@@ -14,8 +14,8 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/tidwall/gjson"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/tidwall/gjson"
 )
 
 // ---- Anthropic Messages -----------------------------------------------------
@@ -72,17 +72,19 @@ func (b aBlock) MarshalJSON() ([]byte, error) {
 var ephemeral = map[string]string{"type": "ephemeral"}
 
 type aRequest struct {
-	Model    string          `json:"model"`
-	System   json.RawMessage `json:"system,omitempty"`
-	Messages []struct {
+	Model        string          `json:"model"`
+	System       json.RawMessage `json:"system,omitempty"`
+	CacheControl json.RawMessage `json:"cache_control,omitempty"`
+	Messages     []struct {
 		Role    string          `json:"role"`
 		Content json.RawMessage `json:"content"`
 	} `json:"messages"`
 	Tools []struct {
-		Type        string          `json:"type,omitempty"`
-		Name        string          `json:"name"`
-		Description string          `json:"description,omitempty"`
-		InputSchema json.RawMessage `json:"input_schema,omitempty"`
+		Type         string          `json:"type,omitempty"`
+		Name         string          `json:"name"`
+		Description  string          `json:"description,omitempty"`
+		InputSchema  json.RawMessage `json:"input_schema,omitempty"`
+		CacheControl json.RawMessage `json:"cache_control,omitempty"`
 	} `json:"tools,omitempty"`
 	ToolChoice *struct {
 		Type                   string `json:"type"`
@@ -111,12 +113,23 @@ type aRequest struct {
 }
 
 func parseAnthropic(body []byte) (*Request, error) {
+	return parseAnthropicRequest(body, false)
+}
+
+func parseAnthropicRequest(body []byte, clientMarks bool) (*Request, error) {
 	var a aRequest
 	if err := decodeJSON(body, &a); err != nil {
 		return nil, fmt.Errorf("invalid request: %v", err)
 	}
 	r := &Request{Model: a.Model, System: stringOrText(a.System), MaxTokens: a.MaxTokens,
 		Temp: a.Temperature, TopP: a.TopP, Stop: a.StopSequences, Stream: a.Stream, Fast: a.Speed == "fast"}
+	if clientMarks {
+		var err error
+		r.clientCache, err = readClientCache(a)
+		if err != nil {
+			return nil, err
+		}
+	}
 	r.Safeguards = a.Safeguards
 	if string(r.Safeguards) == "null" {
 		r.Safeguards = nil
@@ -127,7 +140,7 @@ func parseAnthropic(body []byte) (*Request, error) {
 	if oc := a.OutputConfig; oc != nil && oc.Format != nil && oc.Format.Type == "json_schema" && len(oc.Format.Schema) > 0 {
 		r.Format = &Format{Type: "json_schema", Name: formatName, Schema: oc.Format.Schema}
 	}
-	for _, m := range a.Messages {
+	for mi, m := range a.Messages {
 		msg := Message{Role: m.Role}
 		var s string
 		if decodeJSON(m.Content, &s) == nil {
@@ -141,6 +154,7 @@ func parseAnthropic(body []byte) (*Request, error) {
 			}
 			var raws []json.RawMessage // each block as the client sent it
 			for i, b := range blocks {
+				before := len(msg.Parts)
 				switch b.Type {
 				case "text":
 					msg.Parts = append(msg.Parts, Part{Kind: Text, Text: b.Text})
@@ -166,6 +180,15 @@ func parseAnthropic(body []byte) (*Request, error) {
 						msg.Parts = append(msg.Parts, Part{Kind: Thinking, Sealed: raws[i], SealedBy: sealAnthropic})
 					}
 				}
+				if clientMarks && !(mi == len(a.Messages)-1 && i == len(blocks)-1) {
+					if ttl := cacheTTL(b.CacheControl); ttl != "" {
+						if len(msg.Parts) > before && renderedCacheBlock(b) {
+							msg.Parts[len(msg.Parts)-1].cache = ttl
+						} else {
+							r.clientCache.droppedMessages++
+						}
+					}
+				}
 			}
 		}
 		r.Messages = append(r.Messages, msg)
@@ -176,6 +199,17 @@ func parseAnthropic(body []byte) (*Request, error) {
 			// noted for those that can search by themselves
 			if strings.HasPrefix(t.Type, "web_search") {
 				r.WebSearch = true
+			}
+			if strings.HasPrefix(t.Type, "advisor_") {
+				// Claude Code's advisor: its instructions, which would
+				// have the model call a tool it hasn't got (advisor.go)
+				for i := range r.Messages {
+					for j, pt := range r.Messages[i].Parts {
+						if pt.Kind == Text {
+							r.Messages[i].Parts[j].Text, _ = advisorGoneIn(pt.Text)
+						}
+					}
+				}
 			}
 			continue
 		}
@@ -1243,6 +1277,8 @@ type aCacheCreation struct {
 func (u aUsage) usage() Usage {
 	out := Usage{Input: u.InputTokens, Output: u.OutputTokens, CacheRead: u.CacheReadInputTokens, CacheWrite: u.CacheCreationInputTokens}
 	if c := u.CacheCreation; c != nil {
+		out.cacheCreationReported = true
+		out.cacheCreationHasCounts = c.Ephemeral5m+c.Ephemeral1h > 0
 		out.CacheWrite = max(out.CacheWrite, c.Ephemeral5m+c.Ephemeral1h)
 		out.CacheWrite1h = c.Ephemeral1h
 	}
@@ -1250,10 +1286,10 @@ func (u aUsage) usage() Usage {
 }
 
 // anthropic is the usage as Anthropic says it, the cache writes split by
-// how long they are kept where some were for an hour.
+// how long they are kept when upstream reported TTLs or some were for an hour.
 func (u Usage) anthropic() aUsage {
 	out := aUsage{InputTokens: u.Input, OutputTokens: u.Output, CacheReadInputTokens: u.CacheRead, CacheCreationInputTokens: u.CacheWrite}
-	if h := min(u.CacheWrite1h, u.CacheWrite); h > 0 {
+	if h := min(u.CacheWrite1h, u.CacheWrite); u.cacheCreationReported || h > 0 {
 		out.CacheCreation = &aCacheCreation{Ephemeral5m: u.CacheWrite - h, Ephemeral1h: h}
 	}
 	return out
@@ -1490,6 +1526,7 @@ func (e *anthropicEncoder) event(ev Event) {
 		if ev.Code != "" {
 			failed["code"] = ev.Code // preserve the upstream error type, including refusals
 		}
+		saidError(failed, ev.Said)
 		e.w.event("error", map[string]any{"type": "error", "error": failed})
 	}
 	e.col.add(ev)

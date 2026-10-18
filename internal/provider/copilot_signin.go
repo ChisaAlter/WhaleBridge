@@ -84,7 +84,7 @@ func startCopilotSignIn(s *signInFlow) error {
 		s.st.URL = copilotDevicePage(host)
 	}
 	s.stop = cancel
-	interval := time.Duration(max(dc.Interval, 1)) * time.Second
+	interval := devicePoll(dc.Interval)
 	site := firstNonEmpty(host, "github.com")
 	go func() {
 		fail := func(msg string) {
@@ -151,7 +151,7 @@ func startCopilotSignIn(s *signInFlow) error {
 			}
 			copilotProbeEditor(fctx, user, host)
 			fcancel()
-			if err := addCopilotLogin(user, plan, tok.Token, host); err != nil {
+			if err := keepLogin(ctx, func() error { return addCopilotLogin(user, plan, tok.Token, host) }); err != nil {
 				fail(err.Error())
 				return
 			}

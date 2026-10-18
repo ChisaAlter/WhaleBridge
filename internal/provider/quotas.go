@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"math"
+	"slices"
 	"time"
 )
 
@@ -59,8 +60,13 @@ type Quota struct {
 	User     string      `json:"user,omitempty"`
 	Windows  []QuotaSpan `json:"windows"`
 	Balance  string      `json:"balance,omitempty"`
-	Error    string      `json:"error,omitempty"`
-	AsOf     *time.Time  `json:"asOf,omitempty"` // the cached reading's time, nil for a new one
+	// BalanceSplit is what the Balance is made of, when the vendor tells
+	// it (SubscriptionQuota's)
+	BalanceSplit []BalancePart `json:"balanceSplit,omitempty"`
+	Error        string        `json:"error,omitempty"`
+	AsOf         *time.Time    `json:"asOf,omitempty"` // the cached reading's time, nil for a new one
+	// ReadDeferred says no request was made this time, rather than one failed.
+	ReadDeferred bool `json:"readDeferred,omitempty"`
 	// ReadAt is when the windows or balance shown were read, nil when not
 	// known; a Claude account's can be well before now (claudeReadAt).
 	ReadAt *time.Time `json:"readAt,omitempty"`
@@ -102,7 +108,18 @@ type QuotaSpan struct {
 	Limit  float64 `json:"limit,omitempty"`
 	Unit   string  `json:"unit,omitempty"`
 	Pool   string  `json:"pool,omitempty"` // the shared pool the window draws on ("Gemini")
+	// Holds and HoldsWhy are the window's whole as the Usage page's card
+	// tells it (QuotaWindow.Holds, #2333): reckoned when ReckonHolds is
+	// set, else left out.
+	Holds    *WindowHolds `json:"holds,omitempty"`
+	HoldsWhy string       `json:"holdsWhy,omitempty"`
 }
+
+// ReckonHolds is usage.WithWindowHolds, which package usage sets: it reads
+// the usage log, which this package can't import. QuotaReport,
+// KeptQuotaReport and RefreshReport tell each window's whole by it, as the
+// Usage page does (#2333); nil, where usage isn't linked in, leaves it out.
+var ReckonHolds func(qs []SubscriptionQuota, now time.Time) []SubscriptionQuota
 
 // QuotaReport is Quotas as Quota, the reset times made absolute from now.
 func QuotaReport(ctx context.Context, now time.Time) []Quota {
@@ -110,21 +127,44 @@ func QuotaReport(ctx context.Context, now time.Time) []Quota {
 	return withServed(quotaReport(subs, plans, balances, now), LastServed())
 }
 
+// KeptQuotaReport is QuotaReport from what was last read (CachedCards),
+// asking no vendor: for a status line, which Claude Code runs again on
+// every message (#1997), so it must neither wait for a read nor start one.
+func KeptQuotaReport(now time.Time) []Quota {
+	var subs, plans, balances []SubscriptionQuota
+	for _, q := range CachedCards(now) {
+		switch q.Kind {
+		case "plan":
+			plans = append(plans, q)
+		case "balance":
+			balances = append(balances, q)
+		default:
+			subs = append(subs, q)
+		}
+	}
+	return withServed(quotaReport(subs, plans, balances, now), LastServed())
+}
+
 // quotaReport assembles the cards from readings the tests feed directly.
 func quotaReport(subs, plans, balances []SubscriptionQuota, now time.Time) []Quota {
+	if ReckonHolds != nil { // one pass over the log for every card
+		all := ReckonHolds(slices.Concat(subs, plans, balances), now)
+		ns, np := len(subs), len(plans)
+		subs, plans, balances = all[:ns], all[ns:ns+np], all[ns+np:]
+	}
 	out := []Quota{}
 	for _, g := range []struct {
 		kind string
 		qs   []SubscriptionQuota
 	}{{"subscription", subs}, {"plan", plans}, {"balance", balances}} {
 		for _, q := range g.qs {
-			r := Quota{Provider: q.Provider, Name: q.Name, Kind: g.kind, Plan: q.Plan, User: q.User, AsOf: q.AsOf, ReadAt: q.ReadAt,
-				Windows: []QuotaSpan{}, Balance: q.Balance, Error: q.Error, Until: q.Until, Renew: q.Renew, Resets: q.Resets, ResetsUsed: q.ResetsUsed, From: q.From, Alias: q.Alias, Seat: q.Seat}
+			r := Quota{Provider: q.Provider, Name: q.Name, Kind: g.kind, Plan: q.Plan, User: q.User, AsOf: q.AsOf, ReadAt: q.ReadAt, ReadDeferred: q.ReadDeferred,
+				Windows: []QuotaSpan{}, Balance: q.Balance, BalanceSplit: q.BalanceSplit, Error: q.Error, Until: q.Until, Renew: q.Renew, Resets: q.Resets, ResetsUsed: q.ResetsUsed, From: q.From, Alias: q.Alias, Seat: q.Seat}
 			// a pool's own windows stand in for the models' drawing on it,
 			// as the usage page shows them
 			for _, w := range PooledWindows(q.Windows) {
 				s := QuotaSpan{Unlimited: w.Unlimited, Name: w.Name, Used: w.Used, Remaining: max(0, 100-w.Used), ResetsAt: w.ResetsAt, Display: w.Display,
-					Amount: w.Amount, Limit: w.Limit, Unit: w.Unit, Pool: w.Pool}
+					Amount: w.Amount, Limit: w.Limit, Unit: w.Unit, Pool: w.Pool, Holds: w.Holds, HoldsWhy: w.HoldsWhy}
 				if s.ResetsAt == nil && w.ResetSecs > 0 {
 					t := now.Add(time.Duration(w.ResetSecs) * time.Second)
 					s.ResetsAt = &t

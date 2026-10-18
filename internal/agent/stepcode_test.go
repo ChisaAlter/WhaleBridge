@@ -1038,6 +1038,11 @@ func TestStepCodeRealCLISandbox(t *testing.T) {
 // (those entries renamed) and takes out the one magpie appended.
 func TestStepCodeEnabledModelsFollowRename(t *testing.T) {
 	home, _ := museHome(t)
+	// a provider whose id only shares a prefix; its model is offered, so
+	// the sync after the rename keeps its entry (#2055)
+	if err := provider.Save(provider.Provider{ID: "deepseekx", Name: "DeepSeekX", Chat: "https://deepseekx.invalid/v1", Key: "k", Models: []string{"flash"}}); err != nil {
+		t.Fatal(err)
+	}
 	t.Setenv("STEP_CODING_AGENT_DIR", "")
 	t.Setenv("STEPCODE_CONFIG_DIR", "")
 	dir := filepath.Join(home, ".stepcode")

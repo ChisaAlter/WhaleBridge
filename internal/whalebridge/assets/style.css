@@ -393,6 +393,17 @@ button[aria-busy=true],summary[aria-busy=true]{opacity:1;cursor:progress}
 .button-spinner{display:inline-block;flex:none;width:14px;height:14px;margin-left:8px;border:2px solid currentColor;border-right-color:transparent;border-radius:50%;will-change:transform;animation:button-spin .8s linear infinite}
 @keyframes button-spin{to{transform:rotate(360deg)}}
 @media(prefers-reduced-motion:reduce){.button-spinner{animation:none}}
+[data-button-busy]:has(>.button-feedback){position:relative!important;display:inline-flex;box-sizing:border-box!important;width:var(--button-busy-width)!important;min-width:var(--button-busy-width)!important;max-width:var(--button-busy-width)!important;height:var(--button-busy-height)!important;min-height:var(--button-busy-height)!important;max-height:var(--button-busy-height)!important;flex-grow:0!important;flex-shrink:0!important;opacity:1;cursor:progress}
+.button-feedback{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;gap:4px;padding:0 6px;min-width:0;pointer-events:none}
+[data-button-busy=icon]>.button-feedback{padding:0}
+.button-busy-viewport{flex:1;min-width:0;overflow:hidden;line-height:inherit}
+.button-busy-label{display:block;width:max-content;white-space:nowrap;margin-inline:auto}
+.button-busy-label[data-overflow]{animation:button-label-scroll var(--button-scroll-duration) linear infinite}
+.button-feedback>.button-spinner{position:static;margin:0}
+.text-button[data-button-busy=label]>.button-feedback{padding:0 2px;gap:2px}
+.text-button[data-button-busy=label]>.button-feedback>.button-spinner{width:12px;height:12px}
+@keyframes button-label-scroll{0%,15%,90%,100%{transform:translateX(0)}45%,60%{transform:translateX(var(--button-scroll-distance))}}
+@media(prefers-reduced-motion:reduce){.button-busy-label[data-overflow]{animation:none}.button-busy-viewport{overflow-x:auto;scrollbar-width:none;pointer-events:auto}}
 .table-primary{display:block;font-weight:500;font-size:14px;line-height:22px}
 .table-meta{display:block;font-size:12px;line-height:18px;color:var(--dsw-alias-label-tertiary);margin-top:4px;overflow-wrap:anywhere}
 .table-meta.endpoint,.member-preview{max-width:320px}

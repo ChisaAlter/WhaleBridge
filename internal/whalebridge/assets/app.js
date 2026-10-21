@@ -39,12 +39,38 @@ new MutationObserver(decorateSelects).observe(document.body,{childList:true,subt
 decorateSelects();
 const buttonBusy = new WeakMap();
 function startButtonBusy(button,label){
- const previous=buttonBusy.get(button),saved=previous?.saved || {html:button.innerHTML,disabled:button.disabled,minWidth:button.style.minWidth,ariaLabel:button.getAttribute('aria-label')};
- const owner={saved};buttonBusy.set(button,owner);
+ const previous=buttonBusy.get(button),style=getComputedStyle(button);
+ const saved=previous?.saved || {html:button.innerHTML,disabled:button.disabled,ariaLabel:button.getAttribute('aria-label'),title:button.getAttribute('title'),width:style.width==='auto'?button.offsetWidth+'px':style.width,height:style.height==='auto'?button.offsetHeight+'px':style.height};
+ previous?.cleanup();
  const compact=button.classList.contains('icon-button')||button.tagName==='SUMMARY'||button.classList.contains('switch');
- const update=text=>{if(buttonBusy.get(button)!==owner)return;button.innerHTML=(compact?'':'<span role="status">'+escape(text)+'</span>')+'<span class="button-spinner" aria-hidden="true"></span>';button.setAttribute('aria-label',text);};
- button.style.minWidth=button.getBoundingClientRect().width+'px';button.disabled=true;button.setAttribute('aria-busy','true');update(label);
- return {update,finish(){if(buttonBusy.get(button)!==owner)return;buttonBusy.delete(button);button.removeAttribute('aria-busy');button.style.minWidth=saved.minWidth;if(saved.ariaLabel===null)button.removeAttribute('aria-label');else button.setAttribute('aria-label',saved.ariaLabel);if(button.querySelector('.button-spinner'))button.innerHTML=saved.html;button.disabled=saved.disabled;}};
+ const owner={saved};buttonBusy.set(button,owner);
+ button.style.setProperty('--button-busy-width',saved.width);button.style.setProperty('--button-busy-height',saved.height);
+ button.setAttribute('data-button-busy',compact?'icon':'label');button.disabled=true;button.setAttribute('aria-busy','true');
+ button.innerHTML='<span class="button-feedback">'+(compact?'':'<span class="button-busy-viewport" role="status"><span class="button-busy-label"></span></span>')+'<span class="button-spinner" aria-hidden="true"></span></span>';
+ const track=button.querySelector('.button-busy-label'),viewport=track?.parentElement;
+ const measure=()=>{
+  if(!track||buttonBusy.get(button)!==owner)return;
+  if(!button.isConnected){owner.cleanup();return;}
+  const distance=Math.max(0,track.scrollWidth-viewport.clientWidth);
+  track.toggleAttribute('data-overflow',distance>0);
+  track.style.setProperty('--button-scroll-distance',-distance+'px');
+  track.style.setProperty('--button-scroll-duration',Math.max(3600,distance/24*2000+1600)+'ms');
+ };
+ const resize=new ResizeObserver(measure);
+ owner.cleanup=()=>resize.disconnect();
+ if(track){resize.observe(viewport);resize.observe(track);}
+ const update=text=>{if(buttonBusy.get(button)!==owner)return;if(track&&track.textContent!==text)track.textContent=text;button.setAttribute('aria-label',text);button.setAttribute('title',text);measure();};
+ const finish=()=>{
+  if(buttonBusy.get(button)!==owner)return;
+  owner.cleanup();buttonBusy.delete(button);button.removeAttribute('aria-busy');button.removeAttribute('data-button-busy');
+  button.style.removeProperty('--button-busy-width');button.style.removeProperty('--button-busy-height');
+  for(const [name,value] of [['aria-label',saved.ariaLabel],['title',saved.title]]){if(value===null)button.removeAttribute(name);else button.setAttribute(name,value);}
+  // A consumer may have replaced the spinner with its next action after success.
+  if(button.querySelector('.button-spinner'))button.innerHTML=saved.html;
+  button.disabled=saved.disabled;
+ };
+ owner.finish=finish;update(label);
+ return {update,finish};
 }
 function startAdapterBusy(button,phase='downloading'){
  const current=editor,host=$('#adapter-progress'),busy=startButtonBusy(button,'下载中');
@@ -627,7 +653,7 @@ function checkEditorValidity(){
  invalid.reportValidity();return false;
 }
 function showEditor(){
- $('#form-error').hidden=true;$('#adapter-progress').hidden=true;$('#save').hidden=false;buttonBusy.delete($('#save'));$('#save').removeAttribute('aria-label');$('#save').removeAttribute('aria-busy');$('#save').style.minWidth='';$('#save').textContent='保存';$('#save').disabled=false;
+ $('#form-error').hidden=true;$('#adapter-progress').hidden=true;$('#save').hidden=false;buttonBusy.get($('#save'))?.finish();$('#save').removeAttribute('aria-label');$('#save').textContent='保存';$('#save').disabled=false;
  $('#cancel-editor').textContent=['sources','accounts','keys','adapters','health'].includes(editor.type)?'关闭':'取消';
  $('#editor-note').textContent=editor.type==='sources'?'选择来源后配置认证，保存后接入':'保存后同步模型与路由';
  configureEditorSections();

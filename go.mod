@@ -5,13 +5,15 @@ go 1.26.8
 require (
 	github.com/Calcium-Ion/moejs v0.1.0-alpha.4
 	github.com/godbus/dbus/v5 v5.2.2
-	github.com/klauspost/compress v1.18.3
+	github.com/klauspost/compress v1.18.7
 	github.com/pelletier/go-toml/v2 v2.2.4
 	github.com/tidwall/gjson v1.19.0
 	github.com/tidwall/jsonc v0.3.3
+	golang.org/x/net v0.56.0
 	golang.org/x/sys v0.46.0
 	golang.org/x/text v0.39.0
 	gopkg.in/yaml.v3 v3.0.1
+	modernc.org/libc v1.67.6
 	modernc.org/sqlite v1.44.3
 )
 
@@ -24,8 +26,6 @@ require (
 	github.com/tidwall/match v1.1.1 // indirect
 	github.com/tidwall/pretty v1.2.0 // indirect
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
-	golang.org/x/net v0.56.0 // indirect
-	modernc.org/libc v1.67.6 // indirect
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )

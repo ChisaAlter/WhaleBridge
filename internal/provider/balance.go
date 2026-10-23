@@ -739,7 +739,13 @@ func balanceRead(ctx context.Context, p Provider) (amount string, parts []Balanc
 	if src.token != "" && p.BalanceURL != "" && balanceURLPath(p.BalanceURL) == newAPIKeyUsage {
 		return "", nil, nil, true, errKeyUsageWithToken(p.BalanceURL)
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, withBalanceKey(src.url, p.Key, true), nil)
+	method := http.MethodGet
+	if p.BalanceURL != "" {
+		if method, err = balanceMethodOf(p.BalanceMethod); err != nil {
+			return "", nil, nil, true, err
+		}
+	}
+	req, err := http.NewRequestWithContext(ctx, method, withBalanceKey(src.url, p.Key, true), nil)
 	if err != nil {
 		return "", nil, nil, true, err
 	}
@@ -813,6 +819,18 @@ func balanceRead(ctx context.Context, p Provider) (amount string, parts []Balanc
 	}
 	amount, err = src.read(b)
 	return amount, nil, nil, true, err
+}
+
+// balanceMethodOf accepts only the two methods supported by a custom query.
+// An invalid saved value fails before any network request.
+func balanceMethodOf(method string) (string, error) {
+	switch strings.ToUpper(strings.TrimSpace(method)) {
+	case "", http.MethodGet:
+		return http.MethodGet, nil
+	case http.MethodPost:
+		return http.MethodPost, nil
+	}
+	return "", fmt.Errorf("the balance method %q is neither GET nor POST", method)
 }
 
 // sub2APIKeyLimits says the provider's Balance URL is a sub2api panel's

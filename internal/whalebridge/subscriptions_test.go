@@ -86,8 +86,13 @@ func TestSubscriptionPerAccountCheckinContractHTTP(t *testing.T) {
 		"account": map[string]any{"uid": "fixture", "nickname": "Fixture seat"},
 		"auth":    map[string]any{"accessToken": "fixture-workbuddy-access", "refreshToken": "fixture-workbuddy-refresh", "expiresAt": time.Now().Add(8 * time.Hour).UnixMilli(), "domain": "www.codebuddy.cn"},
 	})
+	// The retired subscription is served by its plugin, with an independent
+	// saved identity. The native file above remains a mutation sentinel.
+	componentContractWriteJSON(t, filepath.Join(settings.Dir(), "plugins.json"), plugin.List{Plugins: []plugin.Entry{{Spec: "@fixture/workbuddy"}}})
+	componentContractWriteJSON(t, plugin.AuthPath(), map[string]any{"workbuddy": map[string]any{"type": "api", "key": "fixture-plugin-key", "accountId": "fixture"}})
+	plugin.UseCached([]plugin.Provider{{ID: "workbuddy", Name: "WorkBuddy", Spec: "@fixture/workbuddy", Checkin: true, Accounts: []plugin.Account{{Key: "workbuddy", Type: "api", AccountID: "fixture"}}}})
 	provider.ForgetAccounts()
-	t.Cleanup(provider.ForgetAccounts)
+	t.Cleanup(func() { plugin.UseCached(nil); provider.ForgetAccounts() })
 	s := settings.Load()
 	s.WorkBuddyCheckin, s.CheckinOff = true, []string{"workbuddy|other"}
 	if err := settings.Save(s); err != nil {
@@ -101,15 +106,15 @@ func TestSubscriptionPerAccountCheckinContractHTTP(t *testing.T) {
 	}
 	var accounts []accountInfo
 	response := h.call("GET", "accounts/workbuddy", nil, 200)
-	if err := json.Unmarshal(response, &accounts); err != nil || len(accounts) != 1 || accounts[0].User != "Fixture seat" || accounts[0].CheckinKey != "workbuddy|fixture" || !accounts[0].CheckinOff {
-		t.Fatal("the real account DTO lost its resolved per-account check-in switch")
+	if err := json.Unmarshal(response, &accounts); err != nil || len(accounts) != 1 || accounts[0].User != "fixture" || accounts[0].CheckinKey != "workbuddy|fixture" || !accounts[0].CheckinOff {
+		t.Fatalf("the real account DTO lost its resolved per-account check-in switch: %s", response)
 	}
 	assertSecretsAbsent(t, response, "fixture-workbuddy-access", "fixture-workbuddy-refresh")
 	h.call("POST", "subscription/settings", map[string]any{"resetReminder": 10}, 200)
 	if len(settings.Load().CheckinOff) != 2 {
 		t.Fatal("an unrelated maintenance edit erased account exclusions")
 	}
-	h.call("POST", "accounts/checkin", map[string]any{"id": "workbuddy", "user": "Fixture seat", "on": true}, 200)
+	h.call("POST", "accounts/checkin", map[string]any{"id": "workbuddy", "user": "fixture", "on": true}, 200)
 	if !reflect.DeepEqual(settings.Load().CheckinOff, []string{"workbuddy|other"}) {
 		t.Fatal("re-enabling one account changed another exclusion")
 	}

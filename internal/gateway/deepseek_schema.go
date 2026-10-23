@@ -7,8 +7,8 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/tidwall/gjson"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/tidwall/gjson"
 )
 
 // deepseekToolPatterns normalizes the ECMAScript null escape \0 in tool schemas
@@ -136,6 +136,29 @@ func encodeJSONStringNoHTMLEscape(s string) string {
 	}
 	b.WriteByte('"')
 	return b.String()
+}
+
+// deepseekTokenField renames the top-level output key DeepSeek otherwise
+// ignores, preserving all other bytes, including mentions in user messages.
+func deepseekTokenField(p provider.Provider, to provider.Protocol, body []byte) []byte {
+	if to != provider.Chat || p.Preset != "deepseek" && provider.HostOf(p.Base(to)) != "api.deepseek.com" {
+		return body
+	}
+	if !bytes.Contains(body, []byte(`"max_completion_tokens"`)) || gjson.GetBytes(body, "max_tokens").Exists() {
+		return body
+	}
+	v := gjson.GetBytes(body, "max_completion_tokens")
+	if !v.Exists() || v.Index <= 0 {
+		return body
+	}
+	key := bytes.LastIndex(body[:v.Index], []byte(`"max_completion_tokens"`))
+	if key < 0 || strings.Trim(string(body[key+len(`"max_completion_tokens"`):v.Index]), " \t\r\n:") != "" {
+		return body
+	}
+	out := make([]byte, 0, len(body))
+	out = append(out, body[:key]...)
+	out = append(out, `"max_tokens"`...)
+	return append(out, body[key+len(`"max_completion_tokens"`):]...)
 }
 
 func unicodeNullEscape(pattern string) string {

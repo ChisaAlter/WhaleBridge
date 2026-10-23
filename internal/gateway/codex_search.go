@@ -123,7 +123,11 @@ func chatGPTSearchers(r *http.Request, model string) ([]provider.Provider, strin
 // with why returned.
 func (s *Server) alphaSearchOn(w http.ResponseWriter, r *http.Request, body []byte, model string, ons []provider.Provider) (bool, string) {
 	start := time.Now()
-	w, body, unmask := redacted(w, body)
+	w, body, unmask, maskErr := redacted(w, body)
+	if maskErr != nil {
+		writeError(w, provider.Responses, http.StatusServiceUnavailable, maskErr.Error())
+		return true, ""
+	}
 	defer unmask()
 	var errs []string
 	for _, on := range ons {
@@ -207,6 +211,11 @@ func (s *Server) alphaSearchHere(w http.ResponseWriter, r *http.Request, q alpha
 		return
 	}
 	ctx := context.WithValue(r.Context(), searchForKey{}, &CallFor{Agent: callerOf(r).agent, Model: q.Model})
+	ctx, maskErr := captureMasking(ctx)
+	if maskErr != nil {
+		writeError(w, provider.Responses, http.StatusServiceUnavailable, maskErr.Error())
+		return
+	}
 	var said []string
 	for _, query := range queries {
 		found, _, err := s.webSearch(ctx, query)
@@ -227,5 +236,12 @@ func (s *Server) alphaSearchHere(w http.ResponseWriter, r *http.Request, q alpha
 		}
 		said = append(said, found)
 	}
-	writeJSON(w, http.StatusOK, alphaSearchReply{Output: note + strings.Join(said, "\n\n")})
+	// This is the agent's tool result, after every provider call has ended.
+	// Restore only here; webSearch's internal model rounds stay masked.
+	restored, maskErr := restoreMasked(ctx, note+strings.Join(said, "\n\n"))
+	if maskErr != nil {
+		writeError(w, provider.Responses, http.StatusServiceUnavailable, maskErr.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, alphaSearchReply{Output: restored})
 }

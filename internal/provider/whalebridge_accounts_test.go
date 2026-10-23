@@ -2,12 +2,12 @@ package provider
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 )
 
 func whaleBridgeAccountHome(t *testing.T) string {
@@ -90,28 +90,44 @@ func TestWhaleBridgeBorrowedCodexForgetKeepsNativeAndOwnedRelogin(t *testing.T) 
 	}
 }
 
-func TestWhaleBridgeCursorCurrentIdentityAndLocalToggle(t *testing.T) {
+func TestWhaleBridgeRetiredCursorLeavesNativeLoginUntouched(t *testing.T) {
 	whaleBridgeAccountHome(t)
-	before := cursorStatus
-	cursorStatus = &cliIdentity{name: "cursor", at: time.Now(), read: true, user: "cursor@example.test", plan: "pro", ok: true}
-	t.Cleanup(func() { cursorStatus = before })
-	ls := WhaleBridgeLogins("cursor")
-	if len(ls) != 1 || ls[0].User != "cursor@example.test" || !ls[0].Own || !ls[0].On {
-		t.Fatalf("current Cursor identity omitted: %+v", ls)
-	}
-	if err := WhaleBridgeSetLoginOn("cursor", ls[0].User, false); err != nil {
+	auth := []byte(`{"accessToken":"native-cursor-token","refreshToken":"native-refresh"}`)
+	path := cursorAuthFile()
+	if err := os.MkdirAll(filepath.Dir(path), 0700); err != nil {
 		t.Fatal(err)
 	}
-	ls = WhaleBridgeLogins("cursor")
-	if len(ls) != 1 || ls[0].On || !ls[0].Paused {
-		t.Fatalf("component stop did not appear: %+v", ls)
-	}
-	if err := WhaleBridgeSetLoginOn("cursor", ls[0].User, true); err != nil {
+	if err := os.WriteFile(path, auth, 0600); err != nil {
 		t.Fatal(err)
 	}
-	ls = WhaleBridgeLogins("cursor")
-	if len(ls) != 1 || !ls[0].On || ls[0].Paused {
-		t.Fatal("component enable did not restore Cursor")
+	before, executable := cursorStatus, CursorExecutable
+	calls := 0
+	cursorStatus = &cliIdentity{name: "cursor", ask: func() (string, string, bool, error) { calls++; return "cursor@example.test", "pro", true, nil }}
+	CursorExecutable = func() string { calls++; return "fixture-cursor" }
+	t.Cleanup(func() { cursorStatus, CursorExecutable = before, executable })
+	if ls := WhaleBridgeLogins("cursor"); len(ls) != 0 {
+		t.Fatalf("retired Cursor exposed native identity: %+v", ls)
+	}
+	for _, p := range Accounts() {
+		if p.ID == "cursor" && !p.IsPlugin() {
+			t.Fatal("retired Cursor still served native credentials")
+		}
+	}
+	if ls, ok := usageLogins("cursor"); ok || len(ls) != 0 {
+		t.Fatal("retired Cursor usage fell back to native accounts")
+	}
+	if ls, ok := builtinLogins("cursor"); ok || len(ls) != 0 {
+		t.Fatal("retired Cursor native usage was listed")
+	}
+	q := loginQuota(context.Background(), Login{Agent: "cursor", User: "cursor@example.test", On: true})
+	if q.Error == "" {
+		t.Fatal("stale native usage login was accepted")
+	}
+	if calls != 0 {
+		t.Fatalf("retired serving path probed native CLI %d times", calls)
+	}
+	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, auth) {
+		t.Fatalf("retirement changed native credential bytes: %v", err)
 	}
 }
 

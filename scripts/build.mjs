@@ -27,13 +27,15 @@ execFileSync(process.env.WHALEBRIDGE_GO || 'go', [
 const binary = readFileSync(join(out, asset));
 const license = readFileSync(join(source, 'LICENSE'), 'utf8');
 const manifest = {
-  id: 'whalebridge', name: '鲸桥', version,
+  id: 'whalebridge', name: '鲸Bridge', version,
   description: '默认接入鲸屿，也可为其他 Agent 配置模型，统一管理供应商、路由与用量。',
   upstream: pin.commit, providerFeaturesUpstream: pin.providerFeaturesCommit,
   providerDiscoveryUpstream: pin.providerDiscoveryCommit, searchFeaturesUpstream: pin.searchFeaturesCommit,
-  agentFeaturesUpstream: pin.agentFeaturesCommit, license,
+  agentFeaturesUpstream: pin.agentFeaturesCommit,
+  upstreamReviewedCommit: pin.reviewedCommit, upstreamReviewedArchiveSha256: pin.reviewedArchiveSha256,
+  upstreamReviewedRelease: pin.reviewedRelease, upstreamPatches: pin.patches, license,
   platforms: { 'win32-x64': { asset, size: binary.length, sha256: createHash('sha256').update(binary).digest('hex') } },
 };
 writeFileSync(join(out, 'WhaleBridge-component.json'), `${JSON.stringify(manifest, null, 2)}\n`);
 copyFileSync(join(source, 'LICENSE'), join(out, 'LICENSE'));
-console.log(`鲸桥 ${version}: ${binary.length} bytes → ${out}`);
+console.log(`鲸Bridge ${version}: ${binary.length} bytes → ${out}`);

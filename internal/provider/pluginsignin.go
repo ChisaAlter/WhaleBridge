@@ -3,6 +3,7 @@ package provider
 import (
 	"context"
 	"errors"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -34,13 +35,7 @@ func StartPluginSignInWith(id string, method int, inputs map[string]string, o Si
 		return SignInState{}, err
 	}
 	s.st = SignInState{ID: randomToken(9), Agent: PluginID(id), State: "waiting", Proxy: s.proxy}
-	var cli agentCLI
-	install := false
-	if Moved(s.st.Agent) {
-		cli, install = missingCLI(s.st.Agent)
-	} else if pluginRunsCLI[id] {
-		cli, install = missingCLI(id)
-	}
+	cli, install := missingPluginCLI(id)
 	var installing context.Context
 	if install {
 		s.st.State, s.st.Installing = "installing", cli.Name
@@ -78,6 +73,20 @@ func StartPluginSignInWith(id string, method int, inputs map[string]string, o Si
 // said "install Grok Build first: curl … | bash", which a magpie in Docker
 // has no shell to run; its CLI is installed first, as a moved one's is.
 var pluginRunsCLI = map[string]bool{"grok": true}
+
+func missingPluginCLI(id string) (agentCLI, bool) {
+	// No vendor CLI probe or installer belongs to the component's sign-in.
+	if os.Getenv("LAUNCHER_COMPONENT_ID") == "whalebridge" {
+		return agentCLI{}, false
+	}
+	if Moved(PluginID(id)) {
+		return missingCLI(PluginID(id))
+	}
+	if pluginRunsCLI[id] {
+		return missingCLI(id)
+	}
+	return agentCLI{}, false
+}
 
 // pluginBegin asks the plugin for the page to open and waits for the
 // sign-in to finish there, or for the code the page shows.
@@ -175,16 +184,24 @@ func (s *signInFlow) pluginDone(saved plugin.Saved, err error) {
 // method does, beside the accounts signed in already; it gives the
 // provider's magpie id.
 func PluginAPIKey(ctx context.Context, id string, method int, inputs map[string]string, key string) (string, error) {
+	if settings.AccountDiscoveryOff() {
+		return "", errAccountDiscoveryOff
+	}
 	if strings.TrimSpace(key) == "" {
-		return "", errors.New("enter the key")
+		pp, ok := PluginOf(PluginID(id))
+		if !ok || method < 0 || method >= len(pp.Methods) || pp.Methods[method].Type != "api" || !pp.Methods[method].Keyless {
+			return "", errors.New("enter the key")
+		}
 	}
 	// through the proxy the provider's requests go through (#1663)
-	saved, err := plugin.APIKey(Via(ctx, PluginID(id)), id, method, inputs, strings.TrimSpace(key), plugin.NewAccount)
+	saved, err := pluginAPIKey(Via(ctx, PluginID(id)), id, method, inputs, strings.TrimSpace(key), plugin.NewAccount)
 	if err != nil {
 		return "", err
 	}
 	return PluginSignedIn(saved), nil
 }
+
+var pluginAPIKey = plugin.APIKey
 
 // PluginSignedIn finishes a sign-in to a plugin's provider that magpie
 // doesn't follow, a key or the command line's own, once the plugin has

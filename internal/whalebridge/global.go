@@ -1,6 +1,7 @@
 package whalebridge
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -43,7 +44,7 @@ func globalState() map[string]any {
 	out["otel"] = map[string]any{"enabled": s.OTel.Enabled, "endpoint": s.OTel.Endpoint, "metrics": s.OTel.Metrics, "bodies": s.OTel.Bodies, "bodiesWhole": s.OTel.BodiesWhole, "headerNames": names}
 	searches := []map[string]any{}
 	for _, a := range provider.StoredSearchAPIs() {
-		searches = append(searches, map[string]any{"vendor": a.Vendor, "name": a.Name(), "url": a.URL, "keySet": len(a.Keys()) > 0, "keyMasked": a.MaskedKey(), "ready": a.Ready()})
+		searches = append(searches, map[string]any{"vendor": a.Vendor, "name": a.Name(), "url": a.URL, "keySet": len(a.Keys()) > 0, "keyMasked": a.MaskedKey(), "ready": a.Ready(), "off": a.Off, "pick": a.Pick, "canQuota": gateway.CanReadSearchQuota(a)})
 	}
 	searchVendors := []map[string]any{}
 	for _, v := range provider.SearchVendors {
@@ -169,6 +170,7 @@ func saveGlobalSettings(r *http.Request) error {
 	if err := settings.Save(s); err != nil {
 		return err
 	}
+	provider.Changed()
 	if s.NoAccountDiscovery != discoveryWasOff {
 		provider.ForgetAccounts()
 	}
@@ -254,6 +256,48 @@ func globalRoutes(mux *http.ServeMux, server *gateway.Server, version string) {
 		}
 		return provider.RemoveSearchAPI(a.Vendor)
 	}))
+	mux.HandleFunc("POST /api/search/switch", mutate(func(w http.ResponseWriter, r *http.Request) error {
+		var in struct {
+			Vendor string
+			On     bool
+		}
+		if err := decode(w, r, &in); err != nil {
+			return err
+		}
+		return provider.SwitchSearchAPI(in.Vendor, in.On)
+	}))
+	mux.HandleFunc("POST /api/search/order", mutate(func(w http.ResponseWriter, r *http.Request) error {
+		var in struct{ Vendors []string }
+		if err := decode(w, r, &in); err != nil {
+			return err
+		}
+		return provider.ArrangeSearchAPIs(in.Vendors)
+	}))
+	quota := func(w http.ResponseWriter, r *http.Request, vendor string, fresh bool) {
+		for _, a := range provider.StoredSearchAPIs() {
+			if a.Vendor != vendor {
+				continue
+			}
+			if !gateway.CanReadSearchQuota(a) {
+				http.Error(w, "此搜索服务未提供可读取的密钥额度", http.StatusBadRequest)
+				return
+			}
+			ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+			defer cancel()
+			writeJSON(w, map[string]any{"vendor": vendor, "keys": gateway.SearchQuotas(ctx, a, fresh)})
+			return
+		}
+		http.Error(w, "搜索服务不存在", http.StatusNotFound)
+	}
+	mux.HandleFunc("GET /api/search/quota", func(w http.ResponseWriter, r *http.Request) { quota(w, r, r.URL.Query().Get("vendor"), false) })
+	mux.HandleFunc("POST /api/search/quota", func(w http.ResponseWriter, r *http.Request) {
+		var in struct{ Vendor string }
+		if err := decode(w, r, &in); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		quota(w, r, in.Vendor, true)
+	})
 	mux.HandleFunc("GET /api/search/key", func(w http.ResponseWriter, r *http.Request) {
 		for _, a := range provider.StoredSearchAPIs() {
 			if a.Vendor == r.URL.Query().Get("vendor") {

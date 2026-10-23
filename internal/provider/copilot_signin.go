@@ -151,7 +151,7 @@ func startCopilotSignIn(s *signInFlow) error {
 			}
 			copilotProbeEditor(fctx, user, host)
 			fcancel()
-			if err := addCopilotLogin(user, plan, tok.Token, host); err != nil {
+			if err := keepLogin(ctx, func() error { return addCopilotLogin(user, plan, tok.Token, host) }); err != nil {
 				fail(err.Error())
 				return
 			}

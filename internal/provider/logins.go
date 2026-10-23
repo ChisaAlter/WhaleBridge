@@ -782,6 +782,9 @@ func Logins(agent string) []Login {
 	if pp, ok := pluginOfAgent(agent); ok {
 		return pluginLoginList(pp)
 	}
+	if PluginServes(agent) {
+		return nil
+	}
 	var side []Login
 	switch agent {
 	case "grok":
@@ -835,7 +838,7 @@ func Logins(agent string) []Login {
 			{MiMoID, mimoLoginList}, {ChatGPTAPIID, siwcLoginList}, {"gemini", func() []Login { return googleLoginList("gemini") }},
 			{"antigravity", func() []Login { return googleLoginList("antigravity") }},
 		} {
-			if !Moved(b.id) {
+			if !PluginServes(b.id) {
 				side = append(side, b.list()...)
 				continue
 			}

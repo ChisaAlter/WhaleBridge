@@ -2,6 +2,7 @@ package whalebridge
 
 import (
 	"context"
+	"fmt"
 	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"net/http"
@@ -104,11 +105,36 @@ func accountRoutes(mux *http.ServeMux) {
 		}
 		var st provider.SignInState
 		var err error
-		if b.Plugin && b.Key != "" {
-			_, err = provider.PluginAPIKey(r.Context(), b.Agent, b.Method, b.Inputs, b.Key)
-			st.State = "done"
-		} else if b.Plugin {
-			st, err = provider.StartPluginSignInWith(b.Agent, b.Method, b.Inputs, provider.SignInOptions{Site: b.Site, User: b.User, Proxy: b.Proxy})
+		if b.Plugin {
+			var pp plugin.Provider
+			var listed []plugin.Provider
+			listed, err = plugin.Providers(r.Context())
+			if err == nil {
+				found := false
+				for _, p := range listed {
+					if p.ID == b.Agent || provider.PluginID(p.ID) == b.Agent {
+						pp, found = p, true
+						break
+					}
+				}
+				if !found {
+					err = fmt.Errorf("该供应商适配器未就绪，请刷新后重试")
+				}
+			}
+			if err == nil && (b.Method < 0 || b.Method >= len(pp.Methods)) {
+				err = fmt.Errorf("供应商登录方式已变化，请刷新后重试")
+			}
+			if err == nil {
+				switch pp.Methods[b.Method].Type {
+				case "api":
+					_, err = provider.PluginAPIKey(r.Context(), pp.ID, b.Method, b.Inputs, b.Key)
+					st.State = "done"
+				case "oauth":
+					st, err = provider.StartPluginSignInWith(pp.ID, b.Method, b.Inputs, provider.SignInOptions{Site: b.Site, User: b.User, Proxy: b.Proxy})
+				default:
+					err = fmt.Errorf("该适配器登录方式暂不支持")
+				}
+			}
 		} else {
 			st, err = provider.StartSignInWith(b.Agent, provider.SignInOptions{Site: b.Site, User: b.User, Proxy: b.Proxy})
 		}

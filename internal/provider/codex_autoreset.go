@@ -11,6 +11,10 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
+	"log"
 	"os"
 	"path/filepath"
 	"slices"
@@ -19,6 +23,7 @@ import (
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
+	"github.com/ChisaAlter/WhaleBridge/internal/steady"
 )
 
 // CodexAutoReset says whether the Codex account user spends a reset by
@@ -116,8 +121,13 @@ func (a *autoResets) use(user string, look func(now time.Time) (week *time.Time,
 	asked := time.Now()
 	a.Lock() // one look at a time: those waiting take what it did
 	defer a.Unlock()
-	a.load()
+	if err := a.load(); err != nil {
+		return ResetOutcome{}, err
+	}
 	now := time.Now()
+	if s, ok := a.spent[autoResetAny]; ok && now.Before(s.Until) {
+		return ResetOutcome{}, nil
+	}
 	if s, ok := a.spent[key]; ok {
 		if asked.Before(s.At) {
 			// asked while it was being spent, for the same week used up
@@ -160,22 +170,67 @@ func weekUsedUp(windows []QuotaWindow, now time.Time) *time.Time {
 	return nil
 }
 
-// load reads what was spent, once; a.Lock is held.
-func (a *autoResets) load() {
+// load reads what was spent, once; a.Lock is held. An unreadable ledger
+// is unknown, never none: rebuild it from the history of resets spent for
+// a used-up week. If that history is unknown too, hold every account for
+// a week, the longest a lost spend could still count. Keep corrupt bytes
+// aside before writing the rebuilt ledger over them. If it cannot be
+// read or kept aside, stop before spending or writing anything over it.
+func (a *autoResets) load() error {
 	if a.path == a.where() {
-		return
+		return nil
 	}
 	a.path = a.where()
 	a.spent, a.next = map[string]autoResetSpent{}, map[string]time.Time{}
-	if b, err := os.ReadFile(a.path); err == nil {
-		_ = json.Unmarshal(b, &a.spent)
+	b, err := os.ReadFile(a.path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		a.path = "" // try again after the file can be read
+		return err
+	}
+	if err = json.Unmarshal(b, &a.spent); err == nil {
 		if a.spent == nil {
 			a.spent = map[string]autoResetSpent{}
 		}
+		return nil
 	}
+	aside := a.path + ".bad-" + time.Now().UTC().Format("20060102T150405.000000000")
+	if werr := os.WriteFile(aside, b, 0o600); werr != nil {
+		a.path = "" // never overwrite bytes that have not been kept
+		return fmt.Errorf("%w; keeping it aside: %v", err, werr)
+	}
+	err = fmt.Errorf("%w; kept aside as %s", err, aside)
+	// A type error can leave entries behind. Rebuild only from known history.
+	a.spent = map[string]autoResetSpent{}
+	now := time.Now()
+	uses, uerr := readResetsUsed()
+	if uerr != nil {
+		a.spent[autoResetAny] = autoResetSpent{Until: now.Add(autoResetWeek), At: now}
+		log.Printf("%s: %v; %v too, so no Codex account spends a reset by itself until %s", a.path, err, uerr, now.Add(autoResetWeek).Format(time.RFC3339))
+	} else {
+		for _, u := range uses {
+			key := strings.ToLower(u.User)
+			if u.Why != ResetUsedWeek || now.Sub(u.At) >= autoResetWeek || a.spent[key].At.After(u.At) {
+				continue
+			}
+			a.spent[key] = autoResetSpent{Until: u.At.Add(autoResetWeek), At: u.At, Out: ResetOutcome{Code: "reset", Windows: u.Windows}}
+		}
+		log.Printf("%s: %v; what was spent is taken from %s", a.path, err, resetsUsedPath())
+	}
+	a.save()
+	return nil
 }
 
-// save writes it; a.Lock is held.
+// autoResetAny stands for every account when the week's spends are
+// unknown; autoResetWeek is the longest a spend counts for.
+const (
+	autoResetAny  = "*"
+	autoResetWeek = 7 * 24 * time.Hour
+)
+
+// save writes it through a flushed temp file; a.Lock is held.
 func (a *autoResets) save() {
 	now := time.Now()
 	for k, s := range a.spent { // weeks gone by say nothing any more
@@ -185,5 +240,7 @@ func (a *autoResets) save() {
 	}
 	b, _ := json.MarshalIndent(a.spent, "", "  ")
 	_ = os.MkdirAll(settings.Dir(), 0o755)
-	_ = os.WriteFile(a.path, append(b, '\n'), 0o644)
+	if err := steady.WriteFile(a.path, append(b, '\n'), 0o644); err != nil {
+		log.Printf("writing what a week's auto-use spent to %s: %v", a.path, err)
+	}
 }

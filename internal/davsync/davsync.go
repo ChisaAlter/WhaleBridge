@@ -764,8 +764,14 @@ func run(ctx context.Context, first time.Duration) {
 
 func collect(c Config) (backup.Bundle, error) {
 	b, err := backup.Collect(c.Keys, "magpie")
+	if err != nil {
+		return b, err
+	}
 	if b.Settings == nil {
-		s := settings.Load()
+		s, err := settings.LoadChecked()
+		if err != nil {
+			return b, err
+		}
 		b.Settings = &s
 	}
 	// Fonts belong to each application. New remote bundles carry none;

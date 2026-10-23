@@ -7,16 +7,19 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io/fs"
 	"log"
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/agent"
@@ -24,7 +27,10 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 	"github.com/ChisaAlter/WhaleBridge/internal/davsync"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
+	"github.com/ChisaAlter/WhaleBridge/internal/filememo"
 	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
+	"github.com/ChisaAlter/WhaleBridge/internal/gatewayplugins"
+	"github.com/ChisaAlter/WhaleBridge/internal/middleware"
 	"github.com/ChisaAlter/WhaleBridge/internal/netproxy"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"github.com/ChisaAlter/WhaleBridge/internal/sessions"
@@ -54,13 +60,31 @@ func decode(w http.ResponseWriter, r *http.Request, v any) error {
 // route. Subscription maintenance runs here; client installers, native account
 // switching, session scans and the LAN listener are excluded.
 func Run(version string) error {
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	return RunContext(ctx, version)
+}
+
+// RunContext owns both HTTP servers and the finite gateway plugins. Parent
+// cancellation stops admission, then drains live responses before unregistering.
+func RunContext(parent context.Context, version string) error {
 	if os.Getenv("LAUNCHER_COMPONENT_DATA_DIR") == "" || os.Getenv("WHALEBRIDGE_DSH_HOME") == "" {
-		return fmt.Errorf("请从鲸屿启动器安装并打开鲸桥")
+		return fmt.Errorf("请从鲸屿启动器安装并打开鲸Bridge")
 	}
+	// The maintenance context is independent of parent cancellation: active
+	// request contexts stay alive throughout graceful shutdown.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	var workers sync.WaitGroup
+	runWorker := func(fn func(context.Context)) {
+		workers.Add(1)
+		go func() { defer workers.Done(); fn(ctx) }()
+	}
 	if err := os.MkdirAll(appdir.Config(), 0700); err != nil {
 		return err
+	}
+	if err := migratePluginReferences(); err != nil {
+		return fmt.Errorf("供应商引用迁移失败: %w", err)
 	}
 	keyFile := filepath.Join(appdir.Config(), "gateway.key")
 	stored, err := os.ReadFile(keyFile)
@@ -78,7 +102,7 @@ func Run(version string) error {
 		}
 	}
 	if decoded, err := hex.DecodeString(token); err != nil || len(decoded) != 16 {
-		return fmt.Errorf("鲸桥网关密钥文件无效")
+		return fmt.Errorf("鲸Bridge网关密钥文件无效")
 	}
 	os.Setenv("WHALEBRIDGE_GATEWAY_TOKEN", token)
 	gateway.Token = token
@@ -110,7 +134,7 @@ func Run(version string) error {
 	}
 	g, err := net.Listen("tcp", gateway.Addr())
 	if err != nil {
-		return fmt.Errorf("鲸桥网关端口不可用: %w", err)
+		return fmt.Errorf("鲸Bridge网关端口不可用: %w", err)
 	}
 	defer g.Close()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
@@ -118,26 +142,63 @@ func Run(version string) error {
 		return err
 	}
 	defer listener.Close()
+	server := gateway.New()
+	runtime, err := gatewayplugins.Start()
+	if err != nil {
+		return fmt.Errorf("鲸Bridge网关插件初始化失败: %w", err)
+	}
+	stopObservers := usage.ServeObservers()
+	gatewayHTTP := &http.Server{Handler: runtime.Handler(server.Handler()), ReadHeaderTimeout: 30 * time.Second}
+	var managementHTTP *http.Server
+	stopCatalogSync, stopSubscriptions := func() {}, func() {}
+	defer func() {
+		// Stop refresh and maintenance before draining. No shared request
+		// context is canceled; final unmask, middleware and usage still run.
+		runtime.Quiesce()
+		cancel()
+		var managementDone chan struct{}
+		if managementHTTP != nil {
+			managementDone = make(chan struct{})
+			go func() { defer close(managementDone); _ = managementHTTP.Shutdown(context.Background()) }()
+		}
+		// Join configuration/catalog and subscription workers before draining;
+		// a late refresh may not change providers or restart their host.
+		workers.Wait()
+		stopSubscriptions()
+		stopCatalogSync()
+		// Keep the gateway listener for callbacks needed by accepted Claude
+		// turns. Ordinary new calls are rejected by the host's closing gate.
+		_ = runtime.WaitIdle(context.Background())
+		_ = gatewayHTTP.Shutdown(context.Background())
+		if managementDone != nil {
+			<-managementDone
+		}
+		server.CloseWhaleBridgeSessions()
+		runtime.Stop()
+		stopObservers()
+	}()
 	if err := syncDSH(); err != nil {
 		return err
 	}
 	syncManagedAgents()
-	stopCatalogSync := watchDSHCatalog(ctx)
-	defer stopCatalogSync()
-	server := gateway.New()
-	stopOTel := usage.StartOTel()
-	defer stopOTel()
+	stopCatalogSync = watchDSHCatalog(ctx)
 	gateway.ArchiveBucket = func() (gateway.Putter, bool) { b, ok := davsync.S3Bucket(); return b, ok }
-	go davsync.Run(ctx)
+	runWorker(davsync.Run)
 	failures := make(chan error, 2)
-	go func() {
-		failures <- (&http.Server{Handler: server.Handler(), ReadHeaderTimeout: 30 * time.Second}).Serve(g)
-	}()
+	go func() { failures <- gatewayHTTP.Serve(g) }()
 	origin := "http://" + listener.Addr().String()
 	cookieName := "magpie_web_" + strings.Split(listener.Addr().String(), ":")[1]
 	mux := http.NewServeMux()
 	accountRoutes(mux)
 	agentRoutes(mux)
+	mux.HandleFunc("GET /api/runtime", func(w http.ResponseWriter, r *http.Request) { writeJSON(w, runtime.Status()) })
+	mux.HandleFunc("POST /api/runtime/refresh", func(w http.ResponseWriter, r *http.Request) {
+		if err := runtime.Refresh(r.Context()); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, runtime.Status())
+	})
 	mux.HandleFunc("GET /api/whalebridge/status", func(w http.ResponseWriter, r *http.Request) {
 		models, _ := provider.CatalogFor("dsh")
 		writeJSON(w, map[string]any{"models": len(models), "defaultModel": isDefault(), "version": version, "gateway": gateway.URL(), "pid": os.Getpid(), "catalog": catalog.Status(), "syncError": dshSyncError()})
@@ -311,6 +372,7 @@ func Run(version string) error {
 	mux.HandleFunc("POST /api/catalog/refresh", mutate(func(w http.ResponseWriter, r *http.Request) error { return catalog.Sync(r.Context()) }))
 	sub, _ := fs.Sub(assets, "assets")
 	mux.Handle("/", http.FileServer(http.FS(sub)))
+	management := managementReads(mux)
 	auth := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Cache-Control", "no-store")
 		w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -326,7 +388,7 @@ func Run(version string) error {
 		}
 		c, err := r.Cookie(cookieName)
 		if err != nil || subtle.ConstantTimeCompare([]byte(c.Value), []byte(key)) != 1 {
-			http.Error(w, "请从启动器打开鲸桥", 401)
+			http.Error(w, "请从启动器打开鲸Bridge", 401)
 			return
 		}
 		if r.Method != "GET" && r.Method != "HEAD" {
@@ -339,7 +401,7 @@ func Run(version string) error {
 				return
 			}
 		}
-		mux.ServeHTTP(w, r)
+		management.ServeHTTP(w, r)
 	})
 	state := map[string]any{"id": "whalebridge", "pid": os.Getpid(), "url": origin + "/?k=" + key, "gateway": gateway.URL(), "version": version, "ready": true}
 	bytes, _ := json.Marshal(state)
@@ -347,15 +409,40 @@ func Run(version string) error {
 		return err
 	}
 	defer os.Remove(filepath.Join(appdir.Config(), "state.json"))
-	go func() { failures <- (&http.Server{Handler: auth, ReadHeaderTimeout: 10 * time.Second}).Serve(listener) }()
-	go provider.StartModelRefresh(ctx)
-	gateway.StartWhaleBridgeSubscriptions(ctx)
-	return <-failures
+	managementHTTP = &http.Server{Handler: auth, ReadHeaderTimeout: 10 * time.Second}
+	go func() { failures <- managementHTTP.Serve(listener) }()
+	runWorker(provider.StartModelRefresh)
+	stopSubscriptions = gateway.StartWhaleBridgeSubscriptions(ctx)
+	select {
+	case <-parent.Done():
+		return nil
+	case err := <-failures:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
+		return err
+	}
 }
 
 type sourcePreset struct {
 	provider.PresetDef
 	Notes map[string]string `json:"notes,omitempty"`
+}
+
+// managementReads shares catalog and file lookups within one authenticated read.
+// Mutation paths invalidate snapshots instead of holding them across a save.
+func managementReads(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasPrefix(r.URL.Path, "/api/") {
+			if r.Method == http.MethodGet {
+				defer provider.Hold()()
+				defer filememo.Hold()()
+			} else if r.Method != http.MethodHead {
+				defer provider.Changed()
+			}
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func sourcePresets(wait time.Duration) []sourcePreset {
@@ -402,17 +489,19 @@ func stateHandler(version string) http.HandlerFunc {
 			removed = append(removed, row)
 		}
 		s := settings.Load()
-		writeJSON(w, map[string]any{"version": version, "gateway": gateway.URL(), "providers": suppliers, "removed": removed, "excluded": provider.Excluded(), "presets": sourcePresets(0), "models": settingsModels(shown, modelSuppliers), "hidden": settingsModels(hidden, modelSuppliers), "groups": provider.Groups(), "defaultModel": isDefault(), "catalog": catalog.Status(), "syncError": dshSyncError(), "chineseUnits": s.ChineseUnits, "quotaLeft": s.QuotaLeft})
+		writeJSON(w, map[string]any{"version": version, "gateway": gateway.URL(), "providers": suppliers, "removed": removed, "unmoved": provider.MoveCandidates(), "excluded": provider.Excluded(), "presets": sourcePresets(0), "models": settingsModels(shown, modelSuppliers), "hidden": settingsModels(hidden, modelSuppliers), "groups": provider.Groups(), "defaultModel": isDefault(), "catalog": catalog.Status(), "syncError": dshSyncError(), "chineseUnits": s.ChineseUnits, "quotaLeft": s.QuotaLeft, "runtimeRoutings": middleware.Routings()})
 	}
 }
 
 type settingsModel struct {
 	provider.Entry
-	ChannelID    string `json:"channelId"`
-	ChannelName  string `json:"channelName"`
-	SupplierID   string `json:"supplierId"`
-	SupplierName string `json:"supplierName"`
-	CanFast      bool   `json:"canFast,omitempty"`
+	ChannelID    string   `json:"channelId"`
+	ChannelName  string   `json:"channelName"`
+	SupplierID   string   `json:"supplierId"`
+	SupplierName string   `json:"supplierName"`
+	CanFast      bool     `json:"canFast,omitempty"`
+	Reasonless   bool     `json:"reasonless,omitempty"`
+	ServiceTiers []string `json:"serviceTiers,omitempty"`
 }
 
 // Relay catalogs label every model with the relay (for example Cursor), not
@@ -443,6 +532,7 @@ func settingsModels(entries []provider.Entry, sources map[string]map[string]stri
 	for _, e := range entries {
 		row := settingsModel{Entry: e, ChannelID: e.Provider.ID, ChannelName: e.Provider.Name}
 		row.CanFast = e.Group == "" && provider.CanFast(e.Provider, e.Model)
+		row.Reasonless, row.ServiceTiers = e.Reasonless, e.Tiers
 		if e.Group != "" {
 			row.ChannelID, row.ChannelName = "group", "路由组"
 			row.SupplierID, row.SupplierName = "group", "组合模型"
@@ -499,6 +589,9 @@ func patchHeaders(p *provider.Provider, changes map[string]*string) error {
 func syncConfiguration() error {
 	mutations.Lock()
 	defer mutations.Unlock()
+	if err := migratePluginReferences(); err != nil {
+		return err
+	}
 	err := syncDSH()
 	syncManagedAgents()
 	return err
@@ -518,7 +611,9 @@ func dshSyncError() string {
 // Background supplier refreshes and automatic cloud sync also change the
 // DSH model list. Queue the callback because provider writes can occur inside
 // an API mutation; the worker then sees the latest atomically stored catalog.
-func watchDSHCatalog(ctx context.Context) func() {
+func watchDSHCatalog(parent context.Context) func() {
+	ctx, cancel := context.WithCancel(parent)
+	done := make(chan struct{})
 	wake := make(chan struct{}, 1)
 	previous := catalog.Changed
 	catalog.Changed = func() {
@@ -531,6 +626,7 @@ func watchDSHCatalog(ctx context.Context) func() {
 		}
 	}
 	go func() {
+		defer close(done)
 		for {
 			select {
 			case <-ctx.Done():
@@ -541,13 +637,14 @@ func watchDSHCatalog(ctx context.Context) func() {
 				catalogSyncState.err = ""
 				if err != nil {
 					catalogSyncState.err = err.Error()
-					log.Printf("鲸桥后台 DSH 同步失败: %v", err)
+					log.Printf("鲸Bridge后台 DSH 同步失败: %v", err)
 				}
 				catalogSyncState.Unlock()
 			}
 		}
 	}()
-	return func() { catalog.Changed = previous }
+	var once sync.Once
+	return func() { once.Do(func() { cancel(); <-done; catalog.Changed = previous }) }
 }
 func mutate(fn func(http.ResponseWriter, *http.Request) error) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -557,6 +654,7 @@ func mutate(fn func(http.ResponseWriter, *http.Request) error) http.HandlerFunc 
 			http.Error(w, err.Error(), 400)
 			return
 		}
+		provider.Changed()
 		err := syncDSH()
 		syncManagedAgents()
 		if err != nil {

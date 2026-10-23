@@ -3,7 +3,7 @@ package gateway
 import (
 	"net/http"
 
-	"github.com/ChisaAlter/WhaleBridge/internal/middleware"
+	"github.com/ChisaAlter/WhaleBridge/internal/gwmw"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
@@ -16,7 +16,7 @@ func (s *Server) serveAgent(w http.ResponseWriter, r *http.Request, from provide
 	withGatewaySession(w, r)
 	w, recorded := recordConversation(w, r, from, body)
 	defer recorded()
-	run := middleware.Begin(middleware.Info{Protocol: string(from), Model: modelOf(body), Stream: streamOf(body), Path: r.URL.Path, Agent: agentOf(r)})
+	run := gwmw.Begin(gwmw.Info{Protocol: string(from), Model: modelOf(body), Stream: streamOf(body), Path: r.URL.Path, Agent: agentOf(r)})
 	if run == nil {
 		s.serve(w, r, from, body)
 		return

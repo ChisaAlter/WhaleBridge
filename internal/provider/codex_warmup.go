@@ -565,7 +565,7 @@ func keepWarm(ctx context.Context, name string, w codexWarmer, prefs func() (whi
 		}
 		// the wall clock, which goes on while the machine sleeps
 		now := w.now().Round(0)
-		if which, at := prefs(); warmLook(which, at, w.owned(), now1, last, now) {
+		if which, at := prefs(); !leftAlone(name) && warmLook(which, at, w.owned(), now1, last, now) {
 			last = now
 			c, cancel := context.WithTimeout(ctx, 2*time.Minute)
 			for _, r := range w.warmNow(c, which, at) {

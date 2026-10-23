@@ -60,7 +60,7 @@ func editGatewayCredential(path string, disconnect bool) (*yaml.Node, bool, erro
 	token := gatewayCredential()
 	current := member(refs, keyName)
 	if current != nil && current.Value != token {
-		return nil, false, fmt.Errorf("DSH 已有不同的鲸桥凭据，未覆盖用户配置")
+		return nil, false, fmt.Errorf("DSH 已有不同的鲸Bridge凭据，未覆盖用户配置")
 	}
 	if disconnect {
 		if current == nil {
@@ -70,7 +70,7 @@ func editGatewayCredential(path string, disconnect bool) (*yaml.Node, bool, erro
 		return &doc, true, nil
 	}
 	if token == "" {
-		return nil, false, fmt.Errorf("缺少鲸桥网关凭据")
+		return nil, false, fmt.Errorf("缺少鲸Bridge网关凭据")
 	}
 	if current != nil {
 		return &doc, false, nil

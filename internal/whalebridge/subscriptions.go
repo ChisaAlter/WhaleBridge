@@ -84,7 +84,7 @@ func subscriptionRoutes(mux *http.ServeMux) {
 				err = fmt.Errorf("缺少订阅适配器包名")
 			} else {
 				send(map[string]any{"phase": "downloading"})
-				_, err = plugin.AddWithProgress(ctx, pkg, func() {
+				_, err = provider.AddPluginWithProgress(ctx, pkg, func() {
 					send(map[string]any{"phase": "installing"})
 				})
 			}
@@ -146,6 +146,10 @@ func subscriptionRoutes(mux *http.ServeMux) {
 			}
 		}
 		provider.ForgetAccounts()
+		if err = migratePluginReferences(); err != nil {
+			fail("适配器已更新，但模型引用同步失败: "+err.Error(), 500)
+			return
+		}
 		err = syncDSH()
 		syncManagedAgents()
 		if err != nil {
@@ -255,7 +259,7 @@ func subscriptionRoutes(mux *http.ServeMux) {
 			provider.RefreshUsage(ctx, id, "")
 		}
 		qs := provider.LoginUsage(ctx, id)
-		if id == "cursor" && !provider.Moved(id) {
+		if id == "cursor" && !provider.PluginServes(id) {
 			qs = map[string]provider.SubscriptionQuota{}
 			for _, q := range provider.Quotas(ctx) {
 				if q.Provider == id {

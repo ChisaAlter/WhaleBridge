@@ -46,6 +46,13 @@ func Begin(info Info) *Run {
 	if s == nil || len(s.list) == 0 {
 		return nil
 	}
+	hooks := false
+	for _, m := range s.list {
+		hooks = hooks || m.hasReq || m.hasEv || m.hasResp
+	}
+	if !hooks {
+		return nil
+	}
 	b, _ := json.Marshal(info)
 	return &Run{set: s, info: b, insts: make([]*inst, len(s.list)), ctxs: make([]moejs.Value, len(s.list))}
 }

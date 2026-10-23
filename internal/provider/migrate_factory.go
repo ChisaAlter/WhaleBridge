@@ -3,6 +3,7 @@ package provider
 import (
 	"encoding/json"
 	"errors"
+	"strings"
 	"time"
 )
 
@@ -13,7 +14,7 @@ import (
 func init() {
 	movers["factory"] = &mover{
 		pkg:    "@magpie-community/opencode-factory-auth",
-		min:    "0.1.24", // a session continued after Claude Code compaction, whose restored context opens with the invoked-skills reminder (plugins #66); Claude Code's streamed context_management left out, which Factory's streaming route refuses (plugins #71); Claude Code's skill list sent alone as a system message, as text blocks or a string, gets update-config's line Factory takes (plugins #72); Claude Code 2.1.280's restored-context turn after /compact (plugins #68); pi's compaction and branch summary openings reworded (#1316); hook notifications kept in Claude Code compaction context only stop changed-file quoting, summaries quoted like tool output, a cut after a hunk separator (plugins #42); Claude Code compaction/runtime metadata and quoted session summaries (#1132); pi's opening sentence cut to its first half (#952); DeepSeek V4.1 Flash, Kimi K3 and GLM-5.2 offering none, so reasoning turned off stops their thinking (#899); requests saying droid 0.233.0 (JL: every model 403); Claude Code 2.1.288's runtime context as a system message of text blocks (#658); a tool whose input_schema has anyOf/oneOf/allOf at its root (Codex's automation_update) wrapped for Claude models (#646); a failure's status and its sign-in mark as the built-in's; Claude 5's system-role metadata as Factory takes it; Claude Code's standalone model-switch system updates; tool results quoting Claude Code's fixed phrases, and Claude Code's directory updates carrying a model; the sign-in renewed ahead of time through auth.refresh; Claude Code with a global CLAUDE.md or a SessionStart hook, and Claude Desktop's model line (#634)
+		min:    "0.1.37", // a session continued after Claude Code compaction, whose restored context opens with the invoked-skills reminder (plugins #66); Claude Code's streamed context_management left out, which Factory's streaming route refuses (plugins #71); Claude Code's skill list sent alone as a system message, as text blocks or a string, gets update-config's line Factory takes (plugins #72); Claude Code 2.1.280's restored-context turn after /compact (plugins #68); pi's compaction and branch summary openings reworded (#1316); hook notifications kept in Claude Code compaction context only stop changed-file quoting, summaries quoted like tool output, a cut after a hunk separator (plugins #42); Claude Code compaction/runtime metadata and quoted session summaries (#1132); pi's opening sentence cut to its first half (#952); DeepSeek V4.1 Flash, Kimi K3 and GLM-5.2 offering none, so reasoning turned off stops their thinking (#899); requests saying droid 0.233.0 (JL: every model 403); Claude Code 2.1.288's runtime context as a system message of text blocks (#658); a tool whose input_schema has anyOf/oneOf/allOf at its root (Codex's automation_update) wrapped for Claude models (#646); a failure's status and its sign-in mark as the built-in's; Claude 5's system-role metadata as Factory takes it; Claude Code's standalone model-switch system updates; tool results quoting Claude Code's fixed phrases, and Claude Code's directory updates carrying a model; the sign-in renewed ahead of time through auth.refresh; Claude Code with a global CLAUDE.md or a SessionStart hook, and Claude Desktop's model line (#634)
 		agents: []string{"factory"},
 		out: func() ([]Moving, error) {
 			ls := factoryLogins()
@@ -23,6 +24,13 @@ func init() {
 			var out []Moving
 			for _, l := range ls {
 				c := l.creds
+				if c.Key {
+					out = append(out, Moving{User: l.User, First: l.Active, On: l.On, Lapsed: l.Lapsed != "", Plan: l.Plan, Auth: map[string]any{
+						"type": "api", "key": c.Access,
+						"metadata": map[string]any{"email": c.Email, "userId": c.UserID, "region": c.Region, "premBaseHost": c.Prem},
+					}})
+					continue
+				}
 				out = append(out, Moving{User: l.User, First: l.Active, On: l.On, Lapsed: l.Lapsed != "", Plan: l.Plan, Auth: map[string]any{
 					"type":                 "oauth",
 					"access":               c.Access,
@@ -40,6 +48,9 @@ func init() {
 			return out, nil
 		},
 		back: func(ls []savedLogin, user string, auth map[string]any) ([]savedLogin, string, error) {
+			if str(auth["type"]) == "api" {
+				return factoryKeyBack(ls, user, auth)
+			}
 			access := str(auth["access"])
 			if access == "" {
 				return ls, "", errors.New("Factory: an unreadable plugin sign-in")
@@ -64,4 +75,25 @@ func init() {
 			return ls, ls[i].User, nil
 		},
 	}
+}
+
+// factoryKeyBack is used only to undo a partially completed move, keeping
+// a key account as a key rather than an OAuth account with no refresh.
+func factoryKeyBack(ls []savedLogin, user string, auth map[string]any) ([]savedLogin, string, error) {
+	key := strings.TrimSpace(str(auth["key"]))
+	if !strings.HasPrefix(key, factoryKeyPrefix) {
+		return ls, "", errors.New("Factory: an unreadable plugin API key")
+	}
+	md, _ := auth["metadata"].(map[string]any)
+	if user == "" {
+		user = firstNonEmpty(str(md["email"]), str(md["userId"]), factoryKeyName(key))
+	}
+	i := backInto(&ls, "factory", user)
+	c := factoryCreds{Access: key, Key: true, Email: str(md["email"]), UserID: str(md["userId"]), Region: str(md["region"]), Prem: str(md["premBaseHost"])}
+	b, err := json.Marshal(c)
+	if err != nil {
+		return ls, "", err
+	}
+	ls[i].Auth, ls[i].Lapsed, ls[i].Seen = b, "", time.Now().UTC().Truncate(time.Second)
+	return ls, ls[i].User, nil
 }

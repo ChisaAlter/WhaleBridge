@@ -203,6 +203,7 @@ type Weighed struct {
 	Shared   bool    `json:"shared,omitempty"` // its provider has more than one on
 	Known    bool    `json:"known,omitempty"`  // the vendor said what the account has left
 	Learns   bool    `json:"learns,omitempty"` // not known, but its answer will tell
+	Free     bool    `json:"free,omitempty"`   // Free first: this model costs no quota or credit
 	Used     float64 `json:"used"`             // share of the allowance counting the model, used
 	// Amount of Limit in Unit: the count that share is of, when the
 	// vendor counts it so (WorkBuddy's credits, #659)
@@ -366,6 +367,7 @@ func weighed(c candidate, p provider.Provider, wg weighing, fallback bool, from 
 	default:
 		w.Kind = "provider"
 	}
+	w.Free = wg.free[c.allowanceKey()]
 	if l, ok := wg.lefts[c.allowanceKey()]; ok {
 		w.Known, w.Used, w.Renews, w.Pace = true, l.used, l.renews, l.pace
 		if !l.fullest.IsZero() {

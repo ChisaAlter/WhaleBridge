@@ -20,10 +20,10 @@ package provider
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -91,23 +91,26 @@ func factoryAddKey(ctx context.Context, key string) ImportedAccount {
 	if user == "" {
 		return ImportedAccount{User: factoryKeyName(key), Status: "failed", Error: "Factory took the key but didn't say whose account it is"}
 	}
+	return factoryKeyToPlugin(wctx, user, c)
+}
+
+func factoryKeyToPlugin(ctx context.Context, user string, c factoryCreds) ImportedAccount {
 	status := "added"
-	if l, ok := factoryLookup(user); ok {
-		status = "updated"
-		if was, ok := factorySaved(l); ok && was.Key && was.Access == key {
+	for _, a := range pluginAuths("factory") {
+		md, _ := a["metadata"].(map[string]any)
+		switch {
+		case str(a["type"]) == "api" && str(a["key"]) == c.Access:
 			status = "exists"
+		case status == "added" && strings.EqualFold(firstNonEmpty(str(md["email"]), str(a["email"])), user):
+			status = "updated"
 		}
 	}
-	auth, err := json.Marshal(c)
-	if err != nil {
-		return ImportedAccount{User: user, Status: "failed", Error: err.Error()}
+	auth := map[string]any{"type": "api", "key": c.Access, "metadata": map[string]any{
+		"email": c.Email, "userId": c.UserID, "region": c.Region, "premBaseHost": c.Prem}}
+	if status != "exists" {
+		if _, err := importAuth(ctx, "factory", auth); err != nil {
+			return ImportedAccount{User: user, Status: "failed", Error: err.Error()}
+		}
 	}
-	if err := addSideLogin(savedLogin{Agent: "factory", User: user, Auth: auth}, "", func(savedLogin) {}); err != nil {
-		return ImportedAccount{User: user, Status: "failed", Error: err.Error()}
-	}
-	_ = editSideLogin("factory", user, func(ls []savedLogin, i int) ([]savedLogin, error) {
-		ls[i].Lapsed = ""
-		return ls, nil
-	})
 	return ImportedAccount{User: user, Status: status}
 }

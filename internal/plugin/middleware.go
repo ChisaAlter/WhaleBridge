@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -12,33 +13,50 @@ import (
 // path to a *.middleware.js (or .mjs). only is whether it is nothing
 // else: no OpenCode plugin for the host to load (no main, no exports).
 func Middleware(target string) (file string, only bool) {
+	file, only, _ = MiddlewareChecked(target)
+	return
+}
+
+// MiddlewareChecked also reports discovery failures, so a damaged manifest
+// cannot silently unregister a module that is already serving requests.
+func MiddlewareChecked(target string) (file string, only bool, err error) {
 	st, err := os.Stat(target)
 	if err != nil {
-		return "", false
+		return "", false, err
 	}
 	if !st.IsDir() {
 		base := strings.ToLower(filepath.Base(target))
-		if strings.HasSuffix(base, ".middleware.js") || strings.HasSuffix(base, ".middleware.mjs") {
-			return target, true
+		for _, ext := range []string{".middleware.js", ".middleware.mjs", ".middleware.ts", ".gateway.js", ".gateway.mjs", ".gateway.ts"} {
+			if strings.HasSuffix(base, ext) {
+				return target, true, nil
+			}
 		}
-		return "", false
+		return "", false, nil
 	}
 	b, err := os.ReadFile(filepath.Join(target, "package.json"))
 	if err != nil {
-		return "", false
+		return "", false, err
 	}
 	var pkg struct {
 		Main    string          `json:"main"`
 		Exports json.RawMessage `json:"exports"`
 		Magpie  struct {
 			Middleware string `json:"middleware"`
+			Gateway    string `json:"gateway"`
 		} `json:"magpie"`
 	}
-	if json.Unmarshal(b, &pkg) != nil || strings.TrimSpace(pkg.Magpie.Middleware) == "" {
-		return "", false
+	if json.Unmarshal(b, &pkg) != nil {
+		return "", false, fmt.Errorf("the plugin package manifest cannot be decoded")
 	}
-	file = filepath.Join(target, filepath.FromSlash(strings.TrimSpace(pkg.Magpie.Middleware)))
-	return file, pkg.Main == "" && len(pkg.Exports) == 0
+	name := strings.TrimSpace(pkg.Magpie.Middleware)
+	if name == "" {
+		name = strings.TrimSpace(pkg.Magpie.Gateway)
+	}
+	if name == "" {
+		return "", false, nil
+	}
+	file = filepath.Join(target, filepath.FromSlash(name))
+	return file, pkg.Main == "" && len(pkg.Exports) == 0, nil
 }
 
 // ListStamp changes when plugins.json does.

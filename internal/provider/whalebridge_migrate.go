@@ -2,27 +2,45 @@ package provider
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"maps"
+	"strings"
 	"time"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
-// whaleBridgeOwnAccounts keeps automatic maintenance within credentials
-// issued or imported into this component. Explicit Move/Adopt remain the
-// user's choice, including when they choose to take a native login.
-func whaleBridgeOwnAccounts(id string, accounts []Moving) bool {
+// whaleBridgeMoveAllowed checks the entire batch. An agent's own sign-in
+// or a borrowed credential cannot be claimed by unattended maintenance.
+// The explicit Move API remains the user's choice to hand one over.
+func whaleBridgeMoveAllowed(id string, accounts []Moving) error {
+	var native []string
 	for _, a := range accounts {
-		if WhaleBridgeBorrowing(id, a.User) {
-			return false
+		if a.Own || WhaleBridgeBorrowing(id, a.User) {
+			native = append(native, a.User)
 		}
 	}
-	return true
+	if len(native) == 0 {
+		return nil
+	}
+	users := strings.Join(native, ", ")
+	return &moveError{
+		why: MoveWhy{Code: "native", Args: map[string]string{"name": nameOf(id), "users": users}},
+		msg: fmt.Sprintf("%s has native or borrowed accounts (%s); automatic migration skipped the entire batch. Choose Move explicitly to hand them to the plugin.", nameOf(id), users),
+	}
+}
+
+// whaleBridgeOwnAccounts is kept as a small predicate for callers which
+// only need to inspect eligibility; execution uses the diagnostic gate.
+func whaleBridgeOwnAccounts(id string, accounts []Moving) bool {
+	return whaleBridgeMoveAllowed(id, accounts) == nil
 }
 
 // WhaleBridgeHandOver adopts an installed provider plugin and transfers
-// component-owned accounts. A native client's borrowed login stays in place.
+// component-owned accounts. A mixed batch stays entirely at its source.
 func WhaleBridgeHandOver(ctx context.Context) map[string]error {
-	return handOverAccounts(ctx, true, whaleBridgeOwnAccounts)
+	return handOverAccounts(ctx, true, whaleBridgeMoveAllowed)
 }
 
 func KeepWhaleBridgeRetiringMoved(ctx context.Context) {
@@ -34,16 +52,20 @@ func KeepWhaleBridgeRetiringMoved(ctx context.Context) {
 			return
 		case <-t.C:
 		}
+		if settings.AccountDiscoveryOff() {
+			t.Reset(time.Hour)
+			continue
+		}
 		keepMovedCurrent(ctx)
-		moves := moveRetiring(ctx, whaleBridgeOwnAccounts)
+		moves := moveRetiring(ctx, whaleBridgeMoveAllowed)
 		maps.Copy(moves, WhaleBridgeHandOver(ctx))
 		for id, err := range moves {
 			if err != nil {
-				log.Printf("moving %s to its plugin: %s (it stays built-in)", id, err)
+				log.Printf("moving %s to its plugin: %s", id, err)
 			} else {
 				log.Printf("moved %s to its plugin, %s", id, MovePackage(id))
 			}
 		}
-		t.Reset(time.Hour)
+		t.Reset(nextRetiringRun())
 	}
 }

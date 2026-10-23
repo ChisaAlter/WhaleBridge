@@ -33,7 +33,7 @@ func TestGlobalSearchKeysAndOptionalYou(t *testing.T) {
 	if err := json.Unmarshal(raw, &state); err != nil {
 		t.Fatal(err)
 	}
-	if len(state.Searches) != 2 || state.Searches[0].KeyMasked != "tvly…cret, tvly…cret" || !state.Searches[0].KeySet || !state.Searches[0].Ready {
+	if len(state.Searches) != 2 || state.Searches[0].KeyMasked != "tvly-…cret, tvly-…cret" || !state.Searches[0].KeySet || !state.Searches[0].Ready {
 		t.Fatalf("multi-key search state was lost: %+v", state.Searches)
 	}
 	if state.Searches[1].Vendor != "you" || state.Searches[1].KeySet || !state.Searches[1].Ready {

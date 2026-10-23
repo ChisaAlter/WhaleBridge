@@ -137,7 +137,12 @@ func (s *Server) retrieve(path, operation string) http.HandlerFunc {
 		// to go unmasked (provider.SkipsRedaction)
 		if slices.ContainsFunc(tries, func(c candidate) bool { return !c.p.SkipsRedaction() }) {
 			var done func()
-			w, all, done = redacted(w, all)
+			var maskErr error
+			w, all, done, maskErr = redacted(w, all)
+			if maskErr != nil {
+				writeError(w, provider.Chat, http.StatusServiceUnavailable, maskErr.Error())
+				return
+			}
 			defer done()
 			json.Unmarshal(all, &req)
 		}

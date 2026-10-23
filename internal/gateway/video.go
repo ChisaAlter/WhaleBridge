@@ -23,7 +23,6 @@ import (
 
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
-	"github.com/ChisaAlter/WhaleBridge/internal/redact"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 	"github.com/ChisaAlter/WhaleBridge/internal/usage"
 )
@@ -706,7 +705,11 @@ func (s *Server) videosCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var unmask func()
-	w, f.Prompt, unmask = redactedPrompt(w, f.Prompt)
+	w, f.Prompt, unmask, err = redactedPrompt(w, f.Prompt)
+	if err != nil {
+		fail(http.StatusServiceUnavailable, err.Error())
+		return
+	}
 	defer unmask()
 	// another magpie is asked at its videos API, which says itself what
 	// it can't make
@@ -827,9 +830,17 @@ func (s *Server) openAIVideo(ctx context.Context, p provider.Provider, vendorID,
 // videosGet answers how a video is going.
 func (s *Server) videosGet(w http.ResponseWriter, r *http.Request) {
 	// A later poll can echo the prompt masked when the video was created.
-	rw := redact.NewWriter(w)
-	defer rw.Finish()
-	w = rw
+	m, maskErr := requestMasker()
+	if maskErr != nil {
+		writeError(w, provider.Chat, http.StatusServiceUnavailable, maskErr.Error())
+		return
+	}
+	w, done, maskErr := wrapMasker(w, m)
+	if maskErr != nil {
+		writeError(w, provider.Chat, http.StatusServiceUnavailable, maskErr.Error())
+		return
+	}
+	defer done()
 	id := r.PathValue("id")
 	p, vendorID, started, err := videoMaker(id)
 	if err != nil {
@@ -933,7 +944,7 @@ func (s *Server) videosContent(w http.ResponseWriter, r *http.Request) {
 		writeError(w, provider.Chat, 502, err.Error())
 		return
 	}
-	res, err := s.client.Do(req)
+	res, err := vendorClient(p).Do(req)
 	if err != nil {
 		writeError(w, provider.Chat, 502, fmt.Sprintf("the video couldn't be fetched: %v", err))
 		return

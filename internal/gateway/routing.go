@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/routes"
 	"github.com/ChisaAlter/WhaleBridge/internal/usage"
 )
 
@@ -33,10 +34,9 @@ const usageHalfLife = time.Hour
 
 var routed = struct {
 	sync.Mutex
-	turn     map[string]int      // provider → requests routed in turn
 	used     map[string]tokenUse // candidate restKey → tokens it served
 	failures map[string]int      // candidate restKey → failures since it last answered
-}{turn: map[string]int{}, used: map[string]tokenUse{}, failures: map[string]int{}}
+}{used: map[string]tokenUse{}, failures: map[string]int{}}
 
 type tokenUse struct {
 	n  float64
@@ -181,6 +181,8 @@ const (
 	// failFloor: the request asked for a shorter reply than the provider
 	// gives, and is sent again asking for the least it takes
 	failFloor = "floor"
+	// failRoom: the prompt fits when its requested reply is made smaller.
+	failRoom = "room"
 	// failUpdate: the upstream turned away the configuration_update items
 	// a changed effort went as (#617), and the request is sent again
 	// without them
@@ -773,7 +775,7 @@ func (s *Server) rateRest(c candidate, header http.Header, body []byte, sharedPo
 // unless the vendor said it was out (#530).
 func (c candidate) full(now time.Time) time.Time {
 	a, _ := c.allowance()
-	return a.Full(c.model, provider.SpentShareOf(c.p.Routing), now)
+	return a.Full(c.model, provider.SpentShareOf(routingOf(c.p.Routing)), now)
 }
 
 // allowance is the candidate's allowance as last known: a subscription
@@ -866,14 +868,6 @@ func retryAfter(h http.Header, now time.Time) time.Duration {
 
 var allowances = provider.Allowances
 
-// Shares of an allowance past which an account is kept for when the others
-// can't take a request: low, and all but used up — where the agent signed
-// in to it is signed in to another, too (provider.SpentShare).
-const (
-	lowShare  = 90
-	usedShare = provider.SpentShare
-)
-
 // route orders one provider's candidates as its routing says.
 func route(p provider.Provider, cs []candidate, model string, from provider.Protocol) []candidate {
 	cs, _ = weigh(p, cs, model, from)
@@ -885,6 +879,7 @@ func route(p provider.Provider, cs []candidate, model string, from provider.Prot
 // each served lately. The routing trace shows the same.
 type weighing struct {
 	lefts map[allowanceKey]left // the allowance of each account and model
+	free  map[allowanceKey]bool // Free first only: classification of this exact model
 
 	tokens map[string]float64 // least used: tokens each served lately
 }
@@ -935,7 +930,31 @@ func weigh(p provider.Provider, cs []candidate, model string, from provider.Prot
 	return cs, wg
 }
 
-// weighRouted is weigh by the routing alone.
+// routingOf gives the effective policy for planning outside ordering too.
+// An inactive or unknown strategy behaves as listed order everywhere.
+func routingOf(routing string) string {
+	if routing == "" || routing == provider.Manual || routes.Served(routing) {
+		return routing
+	}
+	return provider.Ordered
+}
+
+func rotates(routing string) bool {
+	st, ok := routes.Find(routing)
+	return ok && st.Rotates()
+}
+
+func weighsByWeight(routing string) bool {
+	st, ok := routes.Find(routing)
+	return ok && st.Weighted()
+}
+
+func goesRound(routing string) bool {
+	st, ok := routes.Find(routing)
+	return ok && (st.Rotates() || st.Weighted())
+}
+
+// weighRouted is weigh by the currently registered strategy alone.
 func weighRouted(p provider.Provider, cs []candidate, model string, from provider.Protocol) ([]candidate, weighing) {
 	var wg weighing
 	if len(cs) == 0 {
@@ -947,7 +966,17 @@ func weighRouted(p provider.Provider, cs []candidate, model string, from provide
 	known := map[string]map[string]provider.Allowance{}
 	now := time.Now()
 	wg.lefts = map[allowanceKey]left{}
+	st, served := routes.Find(p.Routing)
+	if served && st.ByFree {
+		wg.free = map[allowanceKey]bool{}
+	}
 	for _, c := range cs {
+		// Reading a model list to classify cost belongs only to Free first.
+		// Keep even a lone candidate's result for its trace, by model as
+		// well as account: one account can serve both free and paid models.
+		if wg.free != nil {
+			wg.free[c.allowanceKey()] = c.p.FreeModel(c.model)
+		}
 		var a provider.Allowance
 		var ok bool
 		if c.p.Account == nil {
@@ -970,208 +999,37 @@ func weighRouted(p provider.Provider, cs []candidate, model string, from provide
 				restarts: rs, dueRestart: !rs.IsZero() && due.Equal(rs)} // one not known counts as unused
 		}
 	}
-	if len(cs) < 2 {
+	if len(cs) < 2 || !served {
 		return cs, wg
 	}
-	lefts := wg.lefts
-	shareOf := func(c candidate) float64 { return lefts[c.allowanceKey()].used }
-	switch p.Routing {
-	case "":
-		// of those with quota to spare, the one whose allowance renews
-		// soonest, since what it has left is lost then, while one renewing
-		// later keeps: the biggest window decides — the week, not the five
-		// hours in it — and the next one only when that renews in the
-		// same hour. An account with no week (Claude Enterprise's five
-		// hours alone) goes by its five hours, so ahead of every week
-		// but one renewing sooner; a window not started renews its whole
-		// span from now (#576). A Codex account that spends a reset about
-		// to run out by itself (auto-use on, its windows used) renews when
-		// that is spent, if sooner: what it has left is lost there just the
-		// same (#718). Only holding one, or one that runs out after the
-		// week renews, changes nothing. Those alike stay in their order, keeping the vendor's
-		// prompt cache warm. Past that, whichever has the most left, and
-		// one all but used up only when nothing else can take it. Only the
-		// windows that count the model do: Opus's own weekly allowance
-		// being used up leaves Sonnet alone.
-		var fine, low, spent []candidate
-		for _, c := range cs {
-			switch v := shareOf(c); {
-			case v >= usedShare:
-				spent = append(spent, c)
-			case v >= lowShare:
-				low = append(low, c)
-			default:
-				fine = append(fine, c)
-			}
+	seats := make([]routes.Seat, len(cs))
+	routed.Lock()
+	for i, c := range cs {
+		l, known := wg.lefts[c.allowanceKey()]
+		pace := l.pace
+		if !known && c.p.Account != nil {
+			pace = provider.FreshPace
 		}
-		// one not known that tells what it has left as it answers goes
-		// first, once: else, kept after those known, it would never answer
-		// and never be known (Anthropic's usage endpoint can turn
-		// magpie away for hours)
-		sort.SliceStable(fine, func(i, j int) bool {
-			if li, lj := learns(fine[i], lefts), learns(fine[j], lefts); li != lj {
-				return li
-			}
-			ri, rj := lefts[fine[i].allowanceKey()].soon, lefts[fine[j].allowanceKey()].soon
-			for k := 0; k < len(ri) || k < len(rj); k++ {
-				var a, b time.Time // to the hour, so a few minutes don't reorder
-				if k < len(ri) {
-					a = ri[k].Truncate(time.Hour)
-				}
-				if k < len(rj) {
-					b = rj[k].Truncate(time.Hour)
-				}
-				switch {
-				case a.Equal(b):
-					continue
-				case a.IsZero() || b.IsZero(): // not known: after those known
-					return b.IsZero()
-				}
-				return a.Before(b)
-			}
-			return false
-		})
-		for _, l := range [][]candidate{low, spent} {
-			sort.SliceStable(l, func(i, j int) bool {
-				return shareOf(l[i]) < shareOf(l[j])
-			})
-		}
-		cs = append(append(fine, low...), spent...)
-	case provider.Ordered:
-		return cs, wg
-	case provider.Rotate:
-		routed.Lock()
-		n := routed.turn[p.ID] % len(cs)
-		routed.turn[p.ID]++
-		routed.Unlock()
-		cs = append(append([]candidate{}, cs[n:]...), cs[:n]...)
-	case provider.Weighted:
-		cs = weightedFirst(p.ID, cs)
-	case provider.LeastUsed:
-		// a subscription, or a key that reads its own windows, by the
-		// share of its allowance used, as the vendor says; then, and for
-		// other keys, by what magpie sent it lately
-		routed.Lock()
-		tokens := make([]float64, len(cs))
+		seats[i] = routes.Seat{Key: c.rest, Account: c.p.Account != nil, Known: known, Learns: learns(c, wg.lefts),
+			Used: l.used, Soon: l.soon, Pace: pace, Weight: keyWeight(c), Resting: resting(c),
+			Tokens: routed.used[c.restKey()].now(now), Free: wg.free[c.allowanceKey()]}
+	}
+	routed.Unlock()
+	if st.ByUse {
 		wg.tokens = map[string]float64{}
 		for i, c := range cs {
-			tokens[i] = routed.used[c.restKey()].now(now)
-			wg.tokens[c.rest] = tokens[i]
+			wg.tokens[c.rest] = seats[i].Tokens
 		}
-		routed.Unlock()
-		idx := make([]int, len(cs))
-		for i := range idx {
-			idx[i] = i
-		}
-		sort.SliceStable(idx, func(a, b int) bool {
-			ca, cb := cs[idx[a]], cs[idx[b]]
-			if sa, sb := shareOf(ca), shareOf(cb); sa != sb {
-				return sa < sb
-			}
-			return tokens[idx[a]] < tokens[idx[b]]
-		})
-		out := make([]candidate, len(cs))
-		for i, j := range idx {
-			out[i] = cs[j]
-		}
-		cs = out
-	case provider.Pace:
-		// a subscription by what it has left of its week per hour until
-		// that renews, the most first: it has the most to lose at the
-		// reset, where the most left alone (least used) sends a fresh
-		// account ahead of one with 80% left and an hour to go, and the
-		// soonest reset alone (smart) sends one with 3% left and an hour
-		// to go ahead of one with 90% and two. The tiers are Smart's: one
-		// at 90% or more of any window that counts the model — the five
-		// hours too, a rate cap it would be sent into before its
-		// allowance was read again — waits until the others can't answer,
-		// one all but used up until nothing else can; each tier by the
-		// share used. Among the rest, one not known that tells what it
-		// has left as it answers goes first while it isn't, as in Smart,
-		// else it would never be known; then the pace, those alike within
-		// a tenth by what magpie sent them lately, then in their order,
-		// keeping the vendor's prompt cache warm. An account not known
-		// counts as a whole week ahead of it; a key has no week, unless it
-		// reads its own windows (a sub2api key's limits). A Codex
-		// account that spends a reset about to run out by itself goes by
-		// the hours until then when that is sooner (Allowance.Pace, #717).
-		paceOf := func(c candidate) float64 {
-			if l, ok := lefts[c.allowanceKey()]; ok {
-				return l.pace
-			}
-			if c.p.Account != nil {
-				return provider.FreshPace
-			}
-			return 0
-		}
-		tier := func(share float64) int {
-			switch {
-			case share >= usedShare:
-				return 2
-			case share >= lowShare:
-				return 1
-			}
-			return 0
-		}
-		// the bands of pace alike within a tenth, the highest first: drawn
-		// before sorting, from each band's highest down, so that sorting
-		// by them is consistent — "within a tenth of each other" alone is
-		// not, three paces a twelfth apart each going round in a circle.
-		// Drawn among those the pace orders alone — one running low
-		// would otherwise set a band's top and part two alike behind it
-		var byPace []int
-		for i, c := range cs {
-			if tier(shareOf(c)) == 0 && !learns(c, lefts) {
-				byPace = append(byPace, i)
-			}
-		}
-		sort.SliceStable(byPace, func(a, b int) bool { return paceOf(cs[byPace[a]]) > paceOf(cs[byPace[b]]) })
-		band, top := make([]int, len(cs)), 0.0
-		for k, i := range byPace {
-			if p := paceOf(cs[i]); k == 0 || p < 0.9*top {
-				top = p
-				if k > 0 {
-					band[i] = band[byPace[k-1]] + 1
-					continue
-				}
-			} else {
-				band[i] = band[byPace[k-1]]
-			}
-		}
-		routed.Lock()
-		tokens := make([]float64, len(cs))
-		wg.tokens = map[string]float64{}
-		for i, c := range cs {
-			tokens[i] = routed.used[c.restKey()].now(now)
-			wg.tokens[c.rest] = tokens[i]
-		}
-		routed.Unlock()
-		idx := make([]int, len(cs))
-		for i := range idx {
-			idx[i] = i
-		}
-		sort.SliceStable(idx, func(a, b int) bool {
-			ca, cb := cs[idx[a]], cs[idx[b]]
-			sa, sb := shareOf(ca), shareOf(cb)
-			if ta, tb := tier(sa), tier(sb); ta != tb {
-				return ta < tb
-			} else if ta > 0 {
-				if sa != sb {
-					return sa < sb
-				}
-			} else if la, lb := learns(ca, lefts), learns(cb, lefts); la != lb {
-				return la
-			} else if band[idx[a]] != band[idx[b]] {
-				return band[idx[a]] < band[idx[b]]
-			}
-			return tokens[idx[a]] < tokens[idx[b]]
-		})
-		out := make([]candidate, len(cs))
-		for i, j := range idx {
-			out[i] = cs[j]
-		}
-		cs = out
-	default:
+	}
+	order, receipt := routes.ApplyPick(st, p.ID, seats)
+	out := make([]candidate, 0, len(cs))
+	for _, i := range order {
+		c := cs[i]
+		c.roundPick = receipt
+		out = append(out, c)
+	}
+	cs = out
+	if st.Exact {
 		return cs, wg
 	}
 	if p.Account == nil {

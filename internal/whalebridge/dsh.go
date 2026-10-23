@@ -2,14 +2,13 @@ package whalebridge
 
 import (
 	"fmt"
-
-	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
-	"github.com/ChisaAlter/WhaleBridge/internal/provider"
-	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 	"os"
-
 	"slices"
 	"sync"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/filememo"
+	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
 const keyName = "WHALEBRIDGE_GATEWAY_KEY"
@@ -26,6 +25,17 @@ type routeModel struct {
 	ReasoningEfforts    map[string]string `yaml:"reasoningEfforts,omitempty"`
 }
 
+// DSH reserves maxTokens plus 65536 before it compacts. A catalog default
+// leaves half the window for messages, or caps output at a quarter where
+// that gives more room. An explicit output setting keeps the user's value.
+func dshOutput(m provider.Entry) int {
+	n := m.PublishedOutput()
+	if m.OutputSet || m.Context <= 0 || n <= 0 {
+		return n
+	}
+	return min(n, max(1, max(m.Context/4, m.Context/2-65536)))
+}
+
 func syncDSH() error {
 	home := os.Getenv("WHALEBRIDGE_DSH_HOME")
 	if home == "" {
@@ -33,14 +43,16 @@ func syncDSH() error {
 	}
 	dshWrites.Lock()
 	defer dshWrites.Unlock()
+	defer provider.Hold()()
+	defer filememo.Hold()()
 	models, _ := provider.CatalogFor("dsh")
 	labels := provider.Labels(models)
-	modelSettings := settings.Load()
+	modelSettings := provider.HeldSettings()
 	findGroup := provider.GroupFinder()
 	compactAt := modelSettings.Compact()
 	out := make([]routeModel, 0, len(models))
 	for i, m := range models {
-		row := routeModel{ID: m.ID, Name: labels[i], ContextWindow: m.Context, MaxTokens: m.Output}
+		row := routeModel{ID: m.ID, Name: labels[i], ContextWindow: m.Context, MaxTokens: dshOutput(m)}
 		row.CompactionThreshold = provider.CompactFor(modelSettings, m, findGroup)
 		if row.CompactionThreshold == 0 && compactAt > 0 && row.ContextWindow > compactAt {
 			row.CompactionThreshold = compactAt
@@ -74,7 +86,7 @@ func syncDSH() error {
 		API         string       `yaml:"api"`
 		BaseURL     string       `yaml:"baseURL"`
 		Models      []routeModel `yaml:"models"`
-	}{"鲸桥", keyName, "openai-completions", gateway.URL() + "/v1", out}
+	}{"鲸Bridge", keyName, "openai-completions", gateway.URL() + "/v1", out}
 	return updateProfile(home, route, false)
 }
 

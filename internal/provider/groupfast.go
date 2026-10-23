@@ -48,7 +48,8 @@ func (g Group) IsFast(id string) bool {
 // CanFast reports whether model, as p serves it, has a fast mode magpie
 // can ask for: a ChatGPT account's GPT models (Codex's Fast), Cursor's
 // models with a -fast one, an OpenAI key's GPT and o-series models on its
-// Responses API (priority processing), and an Anthropic key's Opus models with fast mode.
+// Responses API (priority processing), an Anthropic key's Opus models with
+// fast mode, and plugin models declared at priority on Chat or Responses.
 // A Claude subscription runs Claude Code itself, and a cloud (Bedrock,
 // Vertex) refuses the field, so neither is. A provider the user added by
 // its address (AddedByAddress) is asked for priority on a GPT model it
@@ -58,6 +59,9 @@ func (g Group) IsFast(id string) bool {
 // without it and not sent it again (the gateway's optional fields).
 func CanFast(p Provider, model string) bool {
 	if p.IsPlugin() {
+		if slices.Contains(PluginTiers(p, model), "priority") {
+			return true
+		}
 		// Cursor's plugin runs a model as its fast variant when the chat
 		// request says service_tier "priority". From 0.2.2 it lists a model
 		// once per context size (claude-opus-5-5@300k) and says fast on

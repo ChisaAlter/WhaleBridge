@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/routes"
 )
 
 // A group routed by weight (#1910, DD on Discord): members weighing 3, 1
@@ -32,11 +33,7 @@ func TestWeightedGroup(t *testing.T) {
 		{ID: "group/wsub", Path: []string{"group/wsub", "wc/m"}, Via: []provider.Group{sub}, Provider: c, Model: "m"},
 		{ID: "group/wsub", Path: []string{"group/wsub", "wd/m"}, Via: []provider.Group{sub}, Provider: d, Model: "m"},
 	}
-	t.Cleanup(func() {
-		wrr.Lock()
-		delete(wrr.m, provider.GroupPrefix+g.ID)
-		wrr.Unlock()
-	})
+	t.Cleanup(func() { routes.Forget(provider.GroupPrefix + g.ID) })
 	unitOf := map[string]string{"wa": "a", "wb": "b", "wc": "sub", "wd": "sub"}
 	plan := func() []candidate {
 		t.Helper()
@@ -98,9 +95,7 @@ func TestWeightedGroup(t *testing.T) {
 	if cs := plan(); cs[len(cs)-1].p.ID != "wa" {
 		t.Fatalf("the resting member isn't last: %s", restsOf(cs))
 	}
-	wrr.Lock()
-	delete(wrr.m, provider.GroupPrefix+g.ID)
-	wrr.Unlock()
+	routes.Forget(provider.GroupPrefix + g.ID)
 	if got := counts(5*20, nil); got["a"] != 0 || got["b"] != 20 || got["sub"] != 80 {
 		t.Fatalf("with wa resting, 1:4 over 100: %v", got)
 	}
@@ -108,9 +103,7 @@ func TestWeightedGroup(t *testing.T) {
 
 	// a conversation kept on wb each round of eight: the round counts it
 	// against wb
-	wrr.Lock()
-	delete(wrr.m, provider.GroupPrefix+g.ID)
-	wrr.Unlock()
+	routes.Forget(provider.GroupPrefix + g.ID)
 	got := counts(8*10, func(i int, cs []candidate) candidate {
 		if i%8 != 0 || cs[0].p.ID == "wb" {
 			return cs[0]

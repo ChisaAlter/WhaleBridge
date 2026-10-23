@@ -289,8 +289,25 @@ func (a *Account) Levels(model string) (levels []string, ok bool) {
 // model, when its list says: a list that gives no model a tier doesn't
 // say, as one fetched before ChatGPT listed them.
 func (a *Account) Tiers(model string) (tiers []string, ok bool) {
-	if a == nil || a.plugin != nil {
+	if a == nil {
 		return nil, false
+	}
+	if a.plugin != nil {
+		pp, found := PluginOf(PluginID(a.plugin.ID))
+		if !found {
+			return nil, false
+		}
+		if !a.pluginLists(model) {
+			return nil, true // this account's explicit list lacks the model
+		}
+		m, found := pluginModel(pp, model)
+		if !found || len(m.ServiceTiers) == 0 {
+			return nil, false // no declaration is unknown, not unsupported
+		}
+		if to := pluginProtocol(pp.ID, m); to != Chat && to != Responses {
+			return nil, true
+		}
+		return slices.Clone(m.ServiceTiers), true
 	}
 	live, _, found := catalog.Live(accountModels(a.Agent, a.User))
 	if !found || !slices.ContainsFunc(live, func(m catalog.Model) bool { return len(m.Tiers) > 0 }) {
@@ -630,10 +647,10 @@ func CodexTiers(m *catalog.Model, e Entry, members func(id string) []Member) {
 	// a provider the user added by its address is sent the tier Codex
 	// asks for as it is (hsiangron on X)
 	m.OwnTier = e.Group == "" && e.Provider.Preset == "" && e.Provider.Account == nil && e.Provider.ID != ""
-	// another magpie offers the tiers its own Codex is offered on the
-	// model, and is sent the one Codex asks for as it is (#1234)
-	if e.Group == "" && e.Provider.IsRemoteMagpie() {
-		m.Tiers = e.Tiers
+	// A remote magpie or provider plugin declares the tiers offered on
+	// this model. A translated plugin request keeps only a declared tier.
+	if e.Group == "" && (e.Provider.IsRemoteMagpie() || e.Provider.IsPlugin() && len(e.Tiers) > 0) {
+		m.Tiers = slices.Clone(e.Tiers)
 	}
 	if e.Group != "" {
 		for _, mb := range members(e.ID) {

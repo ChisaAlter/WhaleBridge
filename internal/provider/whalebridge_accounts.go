@@ -10,7 +10,7 @@ import (
 // WhaleBridgeLogins includes Cursor's single native login. Its upstream
 // adapter supplies a saved-account list only after an explicit migration.
 func WhaleBridgeLogins(id string) []Login {
-	if id != "cursor" || Moved(id) {
+	if id != "cursor" || PluginServes(id) {
 		return Logins(id)
 	}
 	p, err := Find(id)
@@ -36,9 +36,17 @@ func WhaleBridgeBorrowing(id, user string) bool {
 		}
 		return true
 	}
-	for _, l := range Logins(id) {
-		if strings.EqualFold(l.User, user) {
-			return l.Own
+	// Serving gates make Logins(id) the plugin's list after retirement.
+	// Ownership must come from the source row, never that replacement list.
+	mv := movers[id]
+	loginsMu.Lock()
+	defer loginsMu.Unlock()
+	for _, l := range readLogins() {
+		if (l.Agent == id || mv != nil && slices.Contains(mv.agents, l.Agent)) && strings.EqualFold(l.User, user) {
+			if l.Owned {
+				return false
+			}
+			return l.own()
 		}
 	}
 	return false
@@ -52,7 +60,7 @@ func whaleBridgeHiddenLogin(id, user string) bool {
 }
 
 func WhaleBridgeSetLoginOn(id, user string, on bool) error {
-	if id == "cursor" && !Moved(id) {
+	if id == "cursor" && !PluginServes(id) {
 		p, err := Find(id)
 		if err != nil {
 			return err
@@ -68,7 +76,7 @@ func WhaleBridgeSetLoginOn(id, user string, on bool) error {
 // A borrowed native credential is forgotten in this component, never signed
 // out or deleted in its owner. A new component sign-in replaces this marker.
 func WhaleBridgeForgetLogin(id, user string) error {
-	if id == "cursor" && !Moved(id) {
+	if id == "cursor" && !PluginServes(id) {
 		return Delete(id)
 	}
 	if (id != "claude" && id != "codex") || !WhaleBridgeBorrowing(id, user) {

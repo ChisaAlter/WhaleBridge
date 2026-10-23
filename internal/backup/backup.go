@@ -194,14 +194,21 @@ func Collect(keys bool, app string) (Bundle, error) {
 		searches = append(searches, a)
 	}
 	b.Searches = &searches
+	// Unknown settings must not be carried as defaults to a backup or
+	// every computer it is synced to. Only a missing file is no settings.
 	if _, err := os.Stat(settings.Path()); err == nil {
-		s := settings.Load()
+		s, err := settings.LoadChecked()
+		if err != nil {
+			return b, err
+		}
 		if !keys {
 			s.LANKey, s.LANKeyID = "", ""
 			s.OTel.Headers = nil
 			s.GitHubToken = ""
 		}
 		b.Settings = &s
+	} else if !os.IsNotExist(err) {
+		return b, fmt.Errorf("could not read settings at %s: %w", settings.Path(), err)
 	}
 	return b, nil
 }

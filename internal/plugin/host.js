@@ -1319,6 +1319,8 @@ async function info(id, key, strict) {
         ...(m.modalities?.output ? { output: modalities(m.modalities.output) } : {}),
       },
       variants: m.variants ?? was?.variants ?? {},
+      // Keep a config hook's declaration as well as a models hook's.
+      serviceTiers: m.serviceTiers ?? was?.serviceTiers,
       // magpie's own mark: a decision model, answering System One
       ...(typeof m.decides === "boolean" ? { decides: m.decides } : was?.decides !== undefined ? { decides: was.decides } : {}),
     }
@@ -1380,6 +1382,7 @@ function methods(auth) {
   return (auth.methods ?? []).map((m) => ({
     type: m.type,
     label: m.label,
+    ...(m.type === "api" && m.keyless === true && typeof m.authorize === "function" ? { keyless: true } : {}),
     ...(m.type === "api" && shown(m.placeholder, 200) ? { placeholder: shown(m.placeholder, 200) } : {}),
   }))
 }
@@ -1420,6 +1423,19 @@ function rateOf(v) {
   return typeof n === "number" && Number.isFinite(n) && n > 0 ? n : 0
 }
 
+// tiersOf reads the service tiers a plugin says a model serves
+// (m.serviceTiers): ids ("priority", "ultrafast"), or objects with an id as
+// Codex's catalog writes them; anything else is dropped.
+function tiersOf(v) {
+  if (!Array.isArray(v)) return []
+  const out = []
+  for (const t of v) {
+    const id = typeof t === "string" ? t.trim() : typeof t?.id === "string" ? t.id.trim() : ""
+    if (id && !out.includes(id)) out.push(id)
+  }
+  return out
+}
+
 // providers lists each provider and its accounts' models, each asked
 // through its proxy (proxies[provider][key], "" the provider's own), as a
 // built-in fetches each account's list through the account's.
@@ -1446,6 +1462,7 @@ async function providers({ proxies } = {}) {
       npm: p.npm ?? "",
       api: p.api ?? "",
       methods: methods(a.auth),
+      single: a.auth.single === true,
       icon: iconOf(a),
       usage: typeof a.auth.usage === "function",
       checkin: typeof a.auth.checkin === "function",
@@ -1462,6 +1479,14 @@ async function providers({ proxies } = {}) {
         accountId: whoOf(stored[k]),
         hint: hintOf(stored[k]),
         models: own.length === 0 ? undefined : i === 0 ? ids(p) : own[i - 1]?.models ? ids(own[i - 1]) : undefined,
+        // The union above keeps one model per id. Cost-free access is an
+        // account fact: preserve it before that union can discard a plan's
+        // different answer for the same id. A fallback is not fresh fact.
+        freeModels: (() => {
+          const q = i === 0 ? p : own[i - 1]
+          if (!q?.models || q.failed || q.fellBack) return undefined
+          return Object.values(q.models).filter((m) => m.status !== "deprecated" && m.free === true).map((m) => m.id)
+        })(),
         fellBack: i === 0 ? !!p.fellBack : !!(own[i - 1]?.fellBack || own[i - 1]?.failed),
         listError: (i === 0 ? p.fellBack && p.listError : own[i - 1]?.listError) || "",
       })),
@@ -1492,6 +1517,8 @@ async function providers({ proxies } = {}) {
           rateWas: rateOf(m.rateWas),
           // run fast when the request's service_tier is priority (Cursor's)
           fast: m.fast === true,
+          // the service tiers the vendor serves it at, offered to Codex.
+          serviceTiers: tiersOf(m.serviceTiers),
           // a decision model (System One's), hidden from agents and
           // offered as a routing group's classifier
           decides: m.decides === true,
@@ -1560,6 +1587,7 @@ function save(provider, key, result, inputs, apiKey) {
 
 // signInKey is where a sign-in goes: the account named, else a new one.
 function signInKey(provider, account) {
+  if (authOf(provider).single === true) return accountsOf(readAuth(), provider)[0] ?? provider
   return account && account !== "new" && providerOf(account) === provider ? account : freshKey(provider)
 }
 

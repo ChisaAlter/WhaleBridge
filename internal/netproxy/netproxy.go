@@ -29,8 +29,22 @@ import (
 func Install() {
 	if t, ok := http.DefaultTransport.(*http.Transport); ok {
 		t.Proxy = Func
+		if t.HTTP2 == nil {
+			t.HTTP2 = HTTP2Health()
+		}
 		http.DefaultClient.Transport = Dispatch(t)
 	}
+}
+
+// PingAfter and PingWait bound a silent HTTP/2 connection without imposing
+// a response deadline on a live vendor doing a long-running request.
+var PingAfter, PingWait = 20 * time.Second, 10 * time.Second
+
+// HTTP2Health pings a connection after no frame has arrived for PingAfter,
+// then drops it when no reply arrives within PingWait. A new request can
+// establish a fresh connection instead of reusing a dead proxy or NAT flow.
+func HTTP2Health() *http.HTTP2Config {
+	return &http.HTTP2Config{SendPingTimeout: PingAfter, PingTimeout: PingWait}
 }
 
 // Func is an http.Transport Proxy function: the proxy the request's

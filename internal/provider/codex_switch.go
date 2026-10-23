@@ -142,8 +142,8 @@ func usedPast(q SubscriptionQuota, share float64, now time.Time) bool {
 // accounts that are on in magpie, in the order they were saved, whose
 // allowance is known and not spent. ok is false when the agent should stay.
 func NextLogin(ctx context.Context, agent string) (from, to string, back, ok bool) {
-	if accountRemoved(agent) {
-		return "", "", false, false // magpie has no say in its sign-in
+	if leftAlone(agent) {
+		return "", "", false, false // the user's sign-in is left alone
 	}
 	var spares []Login
 	var first *Login

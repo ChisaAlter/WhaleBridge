@@ -388,6 +388,15 @@ var presets = []PresetDef{
 			"global.openai.gpt-6-astra", "global.openai.gpt-6-sol", "global.openai.gpt-6-luna",
 			"openai.gpt-oss-120b-1:0", "openai.gpt-oss-20b-1:0", "qwen.qwen3-coder-480b-a35b-v1:0", "deepseek.v3.2",
 			"moonshotai.kimi-k2.5", "zai.glm-5", "minimax.minimax-m2.5"}},
+	// Mantle uses the same Bedrock API key, lists its own regional models
+	// at /v1/models, and serves each OpenAI model at its own prefix.
+	{ID: "bedrock-mantle", Name: "Amazon Bedrock (Mantle)", Short: "Bedrock Mantle", Icon: "bedrock-color", Kind: KindVendor, Hosts: true,
+		Chat: mantleOpenAIBase("us-east-1"), Responses: mantleOpenAIBase("us-east-1"), Anthropic: mantleAnthropic("us-east-1"),
+		Note:    "Bedrock API key",
+		Website: "https://docs.aws.amazon.com/bedrock/latest/userguide/endpoints.html", KeysURL: "https://console.aws.amazon.com/bedrock/home#/api-keys",
+		Regions: mantleRegions("us-east-1", "us-east-2", "us-west-2", "eu-central-1", "eu-central-2", "eu-north-1", "eu-south-1",
+			"eu-west-1", "eu-west-2", "ap-northeast-1", "ap-northeast-2", "ap-south-1", "ap-southeast-1", "ap-southeast-2",
+			"ap-southeast-3", "ap-southeast-4", "sa-east-1")},
 	// Azure OpenAI, at the user's own resource (azure.go): its v1 API under
 	// /openai/v1 for chat completions and Responses, the key in api-key,
 	// its deployments' names as the model ids. It hosts other makers'
@@ -403,6 +412,13 @@ var presets = []PresetDef{
 		Chat: "https://ollama.com/v1", Anthropic: "https://ollama.com",
 		Note:    "cloud models, with an API key",
 		Website: "https://docs.ollama.com/cloud", KeysURL: "https://ollama.com/settings/keys"},
+
+	// Nous Portal hosts multiple makers on Chat. Its Messages endpoint
+	// serves only a subset, so all models use the shared Chat translation.
+	{ID: "nous", Name: "Nous Portal", Icon: "nousresearch", Kind: KindVendor, Hosts: true,
+		Chat:    "https://inference-api.nousresearch.com/v1",
+		Note:    "Nous Research · Hermes and other models",
+		Website: "https://portal.nousresearch.com", KeysURL: "https://portal.nousresearch.com"},
 
 	{ID: "openrouter", Name: "OpenRouter", Icon: "openrouter", Kind: KindRelay, Catalog: "openrouter",
 		Chat: "https://openrouter.ai/api/v1", Anthropic: "https://openrouter.ai/api",
@@ -461,7 +477,12 @@ var presets = []PresetDef{
 		Website: "https://fireworks.ai", KeysURL: "https://app.fireworks.ai/settings/users/api-keys"},
 	{ID: "siliconflow", Name: "SiliconFlow", Icon: "siliconcloud-color", Kind: KindRelay, Catalog: "siliconflow",
 		Chat:    "https://api.siliconflow.cn/v1",
-		Website: "https://cloud.siliconflow.cn", KeysURL: "https://cloud.siliconflow.cn/account/ak"},
+		Website: "https://cloud.siliconflow.cn", KeysURL: "https://cloud.siliconflow.cn/account/ak",
+		Regions: []Region{
+			{ID: "cn", Name: "China", Chat: "https://api.siliconflow.cn/v1"},
+			{ID: "intl", Name: "Global", Chat: "https://api.siliconflow.com/v1",
+				Website: "https://cloud.siliconflow.com", KeysURL: "https://cloud.siliconflow.com/account/ak"},
+		}},
 	// NVIDIA's hosted NIM endpoints (#197): chat completions only; its
 	// /v1/responses answers for a few models alone, 404 for the rest
 	{ID: "nvidia", Name: "NVIDIA NIM", Icon: "nvidia-color", Kind: KindRelay, Catalog: "nvidia",
@@ -580,6 +601,22 @@ func bedrockRegions(ids ...string) []Region {
 	out := make([]Region, len(ids))
 	for i, id := range ids {
 		out[i] = Region{ID: id, Name: id, Chat: bedrockChat(id), Responses: bedrockChat(id), Anthropic: bedrockAnthropic(id)}
+	}
+	return out
+}
+
+func mantleOpenAIBase(region string) string {
+	return "https://bedrock-mantle." + region + ".api.aws/v1"
+}
+
+func mantleAnthropic(region string) string {
+	return "https://bedrock-mantle." + region + ".api.aws/anthropic"
+}
+
+func mantleRegions(ids ...string) []Region {
+	out := make([]Region, len(ids))
+	for i, id := range ids {
+		out[i] = Region{ID: id, Name: id, Chat: mantleOpenAIBase(id), Responses: mantleOpenAIBase(id), Anthropic: mantleAnthropic(id)}
 	}
 	return out
 }

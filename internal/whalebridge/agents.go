@@ -13,6 +13,7 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/agent"
 	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
+	"github.com/ChisaAlter/WhaleBridge/internal/filememo"
 	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
 	"github.com/ChisaAlter/WhaleBridge/internal/profile"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
@@ -90,7 +91,7 @@ var agentSyncErrors = map[string]string{}
 func agentText(value string) string {
 	for _, token := range []string{os.Getenv("WHALEBRIDGE_GATEWAY_TOKEN"), gateway.Token} {
 		if token != "" && token != "magpie" {
-			value = strings.ReplaceAll(value, token, "[鲸桥密钥]")
+			value = strings.ReplaceAll(value, token, "[鲸Bridge密钥]")
 		}
 	}
 	return value
@@ -101,6 +102,8 @@ func agentFailure(w http.ResponseWriter, err error, status int) {
 }
 
 func syncManagedAgents() {
+	defer provider.Hold()()
+	defer filememo.Hold()()
 	ids, err := managedAgents()
 	if err != nil {
 		agentSyncErrors["*"] = err.Error()
@@ -181,7 +184,7 @@ func disconnectManagedAgents() error {
 	}
 	token := strings.TrimSpace(string(stored))
 	if key, err := hex.DecodeString(token); err != nil || len(key) != 16 {
-		return fmt.Errorf("鲸桥网关密钥文件无效")
+		return fmt.Errorf("鲸Bridge网关密钥文件无效")
 	}
 	gateway.Token = token
 	os.Setenv("WHALEBRIDGE_GATEWAY_TOKEN", token)
@@ -287,6 +290,11 @@ func agentAction(action string) http.HandlerFunc {
 		}
 		mutations.Lock()
 		defer mutations.Unlock()
+		// Agent connection planning reads every model before applying its choice.
+		// File writes invalidate these short-lived lookup caches as usual.
+		defer provider.Changed()
+		defer provider.Hold()()
+		defer filememo.Hold()()
 		a, err := agent.Find(input.ID)
 		if err != nil {
 			agentFailure(w, err, http.StatusBadRequest)
@@ -308,7 +316,7 @@ func agentAction(action string) http.HandlerFunc {
 				http.Error(w, "这个 Agent 没有可用的导入链接", http.StatusBadRequest)
 				return
 			}
-			writeJSON(w, map[string]any{"ok": true, "link": link, "added": a.Added != nil && a.Added(), "notice": "在目标应用打开并确认导入，然后刷新接入状态。卸载鲸桥前，请在目标应用移除该供应商。"})
+			writeJSON(w, map[string]any{"ok": true, "link": link, "added": a.Added != nil && a.Added(), "notice": "在目标应用打开并确认导入，然后刷新接入状态。卸载鲸Bridge前，请在目标应用移除该供应商。"})
 			return
 		}
 		if action == "launch" {
@@ -321,7 +329,7 @@ func agentAction(action string) http.HandlerFunc {
 				http.Error(w, "请先接入并选择模型，或安装该 Agent，再生成启动命令", http.StatusBadRequest)
 				return
 			}
-			writeJSON(w, map[string]any{"ok": true, "command": command, "notice": "复制命令并在本机终端运行，以鲸桥配置启动该 Agent。命令包含本机鲸桥密钥，请勿分享。"})
+			writeJSON(w, map[string]any{"ok": true, "command": command, "notice": "复制命令并在本机终端运行，以鲸Bridge配置启动该 Agent。命令包含本机鲸Bridge密钥，请勿分享。"})
 			return
 		}
 		if a.Import != nil && len(a.Fields) == 0 && a.Native == nil {
@@ -352,7 +360,7 @@ func agentAction(action string) http.HandlerFunc {
 			_, err = a.ConnectHow()
 		case "disconnect":
 			if !slices.Contains(ids, a.ID) {
-				err = fmt.Errorf("%s 未在鲸桥接入", a.Name)
+				err = fmt.Errorf("%s 未在鲸Bridge接入", a.Name)
 				break
 			}
 			err = disconnectExternalAgent(a)

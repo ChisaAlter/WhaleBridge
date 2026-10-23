@@ -119,14 +119,19 @@ func askClaudeCodeWebSearch(t *testing.T, model string) string {
 // search off in Settings it isn't asked.
 func TestWorkBuddySearchesForItsModels(t *testing.T) {
 	site := &wbSearchSite{}
-	p := wbSignedIn(t, "workbuddy", "workbuddy-desktop", site)
+	pid := besideFake(t, "workbuddy", site)
+	pp, err := provider.Find(pid)
+	if err != nil || !pp.IsPlugin() || pid != "workbuddy" || !provider.BuiltinRetired(pid) {
+		t.Fatalf("WorkBuddy is not served through its plugin: %+v %v", pp, err)
+	}
+	p := *pp
 	if canSearch() {
 		t.Fatal("something else searches")
 	}
 	if _, err := p.Fetch(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	out := askClaudeCodeWebSearch(t, "workbuddy/hy3")
+	out := askClaudeCodeWebSearch(t, pid+"/fake-1")
 	for _, want := range []string{`"type":"web_search_tool_result"`, `"url":"https://go.dev/doc/go1.26"`, "Go 1.26 is out."} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("reply lacks %s: %s", want, out)
@@ -140,7 +145,7 @@ func TestWorkBuddySearchesForItsModels(t *testing.T) {
 	if q["query"] != "Go 1.26 release notes" || q["type"] != "text2text" || q["max_results"] != float64(5) {
 		t.Errorf("asked %v", q)
 	}
-	if h.Get("Authorization") != "Bearer tok" || h.Get("X-User-Id") != "u1" || !strings.HasPrefix(h.Get("User-Agent"), "WorkBuddy/") ||
+	if h.Get("Authorization") != "Bearer k1" || h.Get("X-Body-Type") != "string" ||
 		h.Get("X-Requested-With") != "XMLHttpRequest" || h.Get("X-Request-ID") == "" {
 		t.Errorf("headers %v", h)
 	}
@@ -152,7 +157,7 @@ func TestWorkBuddySearchesForItsModels(t *testing.T) {
 	site.searched, site.results = nil, nil
 	site.refusal = `{"code":15001,"msg":"web search quota exhausted"}`
 	site.mu.Unlock()
-	_, _, err := New().wbSearch(context.Background(), p, "Go 1.26 release notes")
+	_, _, err = New().wbSearch(context.Background(), p, "Go 1.26 release notes")
 	if err == nil || !strings.Contains(err.Error(), "web search quota exhausted (15001)") {
 		t.Fatalf("refusal: %v", err)
 	}

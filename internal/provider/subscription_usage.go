@@ -393,7 +393,7 @@ func fetchSubscriptionUsage(ctx context.Context) []SubscriptionQuota {
 	// would be a second card of the same account
 	placed := map[string]bool{}
 	moved := func(id string) bool {
-		if !Moved(id) {
+		if !PluginServes(id) {
 			return false
 		}
 		placed[id] = true
@@ -413,11 +413,15 @@ func fetchSubscriptionUsage(ctx context.Context) []SubscriptionQuota {
 			}))
 		}
 	}
-	if user, plan, ok := cursorIdentity(); !moved("cursor") && ok && !hidden["cursor"] {
-		fetches = append(fetches, withUser(ctx, user, func() SubscriptionQuota { return cursorSubscriptionUsage(viaLogin("cursor", user), plan) }))
+	if !moved("cursor") && !hidden["cursor"] {
+		if user, plan, ok := cursorIdentity(); ok {
+			fetches = append(fetches, withUser(ctx, user, func() SubscriptionQuota { return cursorSubscriptionUsage(viaLogin("cursor", user), plan) }))
+		}
 	}
-	if _, ok := grokAccount(); !moved("grok") && ok && !hidden["grok"] {
-		fetches = append(fetches, func() SubscriptionQuota { return keepReading(ctx, readNow(grokSubscriptionUsage(via("grok"))), "") })
+	if !moved("grok") && !hidden["grok"] {
+		if _, ok := grokAccount(); ok {
+			fetches = append(fetches, func() SubscriptionQuota { return keepReading(ctx, readNow(grokSubscriptionUsage(via("grok"))), "") })
+		}
 	}
 	if home, err := os.UserHomeDir(); err == nil {
 		if p, ok := codexAccount(home); ok && !hidden["codex"] {

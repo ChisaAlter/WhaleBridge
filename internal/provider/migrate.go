@@ -9,15 +9,14 @@ package provider
 //  1. the plugin is installed, if it isn't;
 //  2. each account's sign-in is kept as the plugin keeps one, in the order
 //     and on or off as the user had it;
-//  3. each is tried as a request would try it (the plugin's loader and its
-//     model list for that account), and every model the built-in has in use
-//     must be one the plugin serves;
-//  4. only then does the id change hands: the built-in's saved accounts go
-//     out of logins.json into migrations.json, kept for going back.
+//  3. each is tried through the plugin; a retired built-in's lapsed or
+//     unverified account still goes, with its diagnostic kept;
+//  4. the built-in's saved accounts go from logins.json to migrations.json.
 //
-// Anything short of that puts everything back as it was — the plugin's
-// newer tokens included, since a refresh token used once is spent — and
-// the built-in carries on. MoveBack undoes a move the same way.
+// An install or import failure restores the source accounts, including
+// tokens the plugin renewed. A failed rollback keeps its recovery record
+// and plugin credentials for another try. Retirement is independent of
+// migration success: the old built-in never serves those accounts again.
 
 import (
 	"context"
@@ -51,16 +50,30 @@ import (
 const (
 	MoveMoving = "moving" // under way, or cut short (put back at the next try)
 	MovePlugin = "plugin" // the plugin has the id
-	MovedBack  = "back"   // the user moved it back: it stays built-in
-	MoveFailed = "failed" // the last try failed: the built-in carries on
+	MovedBack  = "back"   // an older version moved it back
+	MoveFailed = "failed" // the last try failed; credentials stay for a retry
+	// A removed plugin keeps its credentials, and is only installed again
+	// when the user asks. Retired built-ins are never restored.
+	MoveRemoved = "removed"
 )
 
-// Retiring are the built-ins magpie moves onto their plugins by itself,
-// at start-up; the rest move only when the user asks.
-var Retiring = []string{}
+// Retiring are the built-ins moved onto plugins during maintenance. The
+// component's maintenance applies its ownership gate to the entire batch.
+var Retiring = []string{"zed", "kiro", "cursor", "qoder", QoderCNID, "workbuddy", WorkBuddyAIID, MiMoID, "zcode", "factory", "grok", "devin", CommandCodePlanID}
 
-// moveRetry is how long a failed move waits before it is tried again.
-const moveRetry = 6 * time.Hour
+const (
+	moveRetry    = 6 * time.Hour
+	retiredRetry = 10 * time.Minute
+)
+
+func retryWait(id string) time.Duration {
+	if BuiltinRetired(id) {
+		return retiredRetry
+	}
+	return moveRetry
+}
+
+func retryDue(id string, at time.Time) bool { return time.Since(at) >= retryWait(id) }
 
 // Migration is where one built-in's move stands.
 type Migration struct {
@@ -136,6 +149,12 @@ func installFailed(pkg string, err error) error {
 
 // nameOf is the built-in id's name, as the providers list shows it.
 func nameOf(id string) string {
+	if c, ok := movedCards[id]; ok {
+		return c.name
+	}
+	if id == QoderCNID {
+		return "Qoder CN"
+	}
 	for _, p := range All() {
 		if p.ID == id && !p.IsPlugin() && p.Name != "" {
 			return p.Name
@@ -247,6 +266,20 @@ var errStays = errors.New("stays with the plugin")
 // Movable is whether the built-in id has a plugin it can move to.
 func Movable(id string) bool { return movers[id] != nil }
 
+// BuiltinRetired is whether the built-in serves no requests, regardless of
+// whether its credentials have reached the replacement plugin yet.
+func BuiltinRetired(id string) bool { return Movable(id) && retiredBuiltins[id] }
+
+var retiredBuiltins = map[string]bool{
+	"zed": true, "kiro": true, "cursor": true, "qoder": true, QoderCNID: true,
+	"workbuddy": true, WorkBuddyAIID: true, MiMoID: true, "zcode": true,
+	"factory": true, "grok": true, "devin": true, CommandCodePlanID: true,
+}
+
+// PluginServes is a serving gate, not evidence that credentials moved.
+// Migration bookkeeping and native account discovery still use Moved.
+func PluginServes(id string) bool { return Moved(id) || BuiltinRetired(id) }
+
 // MovableIDs are the built-ins that have a plugin to move to, by id: the
 // page marks them deprecated, moved or not.
 func MovableIDs() []string {
@@ -260,10 +293,12 @@ func MovableIDs() []string {
 
 // MoveCandidate is a built-in with accounts its plugin could run instead.
 type MoveCandidate struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Package  string `json:"package"`
-	Accounts int    `json:"accounts"`
+	ID       string   `json:"id"`
+	Name     string   `json:"name"`
+	Package  string   `json:"package"`
+	Accounts int      `json:"accounts"`
+	Error    string   `json:"error,omitempty"`
+	Why      *MoveWhy `json:"why,omitempty"`
 }
 
 // MoveCandidates are the built-ins not on their plugins that have accounts
@@ -278,7 +313,14 @@ func MoveCandidates() []MoveCandidate {
 			continue
 		}
 		if accts, err := mv.out(); err == nil && len(accts) > 0 {
-			out = append(out, MoveCandidate{ID: id, Name: nameOf(id), Package: mv.pkg, Accounts: len(accts)})
+			c := MoveCandidate{ID: id, Name: nameOf(id), Package: mv.pkg, Accounts: len(accts)}
+			if m, ok := MigrationOf(id); ok && m.State == MoveFailed {
+				c.Error, c.Why = m.Err, m.Why
+			}
+			if err := whaleBridgeMoveAllowed(id, accts); err != nil {
+				c.Error, c.Why = err.Error(), WhyOf(err)
+			}
+			out = append(out, c)
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
@@ -475,6 +517,11 @@ var (
 	// so a test can read what it is handed
 	addPlugin     = plugin.Add
 	upgradePlugin = plugin.Upgrade
+	importAuth    = plugin.Import
+	checkAccount  = plugin.Check
+	pluginAuths   = plugin.Auths
+	takeAuths     = plugin.Take
+	restoreAuth   = plugin.Restore
 )
 
 // modelsInUse are the models the built-in id serves now: the ones agents,
@@ -495,6 +542,13 @@ var modelsInUse = func(id string) []string {
 // Move puts the built-in id's accounts onto its plugin (see above). An
 // error leaves the built-in as it was.
 func Move(ctx context.Context, id string) error {
+	return moveWithGate(ctx, id, nil)
+}
+
+// moveWithGate checks the whole source batch at the execution boundary,
+// including a fresh check before commit. Filtering only out() would let
+// commitMove set aside source accounts which were never authorized.
+func moveWithGate(ctx context.Context, id string, accept func(string, []Moving) error) error {
 	if settings.AccountDiscoveryOff() {
 		return errAccountDiscoveryOff
 	}
@@ -511,11 +565,17 @@ func Move(ctx context.Context, id string) error {
 		return nil
 	}
 	if movingNow(id) {
-		putBack(ctx, id, mv, "")
+		if err := putBack(ctx, id, mv, ""); err != nil {
+			return fmt.Errorf("finishing %s's interrupted move: %w", id, err)
+		}
 	}
-	err = move(ctx, id, mv)
+	err = move(ctx, id, mv, accept)
 	if err != nil {
 		_ = setMigration(id, func(m *Migration) {
+			if m.State == MoveMoving {
+				m.Err, m.Why = err.Error(), WhyOf(err)
+				return // a failed rollback still owns plugin tokens to recover
+			}
 			*m = Migration{State: MoveFailed, Package: mv.pkg, At: time.Now().UTC().Truncate(time.Second), Err: err.Error(), Why: WhyOf(err)}
 		})
 		if me := (*moveError)(nil); errors.As(err, &me) && me.err != nil {
@@ -529,6 +589,10 @@ func Move(ctx context.Context, id string) error {
 // signed in: the plugin installed, and the subscription signs in through
 // it from now on, as a moved one does. One with accounts is moved instead.
 func Adopt(ctx context.Context, id string) error {
+	return adoptWithGate(ctx, id, nil)
+}
+
+func adoptWithGate(ctx context.Context, id string, accept func(string, []Moving) error) error {
 	if settings.AccountDiscoveryOff() {
 		return errAccountDiscoveryOff
 	}
@@ -539,7 +603,7 @@ func Adopt(ctx context.Context, id string) error {
 	if accts, err := mv.out(); err != nil {
 		return err
 	} else if len(accts) > 0 {
-		return Move(ctx, id)
+		return moveWithGate(ctx, id, accept)
 	}
 	unlock, err := lockMoves()
 	if err != nil {
@@ -553,13 +617,29 @@ func Adopt(ctx context.Context, id string) error {
 	if err := installPlugin(ctx, mv.pkg, mv.min); err != nil {
 		return installFailed(mv.pkg, err)
 	}
-	pps, err := pluginProviders(ctx)
-	if err == nil && !slices.ContainsFunc(pps, func(p plugin.Provider) bool { return p.ID == id && plugin.PackageName(p.Spec) == mv.pkg }) {
-		err = fmt.Errorf("%s doesn't serve %s", mv.pkg, id)
+	_, err = servingPlugin(ctx, id, mv.pkg)
+	if err == nil {
+		accts, readErr := mv.out()
+		switch {
+		case readErr != nil:
+			err = readErr
+		case len(accts) > 0:
+			if accept != nil {
+				err = accept(id, accts)
+			}
+			if err == nil {
+				err = fmt.Errorf("%s's source accounts changed while adopting; try the entire move again", nameOf(id))
+			}
+		}
 	}
 	if err == nil {
 		err = setMigration(id, func(m *Migration) {
-			*m = Migration{State: MovePlugin, Package: mv.pkg, At: time.Now().UTC().Truncate(time.Second), Installed: !had}
+			at := time.Now().UTC().Truncate(time.Second)
+			if m.State == MoveRemoved {
+				m.State, m.At, m.Installed = MovePlugin, at, !had
+				return
+			}
+			*m = Migration{State: MovePlugin, Package: mv.pkg, At: at, Installed: !had}
 		})
 	}
 	if err != nil && !had {
@@ -570,7 +650,7 @@ func Adopt(ctx context.Context, id string) error {
 	return err
 }
 
-func move(ctx context.Context, id string, mv *mover) (err error) {
+func move(ctx context.Context, id string, mv *mover, accept func(string, []Moving) error) (err error) {
 	inUse := modelsInUse(id)
 	var host string
 	if p, err := Find(id); err == nil && !p.IsPlugin() {
@@ -583,9 +663,14 @@ func move(ctx context.Context, id string, mv *mover) (err error) {
 	if len(accts) == 0 {
 		return fmt.Errorf("no %s account to move", id)
 	}
-	// every account lapsed: nothing to try the plugin with, so nothing is
-	// installed for it
-	if !slices.ContainsFunc(accts, func(a Moving) bool { return !a.Lapsed }) {
+	if accept != nil {
+		if err := accept(id, accts); err != nil {
+			return err
+		}
+	}
+	// A retired built-in has no route to keep running. Its lapsed accounts
+	// still move so they can be repaired through the replacement plugin.
+	if !BuiltinRetired(id) && !slices.ContainsFunc(accts, func(a Moving) bool { return !a.Lapsed }) {
 		return lapsedAll(id)
 	}
 	had := pluginListed(mv.pkg)
@@ -596,42 +681,36 @@ func move(ctx context.Context, id string, mv *mover) (err error) {
 	// a plugin the move installed goes with a move that failed, which
 	// leaves nothing of it behind: no provider saying it's signed out
 	defer func() {
-		if err != nil && installed {
+		if err != nil && installed && !movingNow(id) {
 			if rerr := removePlugin(context.WithoutCancel(ctx), mv.pkg); rerr != nil {
 				log.Printf("removing %s after a failed move: %s", mv.pkg, rerr)
 			}
 		}
 	}()
-	pps, err := pluginProviders(ctx)
+	pp, err := servingPlugin(ctx, id, mv.pkg)
 	if err != nil {
 		return err
 	}
-	var pp plugin.Provider
-	for _, p := range pps {
-		if p.ID == id {
-			if plugin.PackageName(p.Spec) != mv.pkg {
-				return fmt.Errorf("%s is served by another plugin, %s", id, p.Spec)
-			}
-			pp = p
-		}
-	}
-	if pp.ID == "" {
-		return fmt.Errorf("%s doesn't serve %s", mv.pkg, id)
-	}
-	before := plugin.Auths(id)
+	before := pluginAuths(id)
 	if err := setMigration(id, func(m *Migration) {
+		previous := *m
 		*m = Migration{State: MoveMoving, Package: mv.pkg, At: time.Now().UTC().Truncate(time.Second)}
+		if BuiltinRetired(id) && previous.Why != nil && slices.Contains([]string{"lapsed", "unserved", "account"}, previous.Why.Code) {
+			m.Err, m.Why = previous.Err, previous.Why
+		}
 	}); err != nil {
 		return err
 	}
 	defer func() {
 		if err != nil {
-			putBack(ctx, id, mv, err.Error())
+			if rerr := putBack(ctx, id, mv, err.Error()); rerr != nil {
+				err = errors.Join(err, fmt.Errorf("keeping plugin credentials after rollback failed: %w", rerr))
+			}
 		}
 	}()
 	var moved []movedAccount
 	for _, a := range accts {
-		key, err := plugin.Import(ctx, id, a.Auth)
+		key, err := importAuth(ctx, id, a.Auth)
 		if err != nil {
 			return fmt.Errorf("%s: %w", a.User, err)
 		}
@@ -647,24 +726,45 @@ func move(ctx context.Context, id string, mv *mover) (err error) {
 	tried := false
 	for i, a := range accts {
 		if a.Lapsed {
+			if BuiltinRetired(id) {
+				if err := keepMoveWarning(id, "lapsed", map[string]string{"name": nameOf(id), "user": a.User}, a.User+" needs signing in again through the plugin"); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		// through the account's proxy, as its requests go
-		c, err := plugin.Check(ViaLogin(ctx, id, a.User), id, moved[i].Key)
+		c, err := checkAccount(ViaLogin(ctx, id, a.User), id, moved[i].Key)
 		if err == nil && (c.Refused != "" || refused(c.Usage)) {
 			// the vendor turned the sign-in away: marked, as the built-in
 			// marked it, and along untried, as a lapsed one goes
 			notePluginLapse(pp, moved[i].Key, http.StatusUnauthorized)
+			if BuiltinRetired(id) {
+				if err := keepMoveWarning(id, "lapsed", map[string]string{"name": nameOf(id), "user": a.User}, a.User+" needs signing in again through the plugin"); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		if err != nil && signInGone.MatchString(err.Error()) {
-			// the plugin says in words the sign-in is gone (Grok's past
-			// its time): it moves along untried, as a lapsed one does, and
-			// unmarked, as the plugin's own reads leave its accounts
+			if BuiltinRetired(id) {
+				if err := keepMoveWarning(id, "account", map[string]string{"user": a.User, "error": err.Error()}, a.User+": "+err.Error()); err != nil {
+					return err
+				}
+			}
 			continue
 		}
 		if err != nil {
+			if BuiltinRetired(id) {
+				if err := keepMoveWarning(id, "account", map[string]string{"user": a.User, "error": err.Error()}, fmt.Sprintf("%s wasn't verified through the plugin: %s", a.User, err)); err != nil {
+					return err
+				}
+				continue
+			}
 			return &moveError{MoveWhy{Code: "account", Args: map[string]string{"user": a.User, "error": err.Error()}}, fmt.Sprintf("%s doesn't work through the plugin: %s", a.User, err), err}
+		}
+		if BuiltinRetired(id) {
+			continue
 		}
 		if !tried {
 			if missing := slices.DeleteFunc(slices.Clone(inUse), func(m string) bool {
@@ -681,10 +781,56 @@ func move(ctx context.Context, id string, mv *mover) (err error) {
 			tried = true
 		}
 	}
-	if !tried {
+	if !tried && !BuiltinRetired(id) {
 		return lapsedAll(id)
 	}
+	current, err := mv.out()
+	if err != nil {
+		return err
+	}
+	if accept != nil {
+		if err := accept(id, current); err != nil {
+			return err
+		}
+	}
+	if jsonText(accts) != jsonText(current) {
+		return fmt.Errorf("%s's source accounts changed while moving; the entire batch will be tried again", nameOf(id))
+	}
 	return commitMove(id, mv, moved, installed, host)
+}
+
+// servingPlugin checks the provider actually selected by the plugin host.
+// Merely having the expected package installed is insufficient when Prefer
+// selects another package for the same provider id.
+func servingPlugin(ctx context.Context, id, pkg string) (plugin.Provider, error) {
+	pps, err := pluginProviders(ctx)
+	if err != nil {
+		return plugin.Provider{}, err
+	}
+	for _, pp := range pps {
+		if pp.ID != id {
+			continue
+		}
+		if plugin.PackageName(pp.Spec) != pkg {
+			return plugin.Provider{}, fmt.Errorf("%s is served by another plugin, %s", id, pp.Spec)
+		}
+		return pp, nil
+	}
+	return plugin.Provider{}, fmt.Errorf("%s doesn't serve %s", pkg, id)
+}
+
+// A successful retired move may still need attention in the plugin. Keep
+// that diagnostic with its committed record instead of discarding it.
+func keepMoveWarning(id, code string, args map[string]string, text string) error {
+	return setMigration(id, func(m *Migration) {
+		if m.Err != "" {
+			m.Err += "\n"
+		}
+		m.Err += text
+		if m.Why == nil {
+			m.Why = &MoveWhy{Code: code, Args: args}
+		}
+	})
 }
 
 func lapsedAll(id string) error {
@@ -747,7 +893,22 @@ func keepOrder(pp plugin.Provider, accts []Moving, moved []movedAccount) error {
 		}
 		ls = slices.DeleteFunc(ls, func(l savedLogin) bool { return l.Agent == agent && l.Home == ma.Key })
 		l := savedLogin{Agent: agent, User: a.User, Plan: a.Plan, Home: ma.Key, On: a.On || a.First, First: ma.Key == first, Seen: time.Now().UTC().Truncate(time.Second)}
-		if a.Lapsed {
+		// WhaleBridge stores a routing order in addition to First/On.
+		// Keep it from the original row; a native marker's settings belong
+		// to that source as well, never to another account with the same id.
+		if mv := movers[pp.ID]; mv != nil {
+			for _, source := range ls {
+				if slices.Contains(mv.agents, source.Agent) && strings.EqualFold(source.User, a.User) && source.own() == a.Own {
+					l.Order, l.Paused = source.Order, source.Paused
+					l.ID = loginID(source)
+					if source.Lapsed != "" {
+						l.Lapsed = source.Lapsed
+					}
+					break
+				}
+			}
+		}
+		if a.Lapsed && l.Lapsed == "" {
 			l.Lapsed = lapsedText(pp, a.User)
 		}
 		ls = append(ls, l)
@@ -778,13 +939,16 @@ func commitMove(id string, mv *mover, moved []movedAccount, installed bool, host
 	loginsMu.Lock()
 	var backup []savedLogin
 	for _, l := range readLogins() {
-		if slices.Contains(mv.agents, l.Agent) {
+		if slices.Contains(mv.agents, l.Agent) && slices.ContainsFunc(moved, func(a movedAccount) bool {
+			return strings.EqualFold(a.User, l.User) && a.Own == l.own()
+		}) {
 			backup = append(backup, l)
 		}
 	}
 	loginsMu.Unlock()
 	if err := setMigration(id, func(m *Migration) {
-		*m = Migration{State: MovePlugin, Package: mv.pkg, At: time.Now().UTC().Truncate(time.Second), Accounts: moved, Backup: backup, Kept: kept, Installed: installed, Host: host}
+		warning, why := m.Err, m.Why
+		*m = Migration{State: MovePlugin, Package: mv.pkg, At: time.Now().UTC().Truncate(time.Second), Accounts: moved, Backup: backup, Kept: kept, Installed: installed, Host: host, Err: warning, Why: why}
 	}); err != nil {
 		if mv.give != nil {
 			_ = mv.give(kept)
@@ -802,30 +966,42 @@ func tidyMoved(id string) {
 	if mv == nil || !Moved(id) {
 		return
 	}
+	m, _ := MigrationOf(id)
 	loginsMu.Lock()
+	defer loginsMu.Unlock()
 	ls := readLogins()
 	var left []savedLogin
-	ls = slices.DeleteFunc(ls, func(l savedLogin) bool {
-		if slices.Contains(mv.agents, l.Agent) {
+	ls = slices.DeleteFunc(slices.Clone(ls), func(l savedLogin) bool {
+		if !slices.Contains(mv.agents, l.Agent) {
+			return false
+		}
+		// Only rows in this transaction may be tidied. An account first
+		// observed after commit, especially a native marker, was never
+		// authorized or imported by the move and stays at its source.
+		if slices.ContainsFunc(m.Backup, func(b savedLogin) bool { return sameMoved(b, l) }) ||
+			slices.ContainsFunc(m.Accounts, func(a movedAccount) bool { return strings.EqualFold(a.User, l.User) && a.Own == l.own() }) {
 			left = append(left, l)
 			return true
 		}
 		return false
 	})
-	if len(left) > 0 {
-		_ = writeLogins(ls)
-	}
-	loginsMu.Unlock()
 	if len(left) == 0 {
 		return
 	}
-	_ = setMigration(id, func(m *Migration) {
+	// Back up before removing rows so a stopped process always has them.
+	if err := setMigration(id, func(m *Migration) {
 		for _, l := range left {
 			if !slices.ContainsFunc(m.Backup, func(b savedLogin) bool { return sameMoved(b, l) }) {
 				m.Backup = append(m.Backup, l)
 			}
 		}
-	})
+	}); err != nil {
+		log.Printf("keeping %s's moved source accounts: %s", id, err)
+		return
+	}
+	if err := writeLogins(ls); err != nil {
+		log.Printf("tidying %s's moved source accounts: %s", id, err)
+	}
 }
 
 func sameMoved(a, b savedLogin) bool {
@@ -836,7 +1012,7 @@ func sameMoved(a, b savedLogin) bool {
 // built-in's accounts (its newer tokens with them), then out of the
 // plugin — but for one the user had there already, which gets back what
 // it had.
-func putBack(ctx context.Context, id string, mv *mover, why string) {
+func putBack(ctx context.Context, id string, mv *mover, why string) error {
 	m, _ := MigrationOf(id)
 	var keys []string
 	for _, ma := range m.Accounts {
@@ -846,10 +1022,18 @@ func putBack(ctx context.Context, id string, mv *mover, why string) {
 	skip := func(ma movedAccount, a map[string]any) bool {
 		return signinHash(a) == ma.Sent || slices.ContainsFunc(renewed, func(u string) bool { return strings.EqualFold(u, ma.User) })
 	}
-	_, _, _ = handBack(ctx, id, mv, m.Accounts, keys, skip, nil, func(ls []savedLogin, _ map[string]string) []savedLogin { return ls })
+	rollback := context.WithoutCancel(ctx)
+	if len(keys) > 0 {
+		_, errs, err := handBack(rollback, id, mv, m.Accounts, keys, skip, nil, func(ls []savedLogin, _ map[string]string) []savedLogin { return ls })
+		if err != nil || len(errs) > 0 {
+			return errors.Join(append(errs, err)...)
+		}
+	}
 	for _, ma := range m.Accounts {
 		if ma.Was != nil {
-			_ = plugin.Restore(ctx, id, ma.Key, ma.Was)
+			if err := restoreAuth(rollback, id, ma.Key, ma.Was); err != nil {
+				return err
+			}
 		}
 	}
 	// the plugin's rows keepOrder wrote go with its accounts, but for one
@@ -861,11 +1045,14 @@ func putBack(ctx context.Context, id string, mv *mover, why string) {
 			return l.Agent == "plugin:"+id && slices.ContainsFunc(m.Accounts, func(ma movedAccount) bool { return ma.Key == l.Home && ma.Was == nil })
 		})
 		if len(ls) != n {
-			_ = writeLogins(ls)
+			if err := writeLogins(ls); err != nil {
+				loginsMu.Unlock()
+				return err
+			}
 		}
 	}
 	loginsMu.Unlock()
-	_ = setMigration(id, func(m *Migration) {
+	return setMigration(id, func(m *Migration) {
 		*m = Migration{State: MoveFailed, Package: mv.pkg, At: time.Now().UTC().Truncate(time.Second), Err: why}
 	})
 }
@@ -934,7 +1121,7 @@ func handBack(ctx context.Context, id string, mv *mover, accts []movedAccount, k
 		}
 		return mv.settle(mine)
 	}
-	seen := plugin.Auths(id)
+	seen := pluginAuths(id)
 	users, errs, err := write(seen)
 	if err == nil && len(errs) == 0 {
 		err = settle(seen)
@@ -946,7 +1133,7 @@ func handBack(ctx context.Context, id string, mv *mover, accts []movedAccount, k
 	if len(keys) == 0 {
 		return users, nil, nil
 	}
-	taken, err := plugin.Take(ctx, id, keys)
+	taken, err := takeAuths(ctx, id, keys)
 	if err != nil {
 		return users, nil, err
 	}
@@ -955,6 +1142,15 @@ func handBack(ctx context.Context, id string, mv *mover, accts []movedAccount, k
 			users, errs, err := write(taken)
 			if err == nil && len(errs) == 0 {
 				err = settle(taken)
+			}
+			if err != nil || len(errs) > 0 {
+				// Take may have raced a token rotation. If persisting that
+				// newer value fails, retain it with the plugin for recovery.
+				for key, auth := range taken {
+					if auth != nil {
+						err = errors.Join(err, restoreAuth(context.WithoutCancel(ctx), id, key, auth))
+					}
+				}
 			}
 			return users, errs, err
 		}
@@ -973,6 +1169,9 @@ func MoveBack(ctx context.Context, id string) error {
 // serves nothing else now, which releasePlugin, about to remove or turn
 // off the plugin itself, leaves to its caller.
 func moveBack(ctx context.Context, id string, tidy bool) error {
+	if BuiltinRetired(id) {
+		return &moveError{MoveWhy{Code: "retired", Args: map[string]string{"name": nameOf(id)}}, fmt.Sprintf("%s's built-in is retired; restore its plugin to use its accounts", nameOf(id)), nil}
+	}
 	if settings.AccountDiscoveryOff() {
 		return errAccountDiscoveryOff
 	}
@@ -995,7 +1194,7 @@ func moveBack(ctx context.Context, id string, tidy bool) error {
 			order = append(order, l.acct)
 		}
 	}
-	keys := slices.Collect(maps.Keys(plugin.Auths(id)))
+	keys := slices.Collect(maps.Keys(pluginAuths(id)))
 	sort.SliceStable(keys, func(i, j int) bool {
 		if a, b := indexOfKey(order, keys[i]), indexOfKey(order, keys[j]); a != b {
 			return a < b
@@ -1106,7 +1305,7 @@ func moveBack(ctx context.Context, id string, tidy bool) error {
 // to any of its providers, or a built-in moved onto it.
 func servesAnything(pkg string) bool {
 	for _, p := range plugin.Cached() {
-		if plugin.PackageName(p.Spec) == pkg && len(plugin.Auths(p.ID)) > 0 {
+		if plugin.PackageName(p.Spec) == pkg && len(pluginAuths(p.ID)) > 0 {
 			return true
 		}
 	}
@@ -1138,14 +1337,16 @@ func pluginOn(id string) map[string]bool {
 	return out
 }
 
-// MoveRetiring moves the built-ins being retired that have accounts, at
-// start-up: once, or again moveRetry after one failed. One the user moved
-// back stays.
+// MoveRetiring retries failed retired moves sooner. An old move-back
+// record may migrate again; a removed plugin waits for explicit reinstall.
 func MoveRetiring(ctx context.Context) map[string]error {
+	if os.Getenv("LAUNCHER_COMPONENT_ID") == "whalebridge" {
+		return moveRetiring(ctx, whaleBridgeMoveAllowed)
+	}
 	return moveRetiring(ctx, nil)
 }
 
-func moveRetiring(ctx context.Context, accept func(string, []Moving) bool) map[string]error {
+func moveRetiring(ctx context.Context, accept func(string, []Moving) error) map[string]error {
 	if settings.AccountDiscoveryOff() {
 		return nil
 	}
@@ -1156,15 +1357,24 @@ func moveRetiring(ctx context.Context, accept func(string, []Moving) bool) map[s
 		case ok && m.State == MovePlugin:
 			tidyMoved(id)
 			continue
-		case ok && m.State == MovedBack:
+		case ok && m.State == MoveRemoved:
 			continue
-		case ok && m.State == MoveFailed && time.Since(m.At) < moveRetry:
+		case ok && m.State == MovedBack && !BuiltinRetired(id):
+			continue
+		case ok && m.State == MoveFailed && !retryDue(id, m.At):
 			continue
 		}
-		if accts, err := movers[id].out(); err != nil || len(accts) == 0 || (accept != nil && !accept(id, accts)) {
+		mv := movers[id]
+		if mv == nil {
 			continue
 		}
-		out[id] = Move(ctx, id)
+		if accts, err := mv.out(); err != nil {
+			out[id] = err
+			continue
+		} else if len(accts) == 0 {
+			continue
+		}
+		out[id] = moveWithGate(ctx, id, accept)
 	}
 	return out
 }
@@ -1180,13 +1390,16 @@ func moveRetiring(ctx context.Context, accept func(string, []Moving) bool) map[s
 // accounts of its own for already is left as it is, since its models are
 // in use as <id>-plugin's and the id changing would leave agents asking
 // for a provider gone; the add sheet lists it once regardless. One the
-// user moved back stays built-in, and a failed move waits moveRetry. No
-// plugin is installed for it: the user's own install is what says to.
+// removed plugin resumes its saved migration only after the selected
+// package serves it again. No plugin is installed here.
 func HandOver(ctx context.Context, accounts bool) map[string]error {
+	if os.Getenv("LAUNCHER_COMPONENT_ID") == "whalebridge" {
+		return handOverAccounts(ctx, accounts, whaleBridgeMoveAllowed)
+	}
 	return handOverAccounts(ctx, accounts, nil)
 }
 
-func handOverAccounts(ctx context.Context, accounts bool, accept func(string, []Moving) bool) map[string]error {
+func handOverAccounts(ctx context.Context, accounts bool, accept func(string, []Moving) error) map[string]error {
 	if settings.AccountDiscoveryOff() {
 		return nil
 	}
@@ -1195,7 +1408,20 @@ func handOverAccounts(ctx context.Context, accounts bool, accept func(string, []
 	asked := false
 	for _, id := range MovableIDs() {
 		mv := movers[id]
-		if m, ok := MigrationOf(id); ok && (m.State != MoveFailed || time.Since(m.At) < moveRetry) {
+		m, ok := MigrationOf(id)
+		if ok && m.State == MoveRemoved {
+			if pluginReady(mv) {
+				if _, err := servingPlugin(ctx, id, mv.pkg); err != nil {
+					out[id] = err
+					continue
+				}
+				out[id] = setMigration(id, func(m *Migration) {
+					m.State, m.At, m.Installed = MovePlugin, time.Now().UTC().Truncate(time.Second), false
+				})
+			}
+			continue
+		}
+		if ok && (m.State != MoveFailed || !retryDue(id, m.At)) {
 			continue
 		}
 		if !pluginReady(mv) {
@@ -1213,15 +1439,21 @@ func handOverAccounts(ctx context.Context, accounts bool, accept func(string, []
 			continue
 		}
 		accts, err := mv.out()
-		if accept != nil && !accept(id, accts) {
+		if err != nil {
+			out[id] = err
 			continue
 		}
+		if accept != nil {
+			if err := accept(id, accts); err != nil {
+				out[id] = err
+				continue
+			}
+		}
 		switch {
-		case err != nil:
 		case len(accts) == 0:
-			out[id] = Adopt(ctx, id)
+			out[id] = adoptWithGate(ctx, id, accept)
 		case accounts:
-			out[id] = Move(ctx, id)
+			out[id] = moveWithGate(ctx, id, accept)
 		}
 	}
 	return out
@@ -1245,7 +1477,11 @@ func pluginReady(mv *mover) bool {
 func keepMovedCurrent(ctx context.Context) {
 	for _, id := range OnPlugins() {
 		mv := movers[id]
-		if mv.min == "" {
+		// An uninstall outside the component also stays uninstalled.
+		// Maintenance may update an existing install, never recreate one.
+		if mv == nil || mv.min == "" || !slices.ContainsFunc(plugin.Load().Plugins, func(e plugin.Entry) bool {
+			return plugin.PackageName(e.Spec) == mv.pkg && !e.Off
+		}) {
 			continue
 		}
 		if err := installPlugin(ctx, mv.pkg, mv.min); err != nil {
@@ -1277,13 +1513,23 @@ func KeepRetiringMoved(ctx context.Context) {
 		maps.Copy(moves, HandOver(ctx, true))
 		for id, err := range moves {
 			if err != nil {
-				log.Printf("moving %s to its plugin: %s (it stays built-in)", id, err)
+				log.Printf("moving %s to its plugin: %s", id, err)
 			} else {
 				log.Printf("moved %s to its plugin, %s", id, MovePackage(id))
 			}
 		}
-		t.Reset(time.Hour)
+		t.Reset(nextRetiringRun())
 	}
+}
+
+func nextRetiringRun() time.Duration {
+	next := time.Hour
+	for _, id := range MovableIDs() {
+		if m, ok := MigrationOf(id); ok && m.State == MoveFailed && BuiltinRetired(id) {
+			next = min(next, max(time.Until(m.At.Add(retiredRetry)), time.Minute))
+		}
+	}
+	return next
 }
 
 // MovedOnto are the built-ins moved onto the plugin named (its spec or
@@ -1304,33 +1550,34 @@ func MovedOnto(name string) []string {
 	return out
 }
 
-// releasePlugin moves the built-ins on the plugin named back first, so
-// taking the plugin away leaves none of them without its accounts.
-func releasePlugin(ctx context.Context, name string) error {
-	for _, id := range MovedOnto(name) {
-		if err := moveBack(ctx, id, false); err != nil {
-			return fmt.Errorf("moving %s back to the built-in: %w", id, err)
+// RemovePlugin keeps the plugin's credentials for a later explicit
+// reinstall. It never revives a retired built-in or hands tokens back.
+func RemovePlugin(ctx context.Context, name string) error {
+	moved := MovedOnto(name)
+	spec := installedSpec(name)
+	ids, known := pluginRecordIDs(spec)
+	pkg := plugin.PackageName(spec)
+	if err := removePlugin(ctx, name); err != nil {
+		return err
+	}
+	for _, id := range moved {
+		if err := setMigration(id, func(m *Migration) {
+			m.State, m.At = MoveRemoved, time.Now().UTC().Truncate(time.Second)
+		}); err != nil {
+			return fmt.Errorf("%s is removed; %s still reads as on it: %w", name, id, err)
 		}
+	}
+	if spec == "" || !known {
+		return nil
+	}
+	if err := setAside(pkg, ids); err != nil {
+		return fmt.Errorf("%s is removed; its model picks were left in providers.json: %w", name, err)
 	}
 	return nil
 }
 
-// RemovePlugin removes the plugin named, the built-ins moved onto it moved
-// back to themselves first.
-func RemovePlugin(ctx context.Context, name string) error {
-	if err := releasePlugin(ctx, name); err != nil {
-		return err
-	}
-	return plugin.Remove(ctx, name)
-}
-
-// SetPluginOff turns the plugin named off, the built-ins moved onto it
-// moved back to themselves first, or back on.
-func SetPluginOff(ctx context.Context, name string, off bool) error {
-	if off {
-		if err := releasePlugin(ctx, name); err != nil {
-			return err
-		}
-	}
+// SetPluginOff leaves the subscription with its plugin and its credentials
+// in place. Maintenance respects the disabled entry.
+func SetPluginOff(_ context.Context, name string, off bool) error {
 	return plugin.SetOff(name, off)
 }

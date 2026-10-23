@@ -4,10 +4,12 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
@@ -127,6 +129,159 @@ func renamedRef(ref, from, to string) string {
 		return pre + to + "/" + m
 	}
 	return ref
+}
+
+// canonicalModelSettings provides a read-only view of legacy plugin model
+// preferences. It copies only changed maps and lists; canonical keys win.
+func canonicalModelSettings(s settings.Settings) settings.Settings {
+	out, _ := remapModelSettings(s, heldOf("legacy-plugin-aliases", LegacyPluginAliases))
+	return out
+}
+
+func remapModelSettings(s settings.Settings, aliases map[string]string) (settings.Settings, bool) {
+	if len(aliases) == 0 {
+		return s, false
+	}
+	changed := false
+	ref := func(id string) string {
+		for old, now := range aliases {
+			if id == old {
+				return now
+			}
+			if next := renamedRef(id, old, now); next != id {
+				return next
+			}
+			if rest, ok := strings.CutPrefix(id, old+"|"); ok {
+				return now + "|" + rest
+			}
+		}
+		return id
+	}
+	settings.PerModelKeys(&s, func(_ string, m reflect.Value) {
+		var copied reflect.Value
+		for _, k := range m.MapKeys() {
+			next := ref(k.String())
+			if next == k.String() {
+				continue
+			}
+			if !copied.IsValid() {
+				copied = reflect.MakeMapWithSize(m.Type(), m.Len())
+				iter := m.MapRange()
+				for iter.Next() {
+					copied.SetMapIndex(iter.Key(), iter.Value())
+				}
+			}
+			nk := reflect.ValueOf(next).Convert(m.Type().Key())
+			if !copied.MapIndex(nk).IsValid() {
+				copied.SetMapIndex(nk, m.MapIndex(k))
+			}
+			copied.SetMapIndex(k, reflect.Value{})
+		}
+		if copied.IsValid() {
+			m.Set(copied)
+			changed = true
+		}
+	})
+	list := func(in []string) []string {
+		var out []string
+		moved := false
+		for _, id := range in {
+			next := ref(id)
+			moved = moved || next != id
+			if !slices.Contains(out, next) {
+				out = append(out, next)
+			}
+		}
+		if moved {
+			changed = true
+			return out
+		}
+		return in
+	}
+	for _, field := range []*map[string][]string{&s.HiddenModels, &s.PickedModels, &s.OrderedModels, &s.FastPicks, &s.Visible} {
+		var out map[string][]string
+		for key, ids := range *field {
+			next := list(ids)
+			if !slices.Equal(ids, next) {
+				if out == nil {
+					out = make(map[string][]string, len(*field))
+					for k, v := range *field {
+						out[k] = v
+					}
+				}
+				out[key] = next
+			}
+		}
+		if out != nil {
+			*field = out
+		}
+	}
+	for _, field := range []*[]string{&s.DisabledModels, &s.UsageOrder, &s.PanelUsageHidden, &s.TrayUsages} {
+		*field = list(*field)
+	}
+	for _, field := range []*string{&s.Vision, &s.ImageGen, &s.Searcher, &s.CodexTitles, &s.CodexDescriptions, &s.CodexPredictions, &s.CodexAutoReview, &s.CodexSubagentModel, &s.TrayUsage} {
+		if next := ref(*field); next != *field {
+			*field, changed = next, true
+		}
+	}
+	return s, changed
+}
+
+// MigrateLegacyPluginSettings persists the safe alias supplied by
+// LegacyPluginAliases. It never overwrites a canonical preference, and
+// leaves actual custom providers using either id alone.
+func MigrateLegacyPluginSettings(oldID, newID string) error {
+	if LegacyPluginAliases()[oldID] != newID {
+		return nil
+	}
+	s, err := settings.LoadChecked()
+	if err != nil {
+		return err
+	}
+	s, changed := remapModelSettings(s, map[string]string{oldID: newID})
+	f, err := read()
+	if err != nil {
+		return err
+	}
+	refsChanged := false
+	rename := func(id string) string {
+		next := renamedRef(id, oldID, newID)
+		refsChanged = refsChanged || next != id
+		return next
+	}
+	for i := range f.Providers {
+		for j, id := range f.Providers[i].Fallback {
+			f.Providers[i].Fallback[j] = rename(id)
+		}
+	}
+	for i := range f.Groups {
+		g := &f.Groups[i]
+		for _, ids := range [][]string{g.Members, g.Match, g.Fast, g.Off} {
+			for j, id := range ids {
+				ids[j] = rename(id)
+			}
+		}
+		for j := range g.Rules {
+			g.Rules[j].Use = rename(g.Rules[j].Use)
+		}
+		g.Pick, g.Classifier = rename(g.Pick), rename(g.Classifier)
+		g.Weights = renamedWeights(g.Weights, rename)
+	}
+	if !changed && !refsChanged {
+		return nil
+	}
+	return edit.Atomically(func() error {
+		if changed {
+			if err := settings.Save(s); err != nil {
+				return err
+			}
+		}
+		if refsChanged {
+			return store(f)
+		}
+		catalog.Touched()
+		return nil
+	}, settings.Path(), Path())
 }
 
 // RenamedRef is ref with the provider it names by an id the provider had

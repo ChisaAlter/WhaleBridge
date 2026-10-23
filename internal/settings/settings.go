@@ -106,6 +106,12 @@ type Settings struct {
 	// computer is always let in. MAGPIE_ALLOW_IPS, where set, is used in
 	// its place (gateway.AllowIPs).
 	AllowIPs []string `json:"allowIPs,omitempty"`
+	// FetchPrivate names private hosts, host:port pairs, IPs and CIDR ranges
+	// that media URLs may be downloaded from. Empty means no local grant;
+	// a loopback caller alone never grants access. Set in settings.json
+	// only, never through the management page or a restored remote backup.
+	// These addresses belong to this computer's network (KeepOwn).
+	FetchPrivate []string `json:"fetchPrivate,omitempty"`
 	// Port is the gateway's port on this computer, 0 for DefaultPort.
 	// MAGPIE_ADDR, where it is set, comes first (GatewayAddr).
 	Port int `json:"port,omitempty"`
@@ -528,6 +534,9 @@ type Settings struct {
 	// by "<provider id>/<model id>": the lists magpie hands out offer only
 	// those (see provider.SetModelEfforts).
 	ModelEfforts map[string][]string `json:"modelEfforts,omitempty"`
+	// ModelReasonless are models the user said take no reasoning fields,
+	// by "<provider id>/<model id>", whatever the vendor's list says.
+	ModelReasonless map[string]bool `json:"modelReasonless,omitempty"`
 	// ModelImages is whether the user said a model takes images, by
 	// "<provider id>/<model id>". Absent leaves it to the vendor's list.
 	ModelImages map[string]bool `json:"modelImages,omitempty"`
@@ -874,6 +883,7 @@ func (s *Settings) KeepOwn(cur Settings) {
 	s.NoWSLAgents = cur.NoWSLAgents
 	s.QuotaReads = cur.QuotaReads
 	s.NoAccountDiscovery = cur.NoAccountDiscovery
+	s.FetchPrivate = slices.Clone(cur.FetchPrivate)
 }
 
 // RenamePerModel moves what the user said of a provider's models to the id

@@ -402,10 +402,14 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 			return
 		}
 		var unmask func()
-		w, d.Prompt, unmask = redactedPrompt(w, d.Prompt)
+		w, d.Prompt, unmask, err = redactedPrompt(w, d.Prompt)
+		if err != nil {
+			fail(http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		defer unmask()
 		call.Provider, call.To = p.ID, provider.Chat
-		ctx, cancel := context.WithTimeout(withPrivateFetch(r.Context(), r), drawTimeout)
+		ctx, cancel := context.WithTimeout(r.Context(), drawTimeout)
 		defer cancel()
 		// the account that drew, or refused last, is the one recorded
 		drew, out, code, capBack, err := s.drawOnAccounts(ctx, r, p, model, d)
@@ -433,15 +437,15 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 		}
 		s.record(call)
 		// asked for the image itself, one the vendor keeps at a URL is
-		// fetched the way the vendor was reached: through its proxy, by
-		// the client that just had its answer (#1576: the 4K image a relay
+		// fetched through its proxy, allowing its configured endpoint's
+		// own host as well as public addresses (#1576: the 4K image a relay
 		// drew in 40 s was lost to generate_image's own download). One
 		// that can't be fetched is answered by its URL all the same, never
 		// dropped: it is drawn, and paid for.
 		data := make([]map[string]any, 0, len(out.Images))
 		for _, im := range out.Images {
 			if im.URL != "" && inline(d.Want) {
-				if b, mt, err := FetchImage(p.Via(r.Context()), s.client, im.URL); err == nil {
+				if b, mt, err := FetchImage(p.Via(r.Context()), vendorClient(p), im.URL); err == nil {
 					im = picture{Mime: mt, Data: b}
 				} else if s.debug {
 					log.Printf("images: %s's image at %s is answered by its URL: %v", p.ID, im.URL, err)
@@ -1165,15 +1169,11 @@ func readImagesAnswer(p provider.Provider, url string, b []byte, code int) (draw
 }
 
 // fetchPicture downloads an image an edit was given by URL, for an images
-// API that takes only files. The URL is the caller's: it is fetched from
-// public addresses only (publicClient), but for a request from this
-// computer (withPrivateFetch), and what comes must be an image.
+// API that takes only files. The URL is the caller's: publicClient permits
+// public addresses and explicit fetchPrivate entries, regardless of caller
+// address or the provider's own host. What comes must be an image.
 func (s *Server) fetchPicture(ctx context.Context, url string) ([]byte, string, error) {
-	c := publicClient
-	if privateFetchAllowed(ctx) {
-		c = s.client
-	}
-	b, _, err := FetchImage(ctx, c, url)
+	b, _, err := FetchImage(ctx, publicClient, url)
 	if err != nil {
 		return nil, "", fmt.Errorf("couldn't fetch the image at %s: %v", url, err)
 	}

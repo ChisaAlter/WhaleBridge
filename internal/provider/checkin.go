@@ -9,7 +9,12 @@ package provider
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io/fs"
 	"log"
+	"maps"
+	"os"
 	"sort"
 	"sync"
 	"time"
@@ -19,10 +24,11 @@ import (
 
 // checkinAcct is an account checked in each day.
 type checkinAcct struct {
-	User string
-	On   bool
-	key  string // its entry in the file; "" for one that can't be told apart
-	do   func(context.Context) WorkBuddyCheckin
+	User     string
+	On       bool
+	key      string // its entry in the file; "" for one that can't be told apart
+	provider string // the provider whose background switch applies
+	do       func(context.Context) WorkBuddyCheckin
 }
 
 // checkiner checks the accounts it lists in, keeping what came of it at
@@ -56,9 +62,12 @@ func (c checkiner) checkinNow(ctx context.Context, soon bool) []WorkBuddyCheckin
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	st := readCheckins(c.path)
 	now := c.now()
 	day := wbCheckinDay(now)
+	st, err := readCheckinsChecked(c.path)
+	if err != nil {
+		return c.unread(now, soon, err) // no request or write with unknown marks
+	}
 	var out []WorkBuddyCheckin
 	changed := false
 	// one account signed in twice (the built-in and the plugin) is
@@ -68,7 +77,7 @@ func (c checkiner) checkinNow(ctx context.Context, soon bool) []WorkBuddyCheckin
 	// or a press (#1902)
 	off := checkinOff()
 	for _, a := range c.accounts() {
-		if !a.On || a.key == "" || asked[a.key] || off[a.key] {
+		if !a.On || a.key == "" || asked[a.key] || off[a.key] || !soon && leftAlone(a.provider) {
 			continue
 		}
 		asked[a.key] = true
@@ -98,10 +107,74 @@ func (c checkiner) checkinNow(ctx context.Context, soon bool) []WorkBuddyCheckin
 		if b, err := json.MarshalIndent(st, "", "  "); err == nil {
 			if err := writePrivate(c.path, append(b, '\n')); err != nil {
 				log.Printf("%s check-in: %v", c.label, err)
+			} else {
+				wroteCheckins(c.path, st)
 			}
 		}
 	}
 	return out
+}
+
+// unread reports the accounts that would have been checked in, without
+// asking or writing. The loop retries failures after wbCheckinRetry.
+func (c checkiner) unread(now time.Time, soon bool, err error) []WorkBuddyCheckin {
+	var out []WorkBuddyCheckin
+	listed, off := map[string]bool{}, checkinOff()
+	for _, a := range c.accounts() {
+		if !a.On || a.key == "" || listed[a.key] || off[a.key] || !soon && leftAlone(a.provider) {
+			continue
+		}
+		listed[a.key] = true
+		out = append(out, WorkBuddyCheckin{User: a.User, By: c.by, Day: wbCheckinDay(now), At: now, Outcome: CheckinFailed, Msg: err.Error()})
+	}
+	return out
+}
+
+// readCheckinsChecked treats an existing unreadable or malformed ledger as
+// unknown. Display readers receive its last good state, but a check-in must
+// stop on the error so it cannot ask twice or overwrite unknown entries.
+func readCheckinsChecked(path string) (map[string]WorkBuddyCheckin, error) {
+	st := map[string]WorkBuddyCheckin{}
+	b, err := os.ReadFile(path)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		err = nil
+	case err == nil:
+		if err = json.Unmarshal(b, &st); err != nil || st == nil {
+			// Parser errors (notably time.ParseError) may quote file values.
+			// Only identify the path and shape, never echo ledger contents.
+			err = fmt.Errorf("%s doesn't parse into check-in entries: check-in leaves it unchanged and asks no account until it does", path)
+		}
+	default:
+		err = fmt.Errorf("%s can't be read (%v): check-in leaves it unchanged and asks no account until it can", path, err)
+	}
+	checkinsReadMu.Lock()
+	defer checkinsReadMu.Unlock()
+	if err != nil {
+		if checkinsBad[path] != err.Error() {
+			checkinsBad[path] = err.Error()
+			log.Printf("check-in: %v", err)
+		}
+		return maps.Clone(checkinsRead[path]), err
+	}
+	delete(checkinsBad, path)
+	checkinsRead[path] = maps.Clone(st)
+	return st, nil
+}
+
+var (
+	checkinsReadMu sync.Mutex
+	checkinsRead   = map[string]map[string]WorkBuddyCheckin{}
+	checkinsBad    = map[string]string{}
+)
+
+// wroteCheckins makes a successful write available to display-only readers
+// if the next read fails. Failed writes never update the last good state.
+func wroteCheckins(path string, st map[string]WorkBuddyCheckin) {
+	checkinsReadMu.Lock()
+	defer checkinsReadMu.Unlock()
+	delete(checkinsBad, path)
+	checkinsRead[path] = maps.Clone(st)
 }
 
 // checkinOff are the accounts left out of their vendor's daily check-in

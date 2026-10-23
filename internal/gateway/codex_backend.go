@@ -669,7 +669,12 @@ func (s *Server) codexUpstreamOn(w http.ResponseWriter, r *http.Request, rest st
 	usage.Saw(agentOf(r))
 	if r.Method == http.MethodPost {
 		var unmask func()
-		w, body, unmask = redacted(w, body)
+		var maskErr error
+		w, body, unmask, maskErr = redacted(w, body)
+		if maskErr != nil {
+			writeError(w, provider.Responses, http.StatusServiceUnavailable, maskErr.Error())
+			return
+		}
 		defer unmask()
 	}
 	base := provider.CodexBase

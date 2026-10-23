@@ -28,14 +28,13 @@ package provider
 // Only the Chinese build has the event: WorkBuddy AI ships with it off.
 
 import (
+	"cmp"
 	"context"
-	"encoding/json"
 	"errors"
 	"io"
 	"log"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"slices"
 	"sort"
@@ -167,9 +166,9 @@ func wbCheckinPath() string { return filepath.Join(filepath.Dir(Path()), "workbu
 func wbCheckinKey(a wbAccount) string { return a.site.id + "|" + a.creds.UID }
 
 func readCheckins(path string) map[string]WorkBuddyCheckin {
-	st := map[string]WorkBuddyCheckin{}
-	if b, err := os.ReadFile(path); err == nil {
-		json.Unmarshal(b, &st)
+	st, _ := readCheckinsChecked(path)
+	if st == nil {
+		return map[string]WorkBuddyCheckin{}
 	}
 	return st
 }
@@ -204,7 +203,7 @@ func (c wbCheckiner) checkiner() checkiner {
 			if a.creds.UID != "" {
 				key = wbCheckinKey(a)
 			}
-			out = append(out, checkinAcct{User: a.User, On: a.On, key: key, do: func(ctx context.Context) WorkBuddyCheckin { return wbCheckin(ctx, a) }})
+			out = append(out, checkinAcct{User: a.User, On: a.On, provider: cmp.Or(a.card, a.site.id), key: key, do: func(ctx context.Context) WorkBuddyCheckin { return wbCheckin(ctx, a) }})
 		}
 		return out
 	}}
@@ -404,7 +403,7 @@ func HasWorkBuddy() bool { return len(wbCheckinAccounts()) > 0 }
 // moved back), whose cards had their credits by day but no check-in
 // (#694, Dazzle-sys on 0.1.774: 没看到).
 func wbCheckinAccounts() []wbAccount {
-	if Moved(wbCN.id) {
+	if PluginServes(wbCN.id) {
 		pp, ok := PluginOf(wbCN.id)
 		if !ok {
 			return nil

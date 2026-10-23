@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -284,6 +285,9 @@ type Provider struct {
 	// magpie knows need neither.
 	BalanceURL  string `json:"balanceURL,omitempty"`
 	BalancePath string `json:"balancePath,omitempty"`
+	// BalanceMethod is GET by default, or POST with no body for a custom
+	// BalanceURL. Known vendor endpoints keep their own method.
+	BalanceMethod string `json:"balanceMethod,omitempty"`
 	// BalanceToken is what a vendor tells the whole account's balance to,
 	// where a key is told only what is left on itself: AiHubMix's system
 	// access token, or a new-api relay's for its /api/user/self named in
@@ -318,6 +322,10 @@ type Provider struct {
 	// listed since is served beside picks that held every one listed then
 	// (withNewlyListed), and one listed then and left unpicked stays out.
 	PickedFrom []string `json:"pickedFrom,omitempty"`
+	// Delisted are picks the vendor's list left out. They stay out of Models
+	// until a later list has them again, when relistPicks restores them.
+	// Saves keep them unless the user picks them again or clears the picks.
+	Delisted []string `json:"delisted,omitempty"`
 	// Unlisted keeps the provider's own models out of the list agents see:
 	// it serves only through the routing groups it is in, and by its
 	// "provider/model" ids.
@@ -377,6 +385,9 @@ type file struct {
 	// Routing page (#779), by id, found ones among them; one not in it
 	// follows those that are (see SetGroupOrder).
 	GroupOrder []string `json:"groupOrder,omitempty"`
+	// PluginLeft keeps the settings of a removed plugin's providers until
+	// it is added again (plugin_left.go).
+	PluginLeft []LeftRecord `json:"pluginLeft,omitempty"`
 }
 
 // Path is the file the user's providers live in.
@@ -510,6 +521,7 @@ func (p Provider) clone() Provider {
 	p.Fallback = slices.Clone(p.Fallback)
 	p.Models = slices.Clone(p.Models)
 	p.PickedFrom = slices.Clone(p.PickedFrom)
+	p.Delisted = slices.Clone(p.Delisted)
 	p.Headers = maps.Clone(p.Headers)
 	p.ExtraBody = maps.Clone(p.ExtraBody)
 	p.AccountProxies = maps.Clone(p.AccountProxies)
@@ -563,11 +575,24 @@ func allProviders() []Provider {
 		}
 		out = append(out, p)
 	}
+	aliases := legacyPluginAliasesIn(f)
 	for _, a := range Accounts() {
-		if _, taken := find(out, a.ID); taken || picks[a.ID].Hidden {
+		pk, saved := picks[a.ID]
+		for old, canonical := range aliases {
+			if canonical != a.ID {
+				continue
+			}
+			if !saved {
+				pk = picks[old]
+			}
+			if !slices.Contains(a.Was, old) {
+				a.Was = append(a.Was, old)
+			}
+		}
+		if _, taken := find(out, a.ID); taken || pk.Hidden {
 			continue
 		}
-		a = withPicks(a, picks[a.ID])
+		a = withPicks(a, pk)
 		if a.ID == "cursor" { // picked before its efforts were one model
 			a.Models = cursorPicks(a.Models)
 		}
@@ -586,7 +611,7 @@ func allProviders() []Provider {
 // the provider keeps the same settings (#1899: a second WorkBuddy AI
 // account queued 62s with the wait set to 1s).
 func withPicks(a, pk Provider) Provider {
-	a.PickedFrom = pk.PickedFrom
+	a.PickedFrom, a.Delisted = pk.PickedFrom, pk.Delisted
 	a.Models, a.Unlisted, a.Off, a.Fallback, a.Routing, a.Affinity, a.KeepLogin, a.KeepLoginAs, a.Contexts, a.Family = pk.Models, pk.Unlisted, pk.Off, pk.Fallback, pk.Routing, pk.Affinity, pk.KeepLogin, pk.KeepLoginAs, pk.Contexts, pk.Family
 	a.SwitchOnly = pk.SwitchOnly
 	a.Sink, a.NoModels, a.PriceRate = pk.Sink, pk.NoModels, pk.PriceRate
@@ -622,6 +647,82 @@ func find(ps []Provider, id string) (Provider, bool) {
 	return Provider{}, false
 }
 
+// LegacyPluginAliases maps retired subscription plugins' former suffixed
+// ids to their current ids. A real custom provider on either id blocks the
+// alias: it must keep its identity and settings.
+func LegacyPluginAliases() map[string]string { return legacyPluginAliasesIn(load()) }
+
+func legacyPluginAliasesIn(f file) map[string]string {
+	custom := map[string]bool{}
+	for _, p := range f.Providers {
+		if hasEndpoint(p) {
+			custom[p.ID] = true
+		}
+	}
+	out := map[string]string{}
+	for _, id := range accountIDs {
+		old := id + "-plugin"
+		if BuiltinRetired(id) && !custom[id] && !custom[old] {
+			out[old] = id
+		}
+	}
+	return out
+}
+
+// CanonicalProviderID resolves only the compatibility aliases above.
+func CanonicalProviderID(id string) string {
+	if canonical, ok := LegacyPluginAliases()[id]; ok {
+		return canonical
+	}
+	return id
+}
+
+// MigrateLegacyPluginRecords moves old plugin settings to their current
+// provider id. Existing canonical settings win, and custom providers never
+// move. Callers choose when to persist the matching per-model settings.
+func MigrateLegacyPluginRecords() error {
+	f, err := read()
+	if err != nil {
+		return err
+	}
+	aliases := legacyPluginAliasesIn(f)
+	changed := false
+	for old, canonical := range aliases {
+		i := slices.IndexFunc(f.Providers, func(p Provider) bool { return p.ID == old && OnlyPicks(p) })
+		if i < 0 {
+			continue
+		}
+		j := slices.IndexFunc(f.Providers, func(p Provider) bool { return p.ID == canonical })
+		if j < 0 {
+			f.Providers[i].ID = canonical
+			j = i
+		}
+		if !slices.Contains(f.Providers[j].Was, old) {
+			f.Providers[j].Was = append(f.Providers[j].Was, old)
+		}
+		if i != j {
+			f.Providers = slices.Delete(f.Providers, i, i+1)
+		}
+		changed = true
+	}
+	var order []string
+	for _, id := range f.Order {
+		if canonical, ok := aliases[id]; ok {
+			id = canonical
+		}
+		if !slices.Contains(order, id) {
+			order = append(order, id)
+		}
+	}
+	if !slices.Equal(f.Order, order) {
+		f.Order, changed = order, true
+	}
+	if !changed {
+		return nil
+	}
+	return store(f)
+}
+
 // Find looks a provider up by id (or name, case-insensitively).
 func Find(id string) (*Provider, error) {
 	return findIn(All(), id)
@@ -633,6 +734,11 @@ func findIn(all []Provider, id string) (*Provider, error) {
 	// the workbuddy subscription
 	if i := slices.IndexFunc(all, func(p Provider) bool { return p.ID == q }); i >= 0 {
 		return &all[i], nil
+	}
+	if canonical := CanonicalProviderID(q); canonical != q {
+		if i := slices.IndexFunc(all, func(p Provider) bool { return p.ID == canonical }); i >= 0 {
+			return &all[i], nil
+		}
 	}
 	for _, p := range all {
 		if strings.ToLower(p.Name) == q {
@@ -706,7 +812,7 @@ func Save(p Provider) error {
 		if p.ID == "kiro" {
 			key = p.Key
 		}
-		p = Provider{ID: p.ID, Key: key, Models: p.Models, NoModels: p.NoModels, PickedFrom: p.PickedFrom, Unlisted: p.Unlisted, Off: p.Off, Fallback: p.Fallback, Routing: p.Routing, Sink: p.Sink, PriceRate: p.PriceRate, Affinity: p.Affinity, KeepLogin: p.KeepLogin, KeepLoginAs: p.KeepLoginAs, SwitchOnly: p.SwitchOnly, Contexts: p.Contexts, Family: p.Family, Proxy: p.Proxy, AccountProxies: p.AccountProxies, AccountModels: p.AccountModels, AccountCaps: p.AccountCaps, AccountWindowCaps: p.AccountWindowCaps, AccountNames: p.AccountNames, MaxConcurrency: p.MaxConcurrency, AccountConcurrency: p.AccountConcurrency, QueueLimit: p.QueueLimit, QueueWait: p.QueueWait, MaxRPM: p.MaxRPM, QuotaRest: p.QuotaRest, PinUpstream: p.PinUpstream, Hidden: hiddenAccount(p.ID), Quiet: quietAccount(p.ID), Tucked: tuckedAccount(p.ID)}
+		p = Provider{ID: p.ID, Key: key, Models: p.Models, NoModels: p.NoModels, PickedFrom: p.PickedFrom, Delisted: p.Delisted, Unlisted: p.Unlisted, Off: p.Off, Fallback: p.Fallback, Routing: p.Routing, Sink: p.Sink, PriceRate: p.PriceRate, Affinity: p.Affinity, KeepLogin: p.KeepLogin, KeepLoginAs: p.KeepLoginAs, SwitchOnly: p.SwitchOnly, Contexts: p.Contexts, Family: p.Family, Proxy: p.Proxy, AccountProxies: p.AccountProxies, AccountModels: p.AccountModels, AccountCaps: p.AccountCaps, AccountWindowCaps: p.AccountWindowCaps, AccountNames: p.AccountNames, MaxConcurrency: p.MaxConcurrency, AccountConcurrency: p.AccountConcurrency, QueueLimit: p.QueueLimit, QueueWait: p.QueueWait, MaxRPM: p.MaxRPM, QuotaRest: p.QuotaRest, PinUpstream: p.PinUpstream, Hidden: hiddenAccount(p.ID), Quiet: quietAccount(p.ID), Tucked: tuckedAccount(p.ID)}
 	} else {
 		p.AccountProxies = keyProxies(p) // a provider of keys proxies each key apart
 		if subscriptionID(p.ID) && !stored(p.ID) {
@@ -740,6 +846,7 @@ func Save(p Provider) error {
 		was = &f.Providers[i]
 	}
 	p.PickedFrom = listedWith(p, was)
+	p.Delisted = delistedWith(p, was)
 	if was != nil {
 		if p.Was == nil {
 			p.Was = was.Was
@@ -759,11 +866,36 @@ func Save(p Provider) error {
 	return nil
 }
 
+// delistedWith keeps picks a list set aside, even when an editor sends none
+// of them back. Picking one again removes it here. Select none, or replacing
+// existing picks with the vendor's list, clears them.
+func delistedWith(p Provider, was *Provider) []string {
+	if p.ServesNone() {
+		return nil
+	}
+	d := p.Delisted
+	if d == nil && was != nil {
+		d = was.Delisted
+	}
+	d = slices.DeleteFunc(slices.Clone(d), func(id string) bool { return slices.Contains(p.Models, id) })
+	if len(d) == 0 {
+		return nil
+	}
+	return d
+}
+
 // listedWith is what p.PickedFrom is saved as: none without picks; what was
 // kept with the picks when they are the same picks; and the models listed
-// now when the picks are new, as the user picked them from that list.
+// now when the picks are new. While picks are set aside, the list is known
+// to be short, so it keeps the earlier list too: a model seen and left out
+// does not become new when the vendor lists it again.
 func listedWith(p Provider, was *Provider) []string {
 	if len(p.Models) == 0 {
+		if was != nil && len(delistedWith(p, was)) > 0 {
+			// Every pick can be absent while an unrelated edit is saved.
+			// Keep what the user saw then, not the temporary short list.
+			return was.PickedFrom
+		}
 		return nil
 	}
 	if was != nil && slices.Equal(normalModels(was.Models), normalModels(p.Models)) {
@@ -776,6 +908,13 @@ func listedWith(p Provider, was *Provider) []string {
 	var ids []string
 	for _, m := range from.Available() {
 		ids = append(ids, m.ID)
+	}
+	if was != nil && len(ids) > 0 && len(delistedWith(p, was)) > 0 {
+		for _, id := range was.PickedFrom {
+			if !slices.Contains(ids, id) {
+				ids = append(ids, id)
+			}
+		}
 	}
 	return ids
 }
@@ -1119,7 +1258,7 @@ func normalize(p Provider) Provider {
 	if (p.Preset == OMLXPreset || p.Preset == MLXServePreset) && p.Decide == "" && p.Chat != "" {
 		p.Decide = p.Chat
 	}
-	if p.Routing != Ordered && p.Routing != Rotate && p.Routing != LeastUsed && p.Routing != Pace && p.Routing != Weighted {
+	if p.Routing != Ordered && p.Routing != Rotate && p.Routing != LeastUsed && p.Routing != Pace && p.Routing != Weighted && p.Routing != FreeFirst && !PluginRouting(p.Routing) {
 		p.Routing = ""
 	}
 	if !slices.Contains(Affinities, p.Affinity) {
@@ -1147,6 +1286,8 @@ func normalize(p Provider) Provider {
 	p.azureEndpoints()
 	// OpenCode Zen's or Go's other APIs, beside the one it was given (#1215)
 	p.openCodeEndpoints()
+	// Bedrock Mantle lists at /v1 and offers Messages beside it.
+	p.mantleEndpoints()
 	// a preset's provider keeps its headers too: the preset gives the
 	// endpoints and catalog, the headers say which workspace or app it is
 	p.Headers = cleanHeaders(p.Headers)
@@ -1448,14 +1589,71 @@ func (p Provider) IsOpenCode() bool {
 	return h == "opencode.ai" || strings.HasSuffix(h, ".opencode.ai")
 }
 
-// IsBedrock reports whether the provider is Amazon Bedrock's runtime: made
-// from its preset, or at its host.
+// IsBedrock includes the runtime and Mantle endpoints, which share API-key
+// authentication, Messages quirks and OpenAI protocol/field rules.
 func (p Provider) IsBedrock() bool {
-	if p.Preset == "bedrock" {
+	if p.Preset == "bedrock" || p.IsBedrockMantle() {
 		return true
 	}
 	h := p.Host()
 	return strings.HasPrefix(h, "bedrock-runtime.") && strings.HasSuffix(h, ".amazonaws.com")
+}
+
+// IsBedrockMantle reports Mantle's preset or a provider at its AWS host.
+func (p Provider) IsBedrockMantle() bool {
+	return p.Preset == "bedrock-mantle" || mantleHost(p.Host())
+}
+
+func mantleHost(h string) bool {
+	return strings.HasPrefix(h, "bedrock-mantle.") && strings.HasSuffix(h, ".api.aws")
+}
+
+// mantleOpenAI identifies the models served at /openai/v1. Open weights
+// such as gpt-oss use /v1 instead of the closed GPTs' and xAI's prefix.
+func mantleOpenAI(model string) bool {
+	return bedrockGPT(model) || strings.HasPrefix(strings.ToLower(model), "xai.")
+}
+
+// MantleBase places an OpenAI request at its model's prefix. other reverses
+// the model-id guess after the gateway learns the other route. Custom base
+// paths are kept as typed.
+func MantleBase(base, model string, other bool) string {
+	root, ok := strings.CutSuffix(strings.TrimRight(strings.TrimSpace(base), "/"), "/v1")
+	if !ok {
+		return base
+	}
+	root = strings.TrimSuffix(root, "/openai")
+	if mantleOpenAI(model) != other {
+		return root + "/openai/v1"
+	}
+	return root + "/v1"
+}
+
+// mantleEndpoints supplies missing APIs for a Mantle address. The model
+// list lives at /v1/models, so /openai/v1 is normalized to /v1 while the
+// gateway still chooses the request prefix per model.
+func (p *Provider) mantleEndpoints() {
+	if p.Preset != "" && p.Preset != "bedrock-mantle" {
+		return
+	}
+	root := ""
+	for _, base := range []string{p.Chat, p.Responses, p.Anthropic} {
+		if u, err := url.Parse(strings.TrimSpace(base)); err == nil && u.Scheme != "" && mantleHost(strings.ToLower(u.Hostname())) {
+			root = u.Scheme + "://" + u.Host
+			break
+		}
+	}
+	if root == "" {
+		return
+	}
+	for _, base := range []*string{&p.Chat, &p.Responses} {
+		if strings.TrimRight(strings.TrimSpace(*base), "/") == root+"/openai/v1" {
+			*base = root + "/v1"
+		}
+	}
+	p.Chat = cmp.Or(p.Chat, root+"/v1")
+	p.Responses = cmp.Or(p.Responses, p.Chat)
+	p.Anthropic = cmp.Or(p.Anthropic, root+"/anthropic")
 }
 
 // bedrockClaude is a Bedrock id of a Claude model: a model id

@@ -21,10 +21,63 @@ package gateway
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
+
+// stripAllReasoningFields visits only protocol configuration containers,
+// never messages or tool schemas whose ordinary text may name these fields.
+func stripAllReasoningFields(m map[string]any) bool {
+	changed := false
+	for _, k := range []string{"reasoning_effort", "reasoning", "thinking", "enable_thinking", "thinkingConfig", "thinking_config"} {
+		if _, ok := m[k]; ok {
+			delete(m, k)
+			changed = true
+		}
+	}
+	if oc, ok := m["output_config"].(map[string]any); ok {
+		if _, ok := oc["effort"]; ok {
+			delete(oc, "effort")
+			changed = true
+			if len(oc) == 0 {
+				delete(m, "output_config")
+			}
+		}
+	}
+	if inc, ok := m["include"].([]any); ok {
+		kept := inc[:0:0]
+		for _, v := range inc {
+			if v != "reasoning.encrypted_content" {
+				kept = append(kept, v)
+			}
+		}
+		if len(kept) < len(inc) {
+			m["include"], changed = kept, true
+		}
+	}
+	for _, k := range []string{"extra_body", "google", "generationConfig", "generation_config", "request"} {
+		if child, ok := m[k].(map[string]any); ok && stripAllReasoningFields(child) {
+			changed = true
+			if len(child) == 0 {
+				delete(m, k)
+			}
+		}
+	}
+	return changed
+}
+
+type reasonlessKey struct{}
+
+func withReasonless(ctx context.Context) context.Context {
+	return context.WithValue(ctx, reasonlessKey{}, true)
+}
+
+func isReasonless(ctx context.Context) bool {
+	on, _ := ctx.Value(reasonlessKey{}).(bool)
+	return on
+}
 
 // quietTo is whether pid/model is known not to think: magpie has a word on
 // it, and that word says no reasoning. Like blindTo, it asks the served
@@ -43,6 +96,16 @@ func quietTo(pid, model string) bool {
 // output_config kept, and Gemini's generationConfig.thinkingConfig when it
 // asks to think. The body goes as it is when it asked for nothing.
 func withoutReasoningAsk(proto provider.Protocol, body []byte) []byte {
+	return withoutReasoningFields(proto, body, false)
+}
+
+// withoutAnyReasoning removes reasoning switches as well as reasoning asks:
+// even an explicit "off" is a field a reasonless model's vendor may refuse.
+func withoutAnyReasoning(proto provider.Protocol, body []byte) []byte {
+	return withoutReasoningFields(proto, body, true)
+}
+
+func withoutReasoningFields(proto provider.Protocol, body []byte, all bool) []byte {
 	dec := json.NewDecoder(bytes.NewReader(body))
 	dec.UseNumber()
 	var m map[string]any
@@ -56,47 +119,49 @@ func withoutReasoningAsk(proto provider.Protocol, body []byte) []byte {
 			changed = true
 		}
 	}
-	switch proto {
-	case provider.Chat:
-		drop("reasoning_effort")
-		drop("reasoning")
-	case provider.Responses:
-		drop("reasoning")
-		drop("reasoning_effort")
-	case provider.Anthropic:
-		if t, ok := m["thinking"].(map[string]any); ok {
-			if s, _ := t["type"].(string); s == "enabled" || s == "adaptive" {
-				drop("thinking")
-			}
-		}
-		if oc, ok := m["output_config"].(map[string]any); ok {
-			if _, ok := oc["effort"]; ok {
-				delete(oc, "effort")
-				changed = true
-				if len(oc) == 0 {
-					drop("output_config")
+	if all {
+		changed = stripAllReasoningFields(m)
+	}
+	if !all {
+		switch proto {
+		case provider.Chat, provider.Responses:
+			drop("reasoning_effort")
+			drop("reasoning")
+		case provider.Anthropic:
+			if t, ok := m["thinking"].(map[string]any); ok {
+				if s, _ := t["type"].(string); s == "enabled" || s == "adaptive" {
+					drop("thinking")
 				}
 			}
-		}
-	case provider.Gemini:
-		// generationConfig's thinkingConfig when it asks to think (as
-		// parseGemini reads it), the rest of generationConfig kept; a
-		// budget of 0 is no ask and stays. The body was spelled in
-		// camelCase on its way in (geminiCamel).
-		if gc, ok := m["generationConfig"].(map[string]any); ok {
-			if raw, err := json.Marshal(gc["thinkingConfig"]); err == nil {
-				var tc gThinking
-				if json.Unmarshal(raw, &tc) == nil && tc.effort() != "" {
-					delete(gc, "thinkingConfig")
+			if oc, ok := m["output_config"].(map[string]any); ok {
+				if _, ok := oc["effort"]; ok {
+					delete(oc, "effort")
 					changed = true
-					if len(gc) == 0 {
-						drop("generationConfig")
+					if len(oc) == 0 {
+						drop("output_config")
 					}
 				}
 			}
+		case provider.Gemini:
+			// generationConfig's thinkingConfig when it asks to think (as
+			// parseGemini reads it), the rest of generationConfig kept; a
+			// budget of 0 is no ask and stays. The body was spelled in
+			// camelCase on its way in (geminiCamel).
+			if gc, ok := m["generationConfig"].(map[string]any); ok {
+				if raw, err := json.Marshal(gc["thinkingConfig"]); err == nil {
+					var tc gThinking
+					if json.Unmarshal(raw, &tc) == nil && tc.effort() != "" {
+						delete(gc, "thinkingConfig")
+						changed = true
+						if len(gc) == 0 {
+							drop("generationConfig")
+						}
+					}
+				}
+			}
+		default:
+			return body
 		}
-	default:
-		return body
 	}
 	if !changed {
 		return body

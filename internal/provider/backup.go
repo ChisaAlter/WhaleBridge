@@ -182,7 +182,7 @@ func AddPlugins(ctx context.Context, es []plugin.Entry) (added []string, failed 
 			continue
 		}
 		here[plugin.Name(e.Spec)] = true
-		got, err := addPlugin(ctx, e.Spec)
+		got, err := AddPlugin(ctx, e.Spec)
 		if err == nil && e.Off {
 			err = plugin.SetOff(got.Spec, true)
 		}

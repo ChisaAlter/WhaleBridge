@@ -1,5 +1,5 @@
 'use strict';
-const { app, BrowserWindow } = require('electron');
+const { app, BrowserWindow, nativeTheme } = require('electron');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const http = require('node:http');
@@ -38,6 +38,7 @@ const server = http.createServer(async (req, res) => {
     importWrites.push(body);
     return json(body.preview ? { providers: [{ id: 'imported', name: 'Imported API', chat: 'https://example.test/v1', models: ['long'], keySet: false, keyOptional: false }] } : { ok: true, added: ['imported'] });
   }
+  if (url.pathname === '/api/provider/models') return json({provider:providerFixture});
   if (url.pathname === '/api/upstream') return json({ vendors: [], providers: {} });
   if (url.pathname === '/api/global') return json({settings:{},models:[],searchVendors:[],searches:[],fx:{rate:7},sync:{}});
   if (url.pathname === '/api/lanes') return json({});
@@ -95,7 +96,7 @@ async function run() {
     await wait(`!document.querySelector('[data-action="hide-model"][data-id="channel/model-12"]').disabled`);
     const after = await js(`({scroll:document.querySelector('#main').scrollTop,y:row.getBoundingClientRect().y,sameRow:row===document.querySelector('[data-id="channel/model-12"][data-action]'),sameSearch:search===document.querySelector('#model-search'),message:document.querySelector('#message').hidden})`);
     assert.equal(after.scroll, before.scroll); assert.equal(after.y, before.y);
-    assert.ok(after.sameRow && after.sameSearch); assert.equal(after.message, true, 'single toggles show no toast'); assert.equal(reads, 1);
+    assert.ok(after.sameRow && after.sameSearch); assert.equal(after.message, false, 'single toggles confirm the saved model visibility'); assert.equal(reads, 1);
     assert.equal(await js(`document.querySelector('[data-scope="supplier"]').getAttribute('aria-checked')`), 'mixed');
     await js(`document.querySelector('[data-action="hide-model"][data-id="channel/model-13"]').click();document.querySelector('[data-action="hide-model"][data-id="channel/model-14"]').click()`);
     await wait(`visibilityPending.size===0`);
@@ -132,10 +133,10 @@ async function run() {
       const scrollViewport = document.querySelector('#main').getBoundingClientRect();
       const close = message.querySelector('button').getBoundingClientRect();
       return !message.hidden && rect.width > 0 && rect.height > 0
-        && rect.left >= 0 && rect.right <= innerWidth && rect.bottom <= scrollViewport.top
+        && rect.left >= 0 && rect.right <= innerWidth && rect.top >= scrollViewport.top && rect.bottom <= innerHeight
         && close.left >= rect.left && close.right <= rect.right
         && close.top >= rect.top && close.bottom <= rect.bottom;
-    })()`), 'save errors remain visible in reserved feedback space with a reachable close control');
+    })()`), 'save errors remain visible in the feedback popover with a reachable close control');
     fail = false;
     await click('[data-filter="shown"]');
     await click('[data-action="hide-model"][data-id="channel/model-20"]'); await wait(`visibilityPending.size===0`);
@@ -169,6 +170,65 @@ async function run() {
     await click('#cancel-editor'); await wait(`!document.querySelector('#editor').open`);
     await click('[data-action="edit-provider"][data-id="qa"]'); await js(`activateEditorSection('models')`);
     assert.equal(await js(`document.querySelector('[data-pref="name"]').value`), '', 'cancel discards the model parameter draft');
+    await click('#cancel-editor'); await wait(`!document.querySelector('#editor').open`);
+    // The supplier model browser keeps long names readable and selection separate from editing.
+    providerFixture = { ...providerFixture, models: [], defaultModels: ['long'], available: [providerFixture.available[0], ...Array.from({length:36},(_,i)=>({id:`vendor/model-${i}-long-identifier`,name:i===0?'可识别的模型名称 / Long readable model name':'Catalog Model '+i,context:128000,images:i%2===0,price:i===2?{input:0,output:0}:{input:0.5,output:2},...(i===2?{list:{input:0,output:0}}:{})}))] };
+    await click('#refresh'); await wait(`!document.querySelector('#refresh').disabled`);
+    await click('[data-action="edit-provider"][data-id="qa"]'); await js(`activateEditorSection('models')`);
+    assert.equal(await js(`document.querySelectorAll('.provider-model-row').length`),37);
+    assert.equal(await js(`document.querySelector('.provider-model-row strong').textContent`),'Long Context');
+    assert.ok(await js(`(()=>{const e=document.querySelector('.provider-model-row strong'),s=getComputedStyle(e);return parseFloat(s.fontSize)>=14&&s.color===getComputedStyle(document.body).color;})()`),'model names use readable primary text');
+    assert.ok(await js(`(()=>{const e=document.querySelector('#provider-model-list');return e.scrollHeight>e.clientHeight&&e.clientHeight<=360;})()`),'the catalog has a bounded scrolling viewport');
+    await js(`(()=>{const n=document.querySelector('[data-pref="name"]');n.value='Draft kept';n.dispatchEvent(new Event('input',{bubbles:true}));const p=document.querySelector('[data-price="output"]');p.value='12';p.dispatchEvent(new Event('input',{bubbles:true}));globalThis.modelParameter=p;})()`);
+    const filterModels = async (query,filter='all') => js(`(()=>{const q=document.querySelector('#provider-model-search'),f=document.querySelector('#provider-model-filter');q.value=${JSON.stringify(query)};f.value=${JSON.stringify(filter)};q.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+    await filterModels('Long readable');
+    assert.equal(await js(`document.querySelectorAll('.provider-model-row').length`),1);
+    assert.equal(await js(`modelParameter===document.querySelector('[data-price="output"]')`),true,'searching leaves the price draft mounted');
+    await click('[data-provider-model-pick="vendor/model-0-long-identifier"]');
+    assert.equal(await js(`modelParameter===document.querySelector('[data-price="output"]')`),true,'selection leaves parameter fields mounted');
+    await filterModels('', 'picked');
+    assert.equal(await js(`document.querySelectorAll('.provider-model-row').length`),2);
+    await filterModels('', 'free');
+    assert.equal(await js(`document.querySelectorAll('.provider-model-row').length`),1);
+    assert.match(await js(`document.querySelector('.provider-model-row').textContent`),/Catalog Model 2/);
+    await filterModels('no matching model');
+    assert.match(await js(`document.querySelector('.provider-model-empty').textContent`),/没有匹配/);
+    await filterModels('');
+    await click('[data-action="configure-provider-model"][data-id="vendor/model-0-long-identifier"]');
+    assert.equal(await js(`document.querySelector('.model-setting').dataset.model`),'vendor/model-0-long-identifier');
+    assert.deepEqual(await js(`configuredProviderModelIds()`),['long','vendor/model-0-long-identifier'],'opening parameters does not change selection');
+    await click('[data-action="reset-model-pref"][data-id="vendor/model-0-long-identifier"]');
+    assert.match(await js(`document.querySelector('[data-provider-model="vendor/model-0-long-identifier"] .provider-model-price').textContent`),/输入 \$0\.5输出 \$2/,'reset inherits the catalog price even without a separate list-price field');
+    await click('[data-action="configure-provider-model"][data-id="long"]');
+    assert.equal(await js(`document.querySelector('[data-price="output"]').value`),'12');
+    assert.equal(await js(`document.querySelector('[data-pref="name"]').value`),'Draft kept','switching models retains parameter drafts');
+    await click('[data-action="reset-model-pref"][data-id="long"]');
+    assert.equal(await js(`document.querySelector('[data-pref="name"]').value`),'');
+    assert.equal(await js(`document.querySelector('[data-pref="customPrice"]').checked`),false,'reset remounts the selected model defaults');
+    providerFixture.available[0]={...providerFixture.available[0],price:{input:2,output:10},list:{input:2,output:10},ownPrice:false};
+    await click('[data-action="fetch-edit-models"]');await wait(`!document.querySelector('[data-action="fetch-edit-models"]').disabled`);
+    assert.equal(await js(`document.querySelector('[data-price="input"]').dataset.inherit`),'2','refreshing the active model updates inherited prices');
+    await click('[data-pref="customPrice"]');
+    await js(`(()=>{const p=document.querySelector('[data-price="output"]');p.value='12';p.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+    assert.match(await js(`document.querySelector('[data-provider-model="long"] .provider-model-price').textContent`),/输入 \$2输出 \$12/,'the row price follows the live parameter draft');
+    assert.equal(await js(`editor.modelPrefs.long.price.input`),2,'a blank input inherits the refreshed official price');
+    await js(`(()=>{const p=document.querySelector('[data-price="input"]');p.value='-1';p.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+    await filterModels('Long Context');
+    assert.match(await js(`document.querySelector('[data-provider-model="long"] .provider-model-price').textContent`),/价格待完善/,'redrawing the list retains the invalid-price state');
+    await js(`(()=>{const p=document.querySelector('[data-price="input"]');p.value='';p.dispatchEvent(new Event('input',{bubbles:true}));})()`);
+    await filterModels('');
+    await click('[data-pref="customPrice"]');
+    assert.match(await js(`document.querySelector('[data-provider-model="long"] .provider-model-price').textContent`),/输入 \$2输出 \$10/,'turning off the override restores the official row price');
+    const screenshot=async name=>{if(!process.env.WHALEBRIDGE_QA_SCREENSHOTS)return;await js(`Promise.all(document.getAnimations().filter(a=>a.effect.getTiming().iterations!==Infinity).map(a=>a.finished))`);await js(`new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)))`);fs.mkdirSync(process.env.WHALEBRIDGE_QA_SCREENSHOTS,{recursive:true});fs.writeFileSync(path.join(process.env.WHALEBRIDGE_QA_SCREENSHOTS,name+'.png'),(await win.webContents.capturePage()).toPNG());};
+    win.setContentSize(1120,800); await wait(`innerWidth===1120`); await js(`document.querySelector('.editor-content').scrollTop=0`);
+    await screenshot('provider-models-light');
+    nativeTheme.themeSource='dark'; await wait(`document.documentElement.hasAttribute('data-ds-dark-theme')`); await screenshot('provider-models-dark');
+    await click('[data-action="configure-provider-model"][data-id="long"]');await screenshot('provider-model-parameters-dark');await js(`document.querySelector('.editor-content').scrollTop=0`);
+    win.setContentSize(390,844); await wait(`innerWidth===390`);
+    assert.ok(await js(`(()=>{const dialog=document.querySelector('#editor'),content=document.querySelector('.editor-content');return dialog.scrollWidth<=dialog.clientWidth&&content.scrollWidth<=content.clientWidth;})()`),'the narrow model editor has no horizontal overflow');
+    assert.ok(await js(`[...document.querySelectorAll('.provider-model-row')].every(row=>{const a=row.querySelector('label').getBoundingClientRect(),b=row.querySelector('button').getBoundingClientRect();return a.right<=b.left;})`),'long identities leave the parameter action clear');
+    await screenshot('provider-models-narrow');
+    nativeTheme.themeSource='light'; win.setContentSize(900,780); await wait(`innerWidth===900`);
     await click('#cancel-editor'); await wait(`!document.querySelector('#editor').open`);
     groupFixture = { id:'route',name:'QA route',members:['qa/long'],routing:'manual',pick:'qa/long',matched:[] };
     await click('#refresh'); await wait(`!document.querySelector('#refresh').disabled`); await click('[data-tab="routing"]');

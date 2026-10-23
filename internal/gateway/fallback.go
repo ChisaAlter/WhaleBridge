@@ -30,6 +30,7 @@ import (
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/routes"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
@@ -58,6 +59,8 @@ type candidate struct {
 	// it is in (weightedUnits), for affinity to charge the member that
 	// keeps a conversation (weightedKept)
 	seats []wrrSeat
+	// roundPick belongs to this request's provider-weighted selection.
+	roundPick *routes.PickReceipt
 }
 
 // capHold is how an account is held at its usage cap: the cap of the
@@ -121,7 +124,7 @@ func (c candidate) pooled(now time.Time) bool {
 	if c.p.Account == nil {
 		return false
 	}
-	return allowances(c.p.Account.UsageAgent())[c.p.Account.User].Pooled(c.model, provider.SpentShareOf(c.p.Routing), now)
+	return allowances(c.p.Account.UsageAgent())[c.p.Account.User].Pooled(c.model, provider.SpentShareOf(routingOf(c.p.Routing)), now)
 }
 
 // who is the key or account itself, however many the provider has on: a
@@ -337,7 +340,7 @@ func (s *Server) plan(p provider.Provider, model string, from provider.Protocol)
 		cs, wg := weigh(q, cs, m, from)
 		for i, c := range cs {
 			w := weighed(c, q, wg, fallback, from)
-			w.Turn = i == 0 && (q.Routing == provider.Rotate || q.Routing == provider.Weighted) && len(cs) > 1
+			w.Turn = i == 0 && goesRound(q.Routing) && len(cs) > 1
 			pl.order = append(pl.order, w)
 		}
 		pl.order = append(pl.order, asideOf(aside, q, fallback, from)...)
@@ -415,7 +418,7 @@ func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.
 		}
 		return cs
 	}
-	if g.Routing != provider.Ordered {
+	if routingOf(g.Routing) != provider.Ordered {
 		// what the group weighs: each of its models' keys or accounts,
 		// and each group in it as one — planned by its own routing, put
 		// where the one it would try first is, the rest of it after
@@ -427,7 +430,7 @@ func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.
 		}
 		// a group routed by weight weighs its members, each whole: a
 		// model's keys in its provider's order, a group in it in its own
-		byWeight := g.Routing == provider.Weighted
+		byWeight := weighsByWeight(g.Routing)
 		var units []unit
 		var heads []candidate
 		at := map[string][]int{} // a head's seat → its units, in turn
@@ -461,7 +464,7 @@ func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.
 				var order []Weighed
 				for k, c := range cs {
 					w := weighed(c, m.Provider, wg, false, from)
-					w.Turn = k == 0 && (m.Provider.Routing == provider.Rotate || m.Provider.Routing == provider.Weighted) && len(cs) > 1
+					w.Turn = k == 0 && goesRound(m.Provider.Routing) && len(cs) > 1
 					w.Via = m.Groups()
 					order = append(order, w)
 				}
@@ -482,9 +485,10 @@ func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.
 				members[i] = u.member
 			}
 			var out []candidate
-			for i, k := range weightedUnits(g, members, heads) {
+			unitOrder, receipt := weightedUnits(g, members, heads)
+			for i, k := range unitOrder {
 				u := units[k]
-				seat := wrrSeat{round: provider.GroupPrefix + g.ID, member: u.member}
+				seat := wrrSeat{round: provider.GroupPrefix + g.ID, member: u.member, pick: receipt}
 				for _, c := range u.cs {
 					c.seats = append(slices.Clip(c.seats), seat)
 					out = append(out, c)
@@ -515,7 +519,7 @@ func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.
 			w := weighed(c, u.m.Provider, wg, false, from)
 			w.Routing, w.Via = g.Routing, u.m.Groups()
 			w.Sunk = nil // weighed as the group's, whose own Sink tells
-			w.Turn = i == 0 && g.Routing == provider.Rotate && len(weighedHeads) > 1
+			w.Turn = i == 0 && rotates(g.Routing) && len(weighedHeads) > 1
 			pl.order = append(pl.order, w)
 			out = append(out, c)
 		}
@@ -537,7 +541,7 @@ func planLevel(g provider.Group, ms []provider.Member, depth int, from provider.
 		cs, wg := weigh(m.Provider, keys(m), m.Model, from)
 		for k, c := range cs {
 			w := weighed(c, m.Provider, wg, false, from)
-			w.Turn = k == 0 && (m.Provider.Routing == provider.Rotate || m.Provider.Routing == provider.Weighted) && len(cs) > 1
+			w.Turn = k == 0 && goesRound(m.Provider.Routing) && len(cs) > 1
 			w.Via = m.Groups()
 			pl.order = append(pl.order, w)
 		}
@@ -567,7 +571,7 @@ func firstAwake(cs []candidate) candidate {
 // goes first whichever provider it is of; one set another way keeps it,
 // as the user set it, whatever g's routing.
 func ownRouting(p provider.Provider, g provider.Group) bool {
-	return p.Routing != "" && p.Routing != g.Routing
+	return routingOf(p.Routing) != "" && routingOf(p.Routing) != routingOf(g.Routing)
 }
 
 // capHeld is how the account acct of p is held at its usage cap for
@@ -1157,18 +1161,26 @@ func tooLongUnsaid(p provider.Provider, model string, tokens, status int, body [
 	return fmt.Sprintf("%s (%s answered %d)", msg, p.Name, status), true
 }
 
-// windowOf is the tokens a provider's model takes, where known: the
-// user's (Provider.ContextOf), else its catalog entry's.
+// windowOf uses the same window Provider.WindowOf publishes to clients:
+// an explicit model value, then the provider's own list with its wildcard
+// fitted, before a heuristic catalog entry or an otherwise unknown model.
 func windowOf(p provider.Provider, model string) int {
-	if n := p.ContextOf(model); n > 0 {
+	if n := p.Contexts[model]; n > 0 {
 		return n
+	}
+	for _, m := range p.Available() {
+		if m.ID == model {
+			if n := p.WindowOf(m); n > 0 {
+				return n
+			}
+		}
 	}
 	for _, e := range provider.Served() {
 		if e.Group == "" && e.Provider.ID == p.ID && (e.Model == model || e.ID == model) && e.Context > 0 {
-			return e.Context
+			return e.Context // Provider.WindowOf, with provider-wide limits fitted
 		}
 	}
-	return 0
+	return p.ContextOf(model)
 }
 
 const (

@@ -103,6 +103,7 @@ type signInFlow struct {
 	// or a pasted address, whichever came first
 	claimed  bool
 	finished bool // first outcome owns account publication
+	kept     bool // the account was stored; a later cancel is too late
 	done     chan struct{}
 
 	// proxy is the one the sign-in's requests go through, as netproxy.With
@@ -131,7 +132,36 @@ type SignInOptions struct {
 // sees an account signed in from where its requests will come from, not
 // signed in through the global proxy and used through its own (#1663).
 func (s *signInFlow) via(ctx context.Context) context.Context {
-	return netproxy.With(ctx, s.proxy)
+	return context.WithValue(netproxy.With(ctx, s.proxy), signInKey{}, s)
+}
+
+type signInKey struct{}
+
+var errSignInOver = errors.New("the sign-in was canceled; start it again")
+
+// keepLogin stores the account only while the sign-in carried by ctx is
+// live. Callers outside a sign-in retain their normal saving behaviour.
+func keepLogin(ctx context.Context, store func() error) error {
+	if s, ok := ctx.Value(signInKey{}).(*signInFlow); ok {
+		return s.keep(store)
+	}
+	return store()
+}
+
+// keep and finish share the flow's lock. Cancellation before the write
+// prevents it; once a successful write completes, cancellation is too late
+// and the sign-in can publish done, matching the saved account.
+func (s *signInFlow) keep(store func() error) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.finished {
+		return errSignInOver
+	}
+	if err := store(); err != nil {
+		return err
+	}
+	s.kept = true
+	return nil
 }
 
 // pickProxy sets the proxy a sign-in to agent goes through.
@@ -186,7 +216,7 @@ func StartSignInWith(agent string, o SignInOptions) (SignInState, error) {
 	}
 	// one moved onto its plugin signs in there: an account signed in to
 	// here would be the built-in's, which nothing serves now
-	if Moved(agent) {
+	if PluginServes(agent) {
 		return SignInState{}, fmt.Errorf("%s runs on its plugin: sign in through the plugin (magpie plugin login %s)", agent, agent)
 	}
 	s := &signInFlow{verifier: randomToken(48), state: randomToken(24), done: make(chan struct{}), site: site}
@@ -650,7 +680,7 @@ func (s *signInFlow) status() SignInState {
 // finish records the outcome once and lets the callback server go.
 func (s *signInFlow) finish(out SignInState) bool {
 	s.mu.Lock()
-	if s.finished {
+	if s.finished || s.kept && out.State == "canceled" {
 		s.mu.Unlock()
 		return false
 	}
@@ -752,7 +782,7 @@ func (s *signInFlow) callback(w http.ResponseWriter, r *http.Request) {
 	}
 	if err == nil {
 		var using bool
-		if using, err = addLogin(l); err == nil {
+		if err = keepLogin(ctx, func() (err error) { using, err = addLogin(l); return err }); err == nil {
 			s.finish(SignInState{State: "done", User: l.User, Plan: l.Plan, Using: using})
 			signInPage(w, true, "You're signed in", fmt.Sprintf("%s is added to magpie. You can close this tab.", l.User))
 			return
@@ -767,7 +797,7 @@ func (s *signInFlow) callback(w http.ResponseWriter, r *http.Request) {
 func (s *signInFlow) googleDone(ctx context.Context, w http.ResponseWriter, app googleApp, code string) {
 	g, plan, err := googleExchange(ctx, app, code, s.verifier, s.redirect)
 	if err == nil {
-		err = addGoogleLogin(app.agent, g.user, plan, g.auth)
+		err = keepLogin(ctx, func() error { return addGoogleLogin(app.agent, g.user, plan, g.auth) })
 	}
 	if err != nil {
 		s.finish(SignInState{State: "failed", Error: err.Error()})

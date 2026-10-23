@@ -147,7 +147,7 @@ test('real WhaleBridge account UI retains connection feedback and consistent res
       assert.ok(success.nextStep.includes('\u4e0b\u4e00\u6b65'), 'the next action has a visible heading');
       assert.ok(success.detail.includes('\u6a21\u578b\u5df2\u540c\u6b65\u5230\u9cb8\u5c7f'), 'success confirms model synchronization');
       assert.ok(success.instruction.includes('\u6a21\u578b\u9009\u62e9\u5668'), 'the success detail explains the next action');
-      assert.ok(success.instruction.includes('\u9cb8\u6865'), 'the next action identifies the desktop model channel');
+      assert.ok(success.instruction.includes('鲸Bridge'), 'the next action identifies the desktop model channel');
       assert.equal(success.primary, '\u67e5\u770b\u4f9b\u5e94\u5546');
       assert.equal(success.primaryHidden, false);
       assert.equal(success.primaryDisabled, false);

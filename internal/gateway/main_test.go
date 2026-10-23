@@ -7,7 +7,10 @@ import (
 	"testing"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/agentenv"
+	"github.com/ChisaAlter/WhaleBridge/internal/gwmw"
+	"github.com/ChisaAlter/WhaleBridge/internal/masking"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/ChisaAlter/WhaleBridge/internal/routes"
 	"github.com/ChisaAlter/WhaleBridge/internal/testenv"
 )
 
@@ -35,7 +38,26 @@ func TestMain(m *testing.M) {
 // Isolate every process, including the cold-start redaction tests. HOME
 // alone does not isolate the macOS Keychain, and account caches eventually
 // expire: discovery must keep finding only the test's sign-ins and CLIs.
+var builtinMaskerRemove func()
+var routeBuiltinStop func()
+
+func withoutBuiltinRoutes(t *testing.T) {
+	t.Helper()
+	routeBuiltinStop()
+	t.Cleanup(func() { routeBuiltinStop = routes.RegisterBuiltins() })
+}
+
+func withoutBuiltinMasker(t *testing.T) {
+	t.Helper()
+	builtinMaskerRemove()
+	t.Cleanup(func() { builtinMaskerRemove = gwmw.Mask(masking.Masker{}) })
+}
+
 func isolatedTests(m *testing.M) (int, error) {
+	routeBuiltinStop = routes.RegisterBuiltins()
+	defer func() { routeBuiltinStop() }()
+	builtinMaskerRemove = gwmw.Mask(masking.Masker{})
+	defer func() { builtinMaskerRemove() }()
 	home, err := os.MkdirTemp("", "magpie-gateway-test-")
 	if err != nil {
 		return 1, err

@@ -163,10 +163,19 @@ func subscriptionAdapters(ctx context.Context) map[string]any {
 	for _, e := range plugin.Market(ctx) {
 		available = append(available, e)
 	}
+	candidates := map[string]provider.MoveCandidate{}
+	for _, candidate := range provider.MoveCandidates() {
+		candidates[candidate.ID] = candidate
+	}
 	for _, id := range provider.MovableIDs() {
 		m, _ := provider.MigrationOf(id)
-		p, _ := provider.Find(id)
-		moves = append(moves, map[string]any{"id": id, "package": provider.MovePackage(id), "moved": provider.Moved(id), "signedIn": p != nil && p.Account != nil, "state": m.State, "error": m.Err})
+		candidate := candidates[id]
+		why, message := m.Why, m.Err
+		if candidate.Error != "" {
+			why, message = candidate.Why, candidate.Error
+		}
+		blocked := why != nil && why.Code == "native"
+		moves = append(moves, map[string]any{"id": id, "package": provider.MovePackage(id), "moved": provider.Moved(id), "retired": provider.BuiltinRetired(id), "signedIn": candidate.Accounts > 0, "accounts": candidate.Accounts, "state": m.State, "error": message, "why": why, "nativeSkipped": blocked, "canMove": !blocked && !provider.Moved(id)})
 	}
 	out := map[string]any{"installed": installed, "available": available, "moves": moves, "updates": plugin.PendingUpdates(), "bun": plugin.HasBun(), "bunVer": plugin.BunInUse(), "mirror": settings.Load().ChinaMirror, "prefer": list.Prefer}
 	if providerErr != nil {

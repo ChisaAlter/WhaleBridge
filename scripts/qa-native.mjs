@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 const repo = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const payload = resolve(process.env.WHALEBRIDGE_QA_PACKAGE || join(repo, '.tmp/whalebridge-package'));
 const manifest = JSON.parse(readFileSync(join(payload, 'WhaleBridge-component.json')));
+assert.equal(manifest.name, '鲸Bridge');
 const spec = manifest.platforms['win32-x64'];
 const binary = join(payload, spec.asset);
 const bytes = readFileSync(binary);
@@ -54,19 +55,26 @@ try {
   assert.equal(cookie, `magpie_web_${url.port}=${url.searchParams.get('k')}`);
   const headers = { Cookie: cookie };
   const page = await fetch(url.origin, { headers });
-  assert.equal(page.status, 200); assert.match(await page.text(), /agents\.js/);
+  assert.equal(page.status, 200); const html = await page.text(); assert.match(html, /agents\.js/); assert.match(html, /<title>鲸Bridge · 模型连接组件<\/title>/);
   const response = await fetch(`${url.origin}/api/agents`, { headers });
   assert.equal(response.status, 200);
   const agents = await response.json();
   assert.equal(agents.defaultAgent, 'dsh'); assert.ok(agents.agents.some(agent => agent.id === 'codex'));
   const saved = readFileSync(patch, 'utf8');
   assert.match(saved, /whalebridge/); assert.match(saved, /provider: existing/);
-  console.log(`WhaleBridge ${manifest.version}: native startup, embedded page and default WhaleIsle passed`);
+  console.log(`鲸Bridge ${manifest.version}: native startup, embedded page and default WhaleIsle passed`);
 } finally {
   if (child.pid && child.exitCode === null) {
     const closed = new Promise(resolve => child.once('close', resolve));
-    if (process.platform === 'win32') execFileSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' });
-    else child.kill();
+    if (process.platform === 'win32') {
+      try { execFileSync('taskkill', ['/PID', String(child.pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' }); }
+      catch (error) {
+        // The component may have exited while taskkill was starting. A real
+        // termination failure still needs to surface if the process exists.
+        try { process.kill(child.pid, 0); } catch (probe) { if (probe.code === 'ESRCH') error = null; }
+        if (error) throw error;
+      }
+    } else child.kill();
     await closed;
   }
   const owned = relative(resolve(tmpdir()), resolve(profile));

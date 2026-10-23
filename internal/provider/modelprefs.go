@@ -33,7 +33,7 @@ import (
 
 // ModelName is the name the user gave a provider's model, if any.
 func ModelName(pid, model string) (string, bool) {
-	return modelNameIn(settings.Load().ModelNames, pid, model)
+	return modelNameIn(heldSettings().ModelNames, heldProviderID(pid), model)
 }
 
 func modelNameIn(names map[string]string, pid, model string) (string, bool) {
@@ -311,7 +311,7 @@ func setModelReasonless(ref string, on bool) (bool, error) {
 	}
 	s := settings.Load()
 	key := p.ID + "/" + model
-	if s.ModelReasonless[key] == on {
+	if s.ModelReasonless[key] == on && (!on || len(s.ModelEfforts[key]) == 0) {
 		return false, nil
 	}
 	if on {
@@ -329,17 +329,16 @@ func setModelReasonless(ref string, on bool) (bool, error) {
 	return true, nil
 }
 
-// Reasonless reports whether the user said pid's model takes no reasoning
-// ask (SetModelReasonless).
+// Reasonless reports the user's explicit switch for this provider's model.
 func Reasonless(pid, model string) bool {
-	return heldSettings().ModelReasonless[pid+"/"+model]
+	return heldSettings().ModelReasonless[heldProviderID(pid)+"/"+model]
 }
 
 // ModelEfforts are the reasoning levels the user kept of the provider's
 // models, by model id.
 func (p Provider) ModelEfforts() map[string][]string {
 	out := map[string][]string{}
-	for k, es := range settings.Load().ModelEfforts {
+	for k, es := range heldSettings().ModelEfforts {
 		if m, ok := strings.CutPrefix(k, p.ID+"/"); ok && len(es) > 0 {
 			out[m] = es
 		}
@@ -458,9 +457,6 @@ func setModelAPI(ref, api string) (bool, error) {
 // ModelAPI is the API the user said p's model is asked on, when p has a
 // URL for it still.
 func (p Provider) ModelAPI(model string) (Protocol, bool) {
-	if len(p.Speaks()) < 2 {
-		return "", false
-	}
 	proto := Protocol(heldSettings().ModelAPIs[p.ID+"/"+model])
 	if proto == "" || !modelAPI(proto) || p.Base(proto) == "" {
 		return "", false
@@ -621,7 +617,7 @@ func setModelSame(ref, same string) (bool, error) {
 
 // ImageOverride is the user's answer for whether pid's model takes images.
 func ImageOverride(pid, model string) (bool, bool) {
-	return ImageOverrideIn(settings.Load(), pid, model)
+	return ImageOverrideIn(heldSettings(), heldProviderID(pid), model)
 }
 
 // ImageOverrideIn is ImageOverride from settings s already read: a list of
@@ -846,7 +842,7 @@ func SetPlainNames(on bool) error {
 // ModelNames are the names the user gave the provider's models, by model id.
 func (p Provider) ModelNames() map[string]string {
 	out := map[string]string{}
-	for k, n := range settings.Load().ModelNames {
+	for k, n := range heldSettings().ModelNames {
 		if m, ok := strings.CutPrefix(k, p.ID+"/"); ok && n != "" {
 			out[m] = n
 		}
@@ -892,7 +888,7 @@ func ServesModel(p Provider, model string) bool { return p.serves(model) }
 // model asked for by the name the vendor serves it under is not read as
 // another one.
 func UpstreamName(p Provider, model string) string {
-	return UpstreamNameIn(settings.Load().ModelWires, p.ID, model)
+	return UpstreamNameIn(heldSettings().ModelWires, p.ID, model)
 }
 
 // UpstreamNameIn is UpstreamName over a settings' ModelWires already read,
@@ -922,7 +918,7 @@ func UpstreamNameIn(wires map[string]string, pid, model string) string {
 // asks for gemini-3.7-flash-high and gemini-3.7-flash-low each by its own,
 // rather than for the one id whatever level the effort picked.
 func UpstreamNameAs(p Provider, model, sent string) string {
-	return UpstreamNameAsIn(settings.Load().ModelWires, p.ID, model, sent)
+	return UpstreamNameAsIn(heldSettings().ModelWires, p.ID, model, sent)
 }
 
 // UpstreamNameAsIn is UpstreamNameAs over a settings' ModelWires already
@@ -1218,7 +1214,7 @@ func wireKey(wires map[string]string, pid, model string) string {
 // only whitespace is none, and is not listed.
 func (p Provider) UpstreamNames() map[string]string {
 	out := map[string]string{}
-	for k, n := range settings.Load().ModelWires {
+	for k, n := range heldSettings().ModelWires {
 		if m, ok := strings.CutPrefix(k, p.ID+"/"); ok {
 			if n = strings.TrimSpace(n); n != "" {
 				out[m] = n

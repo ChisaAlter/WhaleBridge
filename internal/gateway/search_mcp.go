@@ -197,6 +197,10 @@ func (s *Server) searchMCPRun(r *http.Request, query string) (string, error) {
 	}
 	defer release()
 	ctx := context.WithValue(r.Context(), searchForKey{}, &CallFor{Agent: callerOf(r).agent, MCP: true})
+	ctx, maskErr := captureMasking(ctx)
+	if maskErr != nil {
+		return "", maskErr
+	}
 	said, _, err := s.webSearch(ctx, query)
 	if err != nil {
 		if r.Context().Err() == nil {
@@ -208,9 +212,9 @@ func (s *Server) searchMCPRun(r *http.Request, query string) (string, error) {
 		}
 		return "", searchMCPError(msg)
 	}
-	// what was masked on the way out (maskedQuery, or the searcher's
-	// request) is the agent's own: it gets it back
-	return restored(said, false), nil
+	// A tool result returned to the agent may contain its original values.
+	// Internal model search rounds keep their placeholders instead.
+	return restoreMasked(ctx, said)
 }
 
 // readMCPBody reads a request body of at most limit bytes, answering 413

@@ -260,8 +260,17 @@ func (p Provider) refetch(ctx context.Context) ([]catalog.Model, []string, map[s
 			log.Println(p.ID + ": " + derr.Error())
 		}
 	}
-	if err != nil || len(before) == 0 {
+	if err != nil {
 		return ms, nil, before, err
+	}
+	if len(before) == 0 {
+		// A first successful list can restore picks set aside earlier too.
+		if now := liveIDs(p.ID); len(now) > 0 && len(p.Delisted) > 0 {
+			if _, derr := dropGonePicks(p.ID, nil, now); derr != nil {
+				log.Println(p.ID + ": " + derr.Error())
+			}
+		}
+		return ms, nil, before, nil
 	}
 	now := liveIDs(p.ID)
 	if len(now) == 0 {
@@ -286,8 +295,8 @@ func liveIDs(id string) map[string]bool {
 	return out
 }
 
-// dropGonePicks takes out of the saved provider's picks those before had
-// and now doesn't, and answers them.
+// dropGonePicks sets aside picks the old list had and the new list omits.
+// A later list restores them from Delisted; a hand-typed pick stays.
 func dropGonePicks(id string, before, now map[string]bool) ([]string, error) {
 	f, err := read()
 	if err != nil {
@@ -295,21 +304,65 @@ func dropGonePicks(id string, before, now map[string]bool) ([]string, error) {
 	}
 	i := slices.IndexFunc(f.Providers, func(q Provider) bool { return q.ID == id })
 	if i < 0 {
+		for old, canonical := range legacyPluginAliasesIn(f) {
+			if canonical == id {
+				i = slices.IndexFunc(f.Providers, func(q Provider) bool { return q.ID == old })
+				break
+			}
+		}
+	}
+	if i < 0 {
 		return nil, nil
 	}
+	q := &f.Providers[i]
 	var kept, dropped []string
-	for _, m := range f.Providers[i].Models {
+	for _, m := range q.Models {
 		if before[m] && !now[m] {
 			dropped = append(dropped, m)
 		} else {
 			kept = append(kept, m)
 		}
 	}
-	if len(dropped) == 0 {
+	// Install the surviving picks before restoring others: one refresh may
+	// both drop B and restore A. Writing kept afterwards would lose A.
+	if len(dropped) > 0 {
+		q.Models = kept
+		for _, m := range dropped {
+			if !slices.Contains(q.Delisted, m) {
+				q.Delisted = append(q.Delisted, m)
+			}
+		}
+	}
+	back := relistPicks(q, now)
+	if len(dropped) == 0 && !back {
 		return nil, nil
 	}
-	f.Providers[i].Models = kept
 	return dropped, store(f)
+}
+
+// relistPicks restores the set-aside picks this list has, in their order.
+func relistPicks(q *Provider, now map[string]bool) bool {
+	if len(q.Delisted) == 0 || len(now) == 0 {
+		return false
+	}
+	var still, back []string
+	for _, m := range q.Delisted {
+		if now[m] {
+			back = append(back, m)
+		} else {
+			still = append(still, m)
+		}
+	}
+	if len(back) == 0 {
+		return false
+	}
+	for _, m := range back {
+		if !slices.Contains(q.Models, m) {
+			q.Models = append(q.Models, m)
+		}
+	}
+	q.Delisted = still
+	return true
 }
 
 // fetch is Fetch without the picks looked after.
@@ -561,6 +614,9 @@ type newFetch struct {
 // skipped as they failed less than newFetchRetry ago; newFetches held.
 func newDue(ps []Provider) (due, skipped []newFetch) {
 	for _, p := range ps {
+		if p.Off || p.Hidden {
+			continue // no background fetch for a provider left alone
+		}
 		// a list of decision models fetched before magpie kept their
 		// windows and input, or not fetched yet (ARNO on Discord)
 		// one switched off isn't asked (leftAlone): a signed-in
@@ -1444,11 +1500,15 @@ func (p Provider) keyLists() (*keyLists, bool) {
 // none of its models are served, its balance and usage still read.
 func (p Provider) ServesNone() bool { return p.NoModels && len(p.Models) == 0 }
 
+// waitsForPicks prevents an entirely set-aside selection from turning into
+// the default vendor list while it waits for one of those picks to return.
+func (p Provider) waitsForPicks() bool { return len(p.Models) == 0 && len(p.Delisted) > 0 }
+
 // Exposed lists the models magpie offers to agents for this provider: the
 // user's picks; else the preset's; else everything, when that is few; none
 // after Select none (ServesNone).
 func (p Provider) Exposed() []catalog.Model {
-	if p.ServesNone() {
+	if p.ServesNone() || p.waitsForPicks() {
 		return nil
 	}
 	avail := p.Available()
@@ -1493,12 +1553,15 @@ func (p Provider) Exposed() []catalog.Model {
 		// ZCode Start Plan account's GLM-5.3) is left out all the same
 		picks = slices.DeleteFunc(slices.Clone(picks), p.Account.unusable)
 	}
+	// Select all leaves out models whose APIs have no URL here. Those
+	// models must not make that complete usable selection look partial.
+	usable := slices.DeleteFunc(slices.Clone(avail), func(m catalog.Model) bool { return p.NoAPIFor(m.ID) })
 	if len(picks) > 0 {
-		return slices.DeleteFunc(pick(p.withNewlyListed(picks, avail)), func(m catalog.Model) bool { return p.NoAPIFor(m.ID) })
+		return slices.DeleteFunc(pick(p.withNewlyListed(picks, usable)), func(m catalog.Model) bool { return p.NoAPIFor(m.ID) })
 	}
-	// a model listed on none of the APIs the provider has a URL for is
-	// left out before the first 24 are taken (#2094)
-	avail = slices.DeleteFunc(slices.Clone(avail), func(m catalog.Model) bool { return p.NoAPIFor(m.ID) })
+	// Filter before taking the default slice: an unreachable model must
+	// not displace one the provider can serve.
+	avail = usable
 	// another magpie's list is already the models its user exposed
 	if len(avail) <= manyModels || p.IsRemoteMagpie() {
 		return avail
@@ -1536,7 +1599,8 @@ func (p Provider) Picks() []string {
 	if len(p.Models) == 0 {
 		return p.Models
 	}
-	return p.withNewlyListed(p.Models, p.Available())
+	avail := slices.DeleteFunc(slices.Clone(p.Available()), func(m catalog.Model) bool { return p.NoAPIFor(m.ID) })
+	return p.withNewlyListed(p.Models, avail)
 }
 
 // withNewlyListed is picks with the models the vendor has listed since
@@ -1613,7 +1677,7 @@ func (p Provider) Efforts(model string) []string {
 	if all := p.Known(model); len(all) > 0 {
 		return all
 	}
-	return effortsKept(nil, settings.Load().ModelEfforts[p.ID+"/"+model])
+	return effortsKept(nil, heldSettings().ModelEfforts[p.ID+"/"+model])
 }
 
 // Thinks reports whether the model reasons: it has levels, its list says
@@ -1649,6 +1713,61 @@ func (p Provider) PaidBesideFree(model string) bool {
 		free = free || m.Free
 	}
 	return listed && paid && free
+}
+
+// FreeModel reports the vendor's cost for this provider and account, before
+// price rates or user overrides. An explicit free flag spends no allowance;
+// otherwise a known list price must be zero in every billing dimension and
+// every context tier. An unknown price never establishes a free model.
+func (p Provider) FreeModel(model string) bool {
+	var available []catalog.Model
+	if p.IsPlugin() {
+		// The primary provider exposes an enabled-account union for the
+		// catalog. A routing candidate must use only its actual account.
+		pp := *p.Account.plugin
+		if current, ok := PluginOf(p.ID); ok {
+			pp = current
+		}
+		actual := pluginAccountCatalog(pp, p.Account.pluginKey)
+		for _, account := range pp.Accounts {
+			if account.Key != p.Account.pluginKey {
+				continue
+			}
+			if account.Models != nil && !slices.ContainsFunc(account.Models, func(id string) bool { return strings.EqualFold(id, model) }) {
+				return false // an explicit empty or restricted list serves no such model
+			}
+			// Only this account's complete FreeModels set proves free use.
+			// nil is unknown even with one remaining account: an old cache
+			// may retain the former first account's union Free flag.
+			if slices.ContainsFunc(account.FreeModels, func(id string) bool { return strings.EqualFold(id, model) }) &&
+				slices.ContainsFunc(actual, func(m catalog.Model) bool { return strings.EqualFold(m.ID, model) }) {
+				return true
+			}
+			break
+		}
+	} else {
+		available = p.Available()
+	}
+	for _, m := range available {
+		if strings.EqualFold(m.ID, model) {
+			if m.Free {
+				return true
+			}
+			break
+		}
+	}
+	// A provider union's Free flag prices its calls but is not evidence of
+	// this account's free access. Only the account facts above may prove it.
+	pr, ok := p.listPrice(model, false)
+	if !ok || pr.Input != 0 || pr.Output != 0 || pr.CacheRead != 0 || pr.CacheWrite != 0 || pr.CacheWrite1h != 0 {
+		return false
+	}
+	for _, tier := range pr.Tiers {
+		if tier.Input != 0 || tier.Output != 0 || tier.CacheRead != 0 || tier.CacheWrite != 0 || tier.CacheWrite1h != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // Known are the model's own reasoning levels, when known.
@@ -1756,6 +1875,10 @@ var makerCatalogs = sync.OnceValue(func() []string {
 // is at the price its plugin lists it at (pluginListPrice), else, when the
 // plugin says the plan serves it free, costs nothing (pluginFree).
 func (p Provider) ListPrice(model string) (catalog.Price, bool) {
+	return p.listPrice(model, true)
+}
+
+func (p Provider) listPrice(model string, allowPluginFree bool) (catalog.Price, bool) {
 	if pr, ok := p.remotePrice(model); ok {
 		return pr, true
 	}
@@ -1793,7 +1916,7 @@ func (p Provider) ListPrice(model string) (catalog.Price, bool) {
 	if pr, ok := p.pluginListPrice(model); ok {
 		return pr, true
 	}
-	if p.pluginFree(model) {
+	if allowPluginFree && p.pluginFree(model) {
 		return catalog.Price{}, true
 	}
 	return catalog.Price{}, false
@@ -2082,7 +2205,7 @@ func SamePriceIn(s settings.Settings, providerID, model string) (catalog.Price, 
 // A price here is the provider's tariff, not the model's: the same model
 // through two relays is two prices, and neither is what models.dev lists.
 func EffectivePrice(providerID, model string) (catalog.Price, bool) {
-	return EffectivePriceIn(settings.Load(), providerID, model)
+	return EffectivePriceIn(heldSettings(), providerID, model)
 }
 
 // EffectivePriceIn is EffectivePrice at the settings given, for a caller
@@ -2108,6 +2231,7 @@ func EffectivePriceIn(s settings.Settings, providerID, model string) (catalog.Pr
 // caller pricing many models at once: byIDOrWas reads every provider's
 // accounts each time.
 func priceOf(s settings.Settings, p Provider, known bool, model string) (catalog.Price, bool) {
+	s = canonicalModelSettings(s)
 	id := p.ID
 	// then what they said the model costs from any provider (*/model):
 	// still the user's word, so before any list price
@@ -2411,7 +2535,7 @@ func buildEntries() []Entry { return entriesOff(disabledNow()) }
 // entriesOff is the providers' catalog less the models off reports.
 func entriesOff(off func(pid, model string) bool) []Entry {
 	var out []Entry
-	s := settings.Load()
+	s := heldSettings()
 	gone := retiredNow() // its vendor said it is retired (retired.go)
 	for _, p := range All() {
 		if !p.On() || p.DecideOnly() { // a dedicated decision API only routes
@@ -2433,6 +2557,7 @@ func entriesOff(off func(pid, model string) bool) []Entry {
 // window and the reply limit a request on it is routed and metered against,
 // with what the user set taken over the vendor's list and models.dev.
 func entryFor(p Provider, m catalog.Model, s settings.Settings) Entry {
+	s = canonicalModelSettings(s)
 	ctx := p.WindowOf(m)
 	output := p.replyLimit(m, s)
 	images := m.Images || catalog.SeesImages(m.ID)
@@ -2525,7 +2650,7 @@ func ServedEntryOf(id string) (Entry, bool) {
 	if err != nil || !p.serves(model) {
 		return Entry{}, false
 	}
-	s := settings.Load()
+	s := heldSettings()
 	for _, ms := range [][]catalog.Model{p.Available(), p.Exposed()} {
 		for _, m := range ms {
 			if m.ID == model {
@@ -2578,7 +2703,7 @@ func resolveIn(entries []Entry, id string) (Provider, string, bool) {
 	if pid, model, ok := strings.Cut(id, "/"); ok {
 		// the providers a request holds (All): an agent's value of a
 		// model not listed lands here
-		if p, err := findIn(All(), pid); err == nil && p.On() && !p.ServesNone() {
+		if p, err := findIn(All(), pid); err == nil && p.On() && !p.ServesNone() && !slices.Contains(p.Delisted, model) {
 			return *p, model, true
 		}
 	}
@@ -2608,12 +2733,12 @@ func resolveIn(entries []Entry, id string) (Provider, string, bool) {
 func listedBy() map[string][]Provider {
 	out := map[string][]Provider{}
 	for _, p := range All() {
-		if !p.On() || p.ServesNone() {
+		if !p.On() || p.ServesNone() || p.waitsForPicks() {
 			continue
 		}
 		seen := map[string]bool{}
 		for _, m := range p.Available() {
-			if !seen[m.ID] {
+			if !seen[m.ID] && !slices.Contains(p.Delisted, m.ID) && !p.NoAPIFor(m.ID) {
 				seen[m.ID] = true
 				out[m.ID] = append(out[m.ID], p)
 			}
@@ -2659,14 +2784,13 @@ func (p Provider) WindowOf(m catalog.Model) int {
 	if n := p.Contexts[m.ID]; n > 0 {
 		return n
 	}
-	listed := ListedWindow(m)
 	if n := p.Contexts["*"]; n > 0 {
-		if most := max(listed, m.MaxContext); most > 0 && most < n {
+		if most := max(catalog.Window(m.Context), m.MaxContext); most > 0 && most < n {
 			return most
 		}
 		return n
 	}
-	return listed
+	return ListedWindow(m)
 }
 
 // ContextOf is the context the user set for the provider's model: its own,
@@ -2686,13 +2810,14 @@ func (p Provider) ContextOf(model string) int {
 // tokens, as agents are told it and the Gateway's model list shows it:
 // the user's Max output, else the vendor's list's, else models.dev's.
 func (p Provider) ReplyLimit(m catalog.Model) int {
-	return p.replyLimit(m, settings.Load())
+	return p.replyLimit(m, heldSettings())
 }
 
 // ReplyLimitIn is ReplyLimit from settings s already read.
 func (p Provider) ReplyLimitIn(m catalog.Model, s settings.Settings) int { return p.replyLimit(m, s) }
 
 func (p Provider) replyLimit(m catalog.Model, s settings.Settings) int {
+	s = canonicalModelSettings(s)
 	output := m.Output
 	if output == 0 {
 		output = catalog.OutputOf(m.ID)
@@ -2798,7 +2923,7 @@ func SetModelOutput(id string, n int) error {
 // model id, "*" for all of them: what its editor's Max output shows.
 func OutputsOf(providerID string) map[string]int {
 	out := map[string]int{}
-	for k, n := range settings.Load().ModelOutputs {
+	for k, n := range heldSettings().ModelOutputs {
 		if model, ok := strings.CutPrefix(k, providerID+"/"); ok && model != "" && n > 0 {
 			out[model] = n
 		}
@@ -2806,17 +2931,16 @@ func OutputsOf(providerID string) map[string]int {
 	return out
 }
 
-// SetModelOutputs makes a provider's reply limits outs, by model id, "*"
-// for all of them, as its editor's Max output says (ARNO on Discord: a
-// model's maxTokens was wrong, and only the context window could be set in
-// the editor): those it leaves out are taken away, and every one set has
-// to be a model the provider serves, as for SetModelOutput. Nothing is
-// saved, nor the agents told, when nothing changed.
+// SetModelOutputs replaces a provider's reply limits, by model id ("*"
+// for all). New or changed limits must name served models. An unchanged
+// limit for a model no longer listed survives the editor's round trip;
+// omitting it removes it. An unchanged save writes and notifies nothing.
 func SetModelOutputs(providerID string, outs map[string]int) error {
 	p, err := Find(providerID)
 	if err != nil {
 		return err
 	}
+	s := settings.Load()
 	for model, n := range outs {
 		if n < 0 {
 			return errorf("an output limit is a number of tokens, not %d", n)
@@ -2824,11 +2948,10 @@ func SetModelOutputs(providerID string, outs map[string]int) error {
 		if err := settings.CheckModelKey("an output limit", p.ID+"/"+model); err != nil {
 			return err
 		}
-		if model != "*" && n > 0 && !p.serves(model) {
+		if model != "*" && n > 0 && s.ModelOutputs[p.ID+"/"+model] != n && !p.serves(model) {
 			return errorf("%s has no model %s (magpie provider %s lists them)", p.ID, model, p.ID)
 		}
 	}
-	s := settings.Load()
 	changed := false
 	for k := range s.ModelOutputs {
 		if model, ok := strings.CutPrefix(k, p.ID+"/"); ok && outs[model] <= 0 {

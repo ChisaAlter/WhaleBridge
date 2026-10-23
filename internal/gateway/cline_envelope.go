@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/tidwall/gjson"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/tidwall/gjson"
 )
 
 // clineUnwrapped is a Cline reply with the {success, data} envelope its API

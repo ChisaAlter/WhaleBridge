@@ -6,7 +6,6 @@ import (
 
 	"github.com/ChisaAlter/WhaleBridge/internal/access"
 	"github.com/ChisaAlter/WhaleBridge/internal/gwmw"
-	"github.com/ChisaAlter/WhaleBridge/internal/middleware"
 	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
@@ -24,34 +23,22 @@ func (s *Server) serveAgent(w http.ResponseWriter, r *http.Request, from provide
 	defer recorded()
 	w, body, hooked := gatewayHooks(w, r, from, body)
 	defer hooked()
-	agents := gwmw.AgentsWanted(middlewareWanted)
-	if len(agents) == 0 {
+	run := gwmw.Begin(gwmw.Info{Protocol: string(from), Model: modelOf(body), Stream: streamOf(body), Path: r.URL.Path, Agent: agentOf(r)})
+	if run == nil {
 		s.serve(w, r, from, body)
 		return
 	}
-	info := gwmw.Info{Protocol: string(from), Model: modelOf(body), Stream: streamOf(body), Path: r.URL.Path, Agent: agentOf(r)}
-	for _, a := range agents {
-		run := a.Begin(info)
-		if run == nil {
-			continue
-		}
-		defer run.End()
-		var turned *gwmw.Reject
-		body, turned = run.Request(body)
-		if turned != nil {
-			writeError(w, from, turned.Status, turned.Message)
-			return
-		}
-		var done func()
-		w, done = run.Wrap(w)
-		defer done()
+	defer run.End()
+	var turned *gwmw.Reject
+	body, turned = run.Request(body)
+	if turned != nil {
+		writeError(w, from, turned.Status, turned.Message)
+		return
 	}
+	w, done := run.Wrap(w)
+	defer done()
 	s.serve(w, r, from, body)
 }
-
-// middlewareWanted: plugins.json has a JS middleware on, so plugins/middleware
-// is in use.
-func middlewareWanted() bool { return middleware.On() > 0 }
 
 // gatewayHooks runs the asynchronous request hooks (OpenCode plugins'
 // gateway entries, in the plugin host) on an agent's request: the body they

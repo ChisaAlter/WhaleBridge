@@ -103,11 +103,11 @@ func (s *Server) kimiSearch(ctx context.Context, p provider.Provider, query stri
 	// through the plan's own proxy, if it has one (#237, #1522)
 	ctx, cancel := context.WithTimeout(s.metered(p.Via(ctx), p, ""), searchTimeout/2)
 	defer cancel()
-	q, err := maskedQuery(query, &p)
-	if err != nil {
-		return "", nil, err
+	masked, maskErr := maskedQueryIn(ctx, query, &p)
+	if maskErr != nil {
+		return "", nil, maskErr
 	}
-	body, _ := json.Marshal(map[string]any{"text_query": q, "limit": searchHits, "enable_page_crawling": false, "timeout_seconds": 30})
+	body, _ := json.Marshal(map[string]any{"text_query": masked, "limit": searchHits, "enable_page_crawling": false, "timeout_seconds": 30})
 	r, err := http.NewRequestWithContext(ctx, http.MethodPost, provider.KimiCodeSearch(p), bytes.NewReader(body))
 	if err != nil {
 		return "", nil, err

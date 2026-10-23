@@ -19,9 +19,9 @@ import (
 	"net/http"
 	"strconv"
 
-	"github.com/tidwall/gjson"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"github.com/ChisaAlter/WhaleBridge/internal/zed"
+	"github.com/tidwall/gjson"
 )
 
 // A Zed subscription is served through cloud.zed.dev/completions, the way the

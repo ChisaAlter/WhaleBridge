@@ -43,8 +43,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/tidwall/gjson"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/tidwall/gjson"
 )
 
 // cmdGenerate says whether an account is asked at /alpha/generate, where,

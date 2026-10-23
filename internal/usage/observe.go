@@ -6,91 +6,103 @@ import (
 	"sync"
 )
 
-// Observer is the gateway's observer point (P3 of
-// docs/subsystems/plugin-runtime.md): it watches what the gateway serves
-// and what the ledger is written, and never changes either. A plugin
-// registers one with Observe while it is on (plugins/otel registers
-// internal/otlp's exporter); with none registered the gateway does no
-// observing work at all, not even keeping a reply's whole body.
-//
-// It lives here, not in the gateway, because every row it sees is a usage
-// Record and the ledger's other writers (budget, routing decisions) reach
-// it too.
+// Observer receives completed ledger rows without altering accounting. Ledger
+// must return promptly; request-aware observers may also implement RequestObserver.
 type Observer interface {
-	// Serve runs it while this process serves the gateway; stop ends it,
-	// after the calls in flight have finished
 	Serve() (stop func())
-	// Bodies is how much of a request's bodies it wants now
-	Bodies() Bodies
-	// Begin is asked as each gateway request starts; nil leaves the
-	// request unwatched by it
-	Begin(Request) Watch
-	// Ledger is each row Append writes. A row of a request some observer
-	// watched has Watched set.
 	Ledger(Record)
 }
 
-// Watch is one request an Observer watches.
+// RequestObserver watches attempts separately from their eventual ledger row.
+// Legacy metadata observers need only Serve and Ledger.
+type RequestObserver interface {
+	Observer
+	Bodies() Bodies
+	Begin(Request) Watch
+}
+
 type Watch interface {
-	// Attempt is each routing attempt, unbilled failures and retries
-	// included, timed as the attempt and not the whole request
 	Attempt(Record)
-	// End is the request's end: its time, agent, model, status and length
 	End(Record)
 }
 
-// Request is what an Observer is told of a request as it starts.
 type Request struct {
-	Header http.Header
-	// Agent the agent that sent it, Session its native session when it
-	// names one, else magpie's
+	Header         http.Header
 	Agent, Session string
-	// Kind its call kind ("web_search", "vision", …), "auxiliary" for
-	// Claude's tool-less small helper calls, "" for an agent's own turn
-	Kind string
-	// Plain is a loopback request with no gateway key, not passed on from
-	// another magpie: one the agent's own transcript can hold
-	Plain bool
+	Kind           string
+	Plain          bool
 }
 
-// Bodies is how much of a request's and reply's bodies an observer wants.
 type Bodies int
 
 const (
-	NoBodies       Bodies = iota
-	CapturedBodies        // the first 256 KiB Recent calls keeps
-	WholeBodies           // uncut: the reply is spooled as it streams
+	NoBodies Bodies = iota
+	CapturedBodies
+	WholeBodies
 )
 
-var (
-	obsMu     sync.Mutex
-	observers []*observing
-	serving   int // ServeObservers calls not yet stopped
-)
+const BodyCut = "\n… (cut here by magpie)"
+
+func RequestObservers() []RequestObserver {
+	var out []RequestObserver
+	for _, observer := range Observers() {
+		if request, ok := observer.(RequestObserver); ok {
+			out = append(out, request)
+		}
+	}
+	return out
+}
+
+func ObservedBodies() Bodies {
+	bodies := NoBodies
+	for _, observer := range RequestObservers() {
+		func() { defer func() { _ = recover() }(); bodies = max(bodies, observer.Bodies()) }()
+	}
+	return bodies
+}
 
 type observing struct {
 	o    Observer
-	stop func() // while serving
+	stop func()
 }
 
-// Observe registers o until remove is called. While this process serves
-// the gateway it is started at once.
-func Observe(o Observer) (remove func()) {
-	obsMu.Lock()
+var obs = struct {
+	sync.Mutex
+	items   []*observing
+	serving int
+}{}
+
+// obsLife serializes starts/stops without holding the snapshot lock across a
+// worker join. A Ledger callback may read Observers while its worker stops.
+var obsLife sync.Mutex
+
+// Observe registers an observer, starting it now when the gateway is served.
+func Observe(o Observer) func() {
+	if o == nil {
+		return func() {}
+	}
+	obsLife.Lock()
+	defer obsLife.Unlock()
 	ob := &observing{o: o}
-	if serving > 0 {
+	obs.Lock()
+	serving := obs.serving > 0
+	obs.Unlock()
+	if serving {
 		ob.stop = o.Serve()
 	}
-	observers = append(observers, ob)
-	obsMu.Unlock()
+	obs.Lock()
+	obs.items = append(obs.items, ob)
+	obs.Unlock()
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			obsMu.Lock()
-			observers = slices.DeleteFunc(slices.Clone(observers), func(x *observing) bool { return x == ob })
+			obsLife.Lock()
+			defer obsLife.Unlock()
+			obs.Lock()
+			obs.items = slices.DeleteFunc(slices.Clone(obs.items), func(x *observing) bool { return x == ob })
 			stop := ob.stop
 			ob.stop = nil
-			obsMu.Unlock()
+			obs.Unlock()
 			if stop != nil {
 				stop()
 			}
@@ -98,64 +110,71 @@ func Observe(o Observer) (remove func()) {
 	}
 }
 
-// ServeObservers starts every observer registered, and each one
-// registered later, until stop: the gateway calls it as it starts serving.
-func ServeObservers() (stop func()) {
-	obsMu.Lock()
-	serving++
-	if serving == 1 {
-		for _, ob := range observers {
+// ServeObservers starts registered observers before accepting gateway calls.
+// Stop after handlers drain; concurrent owners share one set of workers.
+func ServeObservers() func() {
+	obsLife.Lock()
+	obs.Lock()
+	obs.serving++
+	first := obs.serving == 1
+	items := slices.Clone(obs.items)
+	obs.Unlock()
+	if first {
+		for _, ob := range items {
 			ob.stop = ob.o.Serve()
 		}
 	}
-	obsMu.Unlock()
+	obsLife.Unlock()
 	var once sync.Once
 	return func() {
 		once.Do(func() {
-			obsMu.Lock()
-			serving--
+			obsLife.Lock()
+			defer obsLife.Unlock()
+			obs.Lock()
+			obs.serving--
 			var stops []func()
-			if serving == 0 {
-				for _, ob := range observers {
+			if obs.serving == 0 {
+				for _, ob := range obs.items {
 					if ob.stop != nil {
 						stops = append(stops, ob.stop)
 						ob.stop = nil
 					}
 				}
 			}
-			obsMu.Unlock()
-			for _, stop := range stops {
-				stop()
+			obs.Unlock()
+			for i := len(stops) - 1; i >= 0; i-- {
+				stops[i]()
 			}
 		})
 	}
 }
 
-// Observers are the observers registered now.
 func Observers() []Observer {
-	obsMu.Lock()
-	defer obsMu.Unlock()
-	out := make([]Observer, len(observers))
-	for i, ob := range observers {
+	obs.Lock()
+	defer obs.Unlock()
+	out := make([]Observer, len(obs.items))
+	for i, ob := range obs.items {
 		out[i] = ob.o
 	}
 	return out
 }
 
-// ObservedBodies is the most of a request's bodies any observer wants now.
-func ObservedBodies() Bodies {
-	b := NoBodies
-	for _, o := range Observers() {
-		b = max(b, o.Bodies())
-	}
-	return b
-}
-
 func observeLedger(r Record) {
 	for _, o := range Observers() {
-		o.Ledger(r)
+		copy := r
+		// Request-aware exporters own their opt-in body capture. Metadata-only
+		// plugins never receive prompts, replies or shared mutable cost pointers.
+		allowed := false
+		if request, ok := o.(RequestObserver); ok {
+			func() { defer func() { _ = recover() }(); allowed = request.Bodies() > NoBodies }()
+		}
+		if !allowed {
+			copy.BodyIn, copy.BodyOut = "", ""
+		}
+		if r.OwnCost != nil {
+			cost := *r.OwnCost
+			copy.OwnCost = &cost
+		}
+		func() { defer func() { _ = recover() }(); o.Ledger(copy) }()
 	}
 }
-
-// BodyCut ends a body the gateway captured only the start of.
-const BodyCut = "\n… (cut here by magpie)"

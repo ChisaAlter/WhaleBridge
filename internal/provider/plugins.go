@@ -47,7 +47,7 @@ const (
 // anthropic), when it is id-plugin — but for a built-in moved onto the
 // plugin, whose id the plugin has now.
 func PluginID(id string) string {
-	if Moved(id) {
+	if PluginServes(id) && !customIDs()[id] {
 		return id
 	}
 	if slices.Contains(accountIDs, id) || Preset(id) != nil || id == "magpie" || customIDs()[id] {
@@ -110,7 +110,15 @@ func pluginAccounts() []Provider {
 			continue // shown once the move is through (migrate.go)
 		}
 		if ls := pluginLogins(pp); len(ls) > 0 {
-			out = append(out, pluginProvider(pp, ls[0]))
+			// The first account is active; other accounts contribute only
+			// while switched on. Each account still routes by its own list.
+			keys := []string{ls[0].acct.Key}
+			for _, l := range ls[1:] {
+				if l.On {
+					keys = append(keys, l.acct.Key)
+				}
+			}
+			out = append(out, pluginProviderServing(pp, ls[0], keys))
 		}
 	}
 	return out
@@ -183,7 +191,16 @@ func PluginTiers(p Provider, model string) []string {
 		return nil
 	}
 	m, _ := pluginModel(pp, model)
-	return m.ServiceTiers
+	if to := pluginProtocol(pp.ID, m); to != Chat && to != Responses {
+		return nil
+	}
+	return slices.Clone(m.ServiceTiers)
+}
+
+// pluginTierOn is a declared tier on the APIs that carry service_tier.
+func pluginTierOn(provider string, m plugin.Model, tier string) bool {
+	to := pluginProtocol(provider, m)
+	return (to == Chat || to == Responses) && slices.Contains(m.ServiceTiers, tier)
 }
 
 func pluginCatalog(pp plugin.Provider) []catalog.Model {
@@ -197,8 +214,7 @@ func pluginCatalog(pp plugin.Provider) []catalog.Model {
 			// a decision model the plugin marked counts only where it
 			// serves a decision API (pp.Decide)
 			Decides: pp.Decide && m.Decides,
-			// the tiers it says its vendor serves the model at (#2514)
-			Tiers: m.ServiceTiers,
+			Tiers:   slices.Clone(m.ServiceTiers),
 		}
 		// a limit under catalog.LeastWindow (512, H20 on Discord) is none:
 		// the other one, or models.dev, answers (ListedWindow)
@@ -226,7 +242,7 @@ func pluginCatalog(pp plugin.Provider) []catalog.Model {
 		}
 		// a built-in moved onto its plugin keeps the levels it had for a
 		// model its vendor gives none: its maker's, as effortsOf borrows
-		if len(c.Efforts) == 0 && (Moved(pp.ID) || pp.ID == "cline") {
+		if len(c.Efforts) == 0 && (PluginServes(pp.ID) || pp.ID == "cline") {
 			c.Efforts = borrowedEfforts(m.ID)
 		}
 		// OpenCode's price of a model it has none for is 0, as the
@@ -297,6 +313,23 @@ func (p Provider) ListError() string {
 	return PluginListError(pp, p.Account.pluginKey)
 }
 
+// pluginServedCatalog lists the union of accounts' models in catalog order.
+// A missing account or an unknown list serves the whole catalog.
+func pluginServedCatalog(pp plugin.Provider, keys []string) []catalog.Model {
+	all := pluginCatalog(pp)
+	listed := map[string]bool{}
+	for _, k := range keys {
+		i := slices.IndexFunc(pp.Accounts, func(a plugin.Account) bool { return a.Key == k })
+		if i < 0 || pp.Accounts[i].Models == nil {
+			return all
+		}
+		for _, m := range pp.Accounts[i].Models {
+			listed[m] = true
+		}
+	}
+	return slices.DeleteFunc(all, func(m catalog.Model) bool { return !listed[m.ID] })
+}
+
 // pluginLists is whether a plugin's account serves model, as the plugin
 // last told its list; one it told none of serves all of the provider's.
 func (a *Account) pluginLists(model string) bool {
@@ -315,7 +348,18 @@ func (a *Account) pluginLists(model string) bool {
 // pluginProvider is the provider as one of its accounts, l as the
 // accounts list has it.
 func pluginProvider(pp plugin.Provider, l pluginLogin) Provider {
+	return pluginProviderServing(pp, l, nil)
+}
+
+// pluginProviderServing offers the union at keys, or just l's list for nil.
+func pluginProviderServing(pp plugin.Provider, l pluginLogin, keys []string) Provider {
 	acct, user := l.acct, l.User
+	serves := func(cur plugin.Provider) []catalog.Model {
+		if keys == nil {
+			return pluginAccountCatalog(cur, acct.Key)
+		}
+		return pluginServedCatalog(cur, keys)
+	}
 	id := PluginID(pp.ID)
 	name := pp.Name
 	if name == "" {
@@ -336,9 +380,9 @@ func pluginProvider(pp plugin.Provider, l pluginLogin) Provider {
 	}
 	a.models = func() []catalog.Model {
 		if cur, ok := PluginOf(id); ok {
-			return pluginAccountCatalog(cur, acct.Key)
+			return serves(cur)
 		}
-		return pluginAccountCatalog(pp, acct.Key)
+		return serves(pp)
 	}
 	a.fetch = func(ctx context.Context) ([]catalog.Model, error) {
 		ps, err := plugin.Providers(ctx)
@@ -350,7 +394,7 @@ func pluginProvider(pp plugin.Provider, l pluginLogin) Provider {
 				if e := PluginListError(cur, acct.Key); e != "" {
 					return nil, fmt.Errorf("%s couldn't list its models: %s", name, e)
 				}
-				return catalog.Chat(pluginAccountCatalog(cur, acct.Key)), nil
+				return catalog.Chat(serves(cur)), nil
 			}
 		}
 		return nil, fmt.Errorf("%s's plugin no longer lists it", name)
@@ -358,12 +402,16 @@ func pluginProvider(pp plugin.Provider, l pluginLogin) Provider {
 	a.sign = func(ctx context.Context, req *http.Request, body []byte) error { return nil }
 	a.transport = func(req *http.Request) (*http.Response, error) { return pluginFetch(pp, acct.Key, req) }
 	p := Provider{ID: id, Name: name, Icon: PluginIcon(pp), Account: a}
-	if c, ok := movedCards[pp.ID]; ok && Moved(pp.ID) {
+	if c, ok := movedCards[pp.ID]; ok && PluginServes(pp.ID) {
 		p.Name, p.Icon, p.Website = c.name, c.icon, c.site // as the built-in was
-		m, _ := MigrationOf(pp.ID)
-		a.moved, a.wasHost = true, m.Host
-		if a.wasHost == "" { // moved before the move kept it
-			a.wasHost = builtinHost(pp.ID)
+		if Moved(pp.ID) {
+			// Only an actual handover has a former host to carry. A retired
+			// built-in using a fresh plugin account has not moved one.
+			m, _ := MigrationOf(pp.ID)
+			a.moved, a.wasHost = true, m.Host
+			if a.wasHost == "" {
+				a.wasHost = builtinHost(pp.ID)
+			}
 		}
 		if n, ok := movedNames[pp.ID]; ok {
 			p.Name = n

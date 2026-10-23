@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tidwall/gjson"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/tidwall/gjson"
 )
 
 // withExtraBody gives the saved provider id the extraBody written.

@@ -330,6 +330,13 @@ func (s *Server) askJev(p provider.Provider, model string, intents []string, pre
 	if model == "" {
 		model = p.Jev()
 	}
+	// An unmasked conversation or group does not grant its decision
+	// provider the same exception: only Jev's own destination decides.
+	var maskErr error
+	text, maskErr = maskedQueryIn(ctx, text, &p)
+	if maskErr != nil {
+		return verdict{}, maskErr
+	}
 	var l levelling
 	if len(intents) > 1 { // one kind is a topic: a message may be none of it
 		var err error

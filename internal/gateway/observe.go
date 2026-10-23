@@ -6,14 +6,31 @@ import (
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/access"
+	"github.com/ChisaAlter/WhaleBridge/internal/gwmw"
 	"github.com/ChisaAlter/WhaleBridge/internal/usage"
 )
 
 // observed is a request the registered observers watch (usage.Observer,
 // the gateway's observer point): what each one's Begin answered.
 type observed struct {
-	watches []usage.Watch
+	watches []requestWatch
 	routeID int64
+}
+
+type requestWatch struct {
+	watch  usage.Watch
+	bodies usage.Bodies
+}
+
+func watchRecord(record usage.Record, bodies usage.Bodies) usage.Record {
+	if bodies == usage.NoBodies {
+		record.BodyIn, record.BodyOut = "", ""
+	}
+	if record.OwnCost != nil {
+		cost := *record.OwnCost
+		record.OwnCost = &cost
+	}
+	return record
 }
 
 type observedKey struct{}
@@ -21,7 +38,7 @@ type observedKey struct{}
 // observeRequest asks each observer whether it watches the request. With
 // none watching it is nil, and its calls do nothing.
 func observeRequest(r *http.Request, kind string, body []byte) (*http.Request, *observed) {
-	observers := usage.Observers()
+	observers := usage.RequestObservers()
 	if len(observers) == 0 {
 		return r, nil
 	}
@@ -30,8 +47,11 @@ func observeRequest(r *http.Request, kind string, body []byte) (*http.Request, *
 		Plain: local(r) && access.Caller(r.Context()).KeyID == "" && callerOf(r).via == ""}
 	o := &observed{}
 	for _, ob := range observers {
-		if w := ob.Begin(q); w != nil {
-			o.watches = append(o.watches, w)
+		request := q
+		request.Header = q.Header.Clone()
+		watch, err := gwmw.Safely(func() requestWatch { return requestWatch{watch: ob.Begin(request), bodies: ob.Bodies()} })
+		if err == nil && watch.watch != nil {
+			o.watches = append(o.watches, watch)
 		}
 	}
 	if len(o.watches) == 0 {
@@ -64,7 +84,7 @@ func (o *observed) end(call Call, millis int64) {
 	}
 	rec := usage.Record{RouteID: o.routeID, Time: call.Time, Agent: call.Agent, Model: call.Model, Status: call.Status, Millis: millis}
 	for _, w := range o.watches {
-		w.End(rec)
+		_, _ = gwmw.Safely(func() bool { w.watch.End(watchRecord(rec, w.bodies)); return true })
 	}
 }
 
@@ -105,6 +125,6 @@ func (o *observed) attempt(call Call, attempt Try, providerID, effort string, he
 		withBodies(&rec, &bodies)
 	}
 	for _, w := range o.watches {
-		w.Attempt(rec)
+		_, _ = gwmw.Safely(func() bool { w.watch.Attempt(watchRecord(rec, w.bodies)); return true })
 	}
 }

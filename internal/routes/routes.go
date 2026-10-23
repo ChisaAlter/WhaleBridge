@@ -1,131 +1,187 @@
-// Package routes is the gateway's router strategy point (P3 of
-// docs/subsystems/plugin-runtime.md): how one pool of routes — a
-// provider's accounts or keys, or the heads of a group's members — is
-// ordered for a request. The gateway lists the pool, rests, affinity and
-// failover itself; a Strategy only says the order.
-//
-// Smart, the default, is the core's. The others a provider or group can be
-// routed by (order, rotate, usage, pace, weight) are here for a plugin to
-// register: plugins/rotation does, and off, a pool routed by one of them is
-// tried in its listed order, as an unknown routing always was.
+// Package routes holds the gateway's candidate ordering strategies. Admission,
+// protocol fit, cooldowns, affinity and failover remain the gateway's concern.
 package routes
 
 import (
 	"log"
+	"regexp"
 	"slices"
 	"sync"
 	"time"
 )
 
-// Seat is one route of a pool, as a strategy weighs it.
+// Seat is one account, key, or group head in a pool. It contains no credential.
 type Seat struct {
-	// Key is who it is: the account or key's rest key, the same for the
-	// same route from request to request
-	Key string
-	// Account is a subscription's account, not an API key
+	Key     string
 	Account bool
-	// Known: its allowance is known. Used, Soon and Pace are read from it
-	Known bool
-	// Learns: an account not known yet, of an agent that tells what it has
-	// left as it answers (Claude Code's rate_limit_event)
-	Learns bool
-	// Used is the share of its allowance used that counts the model, 0–100
-	Used float64
-	// Soon is when its windows renew, the biggest first (Allowance.Renewal)
-	Soon []time.Time
-	// Pace is its week left per hour until that renews; an account not
-	// known has a whole week (provider.FreshPace), a key none
-	Pace float64
-	// Weight is its key's weight, at least 1
-	Weight int
-	// Resting: it rests after a failure now
+	Known   bool
+	Learns  bool
+	Used    float64
+	Soon    []time.Time
+	Pace    float64
+	Weight  int
 	Resting bool
-	// Tokens is what magpie sent it lately, decayed by an hour's half-life
-	Tokens float64
+	Tokens  float64
+	Free    bool
 }
 
-// Strategy orders a pool.
+// Strategy returns a permutation of the seats. Exact preserves that order over
+// protocol fit; ByUse and ByFree request the corresponding trace facts. Calls
+// must be bounded by the implementation (the JS adapter includes its wait).
 type Strategy struct {
-	// Order is the order to try seats in: a permutation of their indexes.
-	// pool names the pool (a provider's id, or "group/<id>"), for a
-	// strategy that keeps a round per pool. It is asked with two seats or
-	// more.
-	Order func(pool string, seats []Seat) []int
-	// Exact: its order stands as it says. Otherwise, of a provider's API
-	// keys, those that fit the request better go first, each kept in its
-	// order among those alike.
-	Exact bool
-	// ByUse: it weighs by Tokens, which the routing trace then shows
-	ByUse bool
+	Order  func(pool string, seats []Seat) []int
+	Exact  bool
+	ByUse  bool
+	ByFree bool
+	kind   strategyKind
 }
+
+type strategyKind uint8
+
+const (
+	custom strategyKind = iota
+	smart
+	ordered
+	rotate
+	leastUsed
+	pace
+	weighted
+	freeFirst
+)
+
+// Rotates and Weighted identify the built-in round semantics, not merely a
+// configured name. Reserved names cannot be overridden with another algorithm.
+func (s Strategy) Rotates() bool  { return s.kind == rotate }
+func (s Strategy) Weighted() bool { return s.kind == weighted }
 
 var reg = struct {
 	sync.RWMutex
-	m map[string][]*Strategy // routing → registered, the last one serving
+	m map[string][]*Strategy
 }{m: map[string][]*Strategy{}}
 
-// Register serves routing by s until remove is called. Registering one
-// already served stacks: the last serves until it is removed.
-func Register(routing string, s Strategy) (remove func()) {
+// Register stacks a strategy until the returned idempotent disposer removes
+// it. Captured values remain usable after removal. Built-in names activate the
+// canonical built-in only: replacing a weighted algorithm while group planning
+// still treats it as weighted would split ordering from affinity accounting.
+func Register(name string, s Strategy) func() {
+	if canonical, reserved := builtins[name]; reserved {
+		if s.kind != canonical.kind {
+			log.Printf("routes: %q is reserved for its built-in strategy", name)
+			return func() {}
+		}
+		s = canonical
+	} else if name == "" {
+		return func() {}
+	}
 	e := &s
 	reg.Lock()
-	reg.m[routing] = append(reg.m[routing], e)
+	reg.m[name] = append(reg.m[name], e)
 	reg.Unlock()
 	var once sync.Once
 	return func() {
 		once.Do(func() {
 			reg.Lock()
 			defer reg.Unlock()
-			reg.m[routing] = slices.DeleteFunc(slices.Clone(reg.m[routing]), func(x *Strategy) bool { return x == e })
+			stack := slices.DeleteFunc(slices.Clone(reg.m[name]), func(x *Strategy) bool { return x == e })
+			if len(stack) == 0 {
+				delete(reg.m, name)
+			} else {
+				reg.m[name] = stack
+			}
 		})
 	}
 }
 
-// Find is the strategy serving routing: Smart for "", else the last one
-// registered; ok is false when none is.
-func Find(routing string) (Strategy, bool) {
-	if routing == "" {
+// Find takes a value snapshot. Smart is always available; every other policy
+// must be explicitly registered by the application's assembly.
+func Find(name string) (Strategy, bool) {
+	if name == "" {
 		return Smart, true
 	}
 	reg.RLock()
 	defer reg.RUnlock()
-	l := reg.m[routing]
-	if len(l) == 0 {
+	s := reg.m[name]
+	if len(s) == 0 {
 		return Strategy{}, false
 	}
-	return *l[len(l)-1], true
+	return *s[len(s)-1], true
+}
+func Served(name string) bool { _, ok := Find(name); return ok }
+
+var pluginName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$`)
+
+// FromPlugin accepts a persistent plugin/name, independently of whether the
+// plugin is loaded now. It cannot collide with a built-in policy name.
+func FromPlugin(name string) bool { return pluginName.MatchString(name) }
+
+// RegisterBuiltins is explicit bootstrap for a finite application assembly or
+// test binary. Constructing a gateway does not call it. Disposing registrations
+// does not erase their round state; Forget is the deliberate reset operation.
+func RegisterBuiltins() func() {
+	var off []func()
+	for _, name := range []string{"order", "rotate", "usage", "pace", "weight", "free"} {
+		off = append(off, Register(name, builtins[name]))
+	}
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			for i := len(off) - 1; i >= 0; i-- {
+				off[i]()
+			}
+		})
+	}
 }
 
-// Served says whether routing is served now.
-func Served(routing string) bool {
-	_, ok := Find(routing)
-	return ok
+// Apply checks a strategy's output. A panic, nil callback or invalid order
+// keeps every candidate in listed order. The input facts cannot be mutated.
+func Apply(s Strategy, pool string, seats []Seat) []int {
+	order, _ := ApplyPick(s, pool, seats)
+	return order
 }
 
-// Apply is the order s gives seats, checked: an order that isn't a
-// permutation of them, or a strategy that panics, leaves them in their
-// listed order, logged. A strategy only orders, so failing it fails open:
-// every route is still tried.
-func Apply(s Strategy, pool string, seats []Seat) (order []int) {
+// ApplyPick also returns the receipt of a built-in weighted pick. The gateway
+// carries it with that request so affinity can compensate this exact pick even
+// after another request has advanced the same round.
+func ApplyPick(s Strategy, pool string, seats []Seat) (order []int, receipt *PickReceipt) {
+	n := len(seats)
+	if n < 2 {
+		return identity(n), nil
+	}
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("routes: %s's strategy panicked: %v", pool, r)
-			order = identity(len(seats))
+			order, receipt = identity(n), nil
 		}
 	}()
-	order = s.Order(pool, seats)
-	seen := make([]bool, len(seats))
-	ok := len(order) == len(seats)
+	copySeats := slices.Clone(seats)
+	for i := range copySeats {
+		copySeats[i].Soon = slices.Clone(seats[i].Soon)
+	}
+	if s.Weighted() {
+		keys, weights, rests := make([]string, n), make([]int, n), make([]bool, n)
+		for i, seat := range copySeats {
+			keys[i], weights[i], rests[i] = seat.Key, max(seat.Weight, 1), seat.Resting
+		}
+		var best int
+		best, receipt = Pick(pool, keys, weights, rests)
+		return First(best, n), receipt
+	}
+	if s.Order == nil {
+		return identity(n), nil
+	}
+	order = s.Order(pool, copySeats)
+	seen := make([]bool, n)
+	valid := len(order) == n
 	for _, i := range order {
-		if !ok || i < 0 || i >= len(seats) || seen[i] {
-			ok = false
+		if !valid || i < 0 || i >= n || seen[i] {
+			valid = false
 			break
 		}
 		seen[i] = true
 	}
-	if !ok {
-		log.Printf("routes: %s's strategy gave %v for %d routes; trying them in order", pool, order, len(seats))
-		return identity(len(seats))
+	if !valid {
+		log.Printf("routes: %s's strategy returned an invalid order; trying every route in listed order", pool)
+		return identity(n), nil
 	}
-	return order
+	return slices.Clone(order), nil
 }

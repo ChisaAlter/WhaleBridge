@@ -14,8 +14,8 @@ import (
 )
 
 // A search API given several keys (#1477) goes on to the next when one is
-// out of credit (Tavily's 432), and the next search doesn't start from the
-// keys refused, which rest (search_pool_test.go). A failure that isn't about the key (a 500) doesn't spend
+// out of credit (Tavily's 432), and puts the refused keys behind healthy
+// ones on the next search. A failure that isn't about the key (a 500) doesn't spend
 // the other keys.
 func TestSearchAPIKeysTakeTurns(t *testing.T) {
 	t.Setenv("XDG_CONFIG_HOME", t.TempDir())

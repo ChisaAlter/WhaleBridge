@@ -26,6 +26,7 @@ func upstreamTransport() http.RoundTripper {
 		IdleConnTimeout:       90 * time.Second,
 		ForceAttemptHTTP2:     true,
 		TLSClientConfig:       upstreamTLS,
+		HTTP2:                 netproxy.HTTP2Health(),
 	})}
 }
 

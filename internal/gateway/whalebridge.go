@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/filememo"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"github.com/ChisaAlter/WhaleBridge/internal/usage"
 )
 
@@ -89,6 +91,10 @@ func (s *Server) Handler() http.Handler {
 			http.Error(w, "invalid WhaleBridge gateway key", http.StatusUnauthorized)
 			return
 		}
+		// Planning, fallbacks and accounting resolve the same catalog repeatedly.
+		// Holds refresh after a second and writes invalidate them during a stream.
+		defer provider.Hold()()
+		defer filememo.Hold()()
 		if r.Method == http.MethodGet && !strings.HasPrefix(r.URL.Path, "/v1/videos/") && !strings.HasPrefix(r.URL.Path, "/videos/") {
 			next.ServeHTTP(w, r)
 			return
@@ -96,7 +102,7 @@ func (s *Server) Handler() http.Handler {
 		whaleBridgeRequests.Lock()
 		if whaleBridgeRequests.draining {
 			whaleBridgeRequests.Unlock()
-			http.Error(w, "鲸桥正在更新或停止，请稍后再试", http.StatusServiceUnavailable)
+			http.Error(w, "鲸Bridge正在更新或停止，请稍后再试", http.StatusServiceUnavailable)
 			return
 		}
 		whaleBridgeRequests.active++

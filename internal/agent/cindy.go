@@ -41,7 +41,7 @@ func CindyLink(url string) string {
 	models := v1 + "/models"
 	id, name := magpieID, "Magpie"
 	if os.Getenv("WHALEBRIDGE_GATEWAY_TOKEN") != "" {
-		id, name = "whalebridge", "鲸桥"
+		id, name = "whalebridge", "鲸Bridge"
 	}
 	payload := struct {
 		Kind      string          `json:"kind"`

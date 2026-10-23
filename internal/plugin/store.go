@@ -166,6 +166,27 @@ func Load() List {
 	return List{Plugins: clonePlugins(l.Plugins), Config: cloneMap(l.Config), Prefer: maps.Clone(l.Prefer)}
 }
 
+// LoadChecked reads the complete configured list for registries that must
+// distinguish an unreadable file from an intentionally empty list. Failed
+// reads never replace the cached list with partially decoded entries.
+func LoadChecked() (List, error) {
+	b, err := lastgood.Read(listPath(), func(b []byte) bool {
+		var l *List
+		return json.Unmarshal(b, &l) == nil && l != nil
+	})
+	if errors.Is(err, os.ErrNotExist) {
+		return List{}, nil
+	}
+	if err != nil {
+		return List{}, err
+	}
+	var l List
+	if err := json.Unmarshal(b, &l); err != nil {
+		return List{}, fmt.Errorf("the plugin list cannot be decoded")
+	}
+	return List{Plugins: clonePlugins(l.Plugins), Config: cloneMap(l.Config), Prefer: maps.Clone(l.Prefer)}, nil
+}
+
 // clonePlugins copies the entries, their options with them.
 func clonePlugins(es []Entry) []Entry {
 	if es == nil {

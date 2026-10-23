@@ -68,6 +68,9 @@ import (
 )
 
 type subscriptionBridge struct {
+	// Reapers outlive runs removed by abort/finish. Closing the gateway must
+	// join these owners even when they no longer appear in runs.
+	reapers sync.WaitGroup
 	mu      sync.Mutex
 	runs    map[string]*subscriptionRun // callback token → run
 	calls   map[string]*subscriptionRun // tool_use id → run
@@ -3532,7 +3535,13 @@ func (r *subscriptionRun) launch() error {
 	r.mu.Lock()
 	r.tree, r.exited = t, exited
 	r.mu.Unlock()
+	if r.bridge != nil {
+		r.bridge.reapers.Add(1)
+	}
 	go func() {
+		if r.bridge != nil {
+			defer r.bridge.reapers.Done()
+		}
 		err := t.Wait()
 		r.drain()
 		r.mu.Lock()
@@ -3540,6 +3549,7 @@ func (r *subscriptionRun) launch() error {
 		r.mu.Unlock()
 		close(exited)
 		r.finish()
+		r.reading.Wait()
 	}()
 	return nil
 }

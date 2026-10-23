@@ -690,7 +690,7 @@ func claudeIdentity() (user, plan string, signedOut bool) {
 	claudeStatusMu.Lock()
 	defer claudeStatusMu.Unlock()
 	switch {
-	case quiet:
+	case quiet: // serve the last identity without asking a disabled source
 	case claudeStatusAt.IsZero():
 		claudeStatusAt = time.Now()
 		if u, p, out, ok := askClaudeStatus(); ok {
@@ -869,42 +869,27 @@ func Accounts() []Provider {
 	if p, ok := copilotAccount(cfg); ok {
 		out = append(out, p)
 	}
-	if p, ok := cursorAccount(); ok {
-		out = append(out, p)
-	}
-	if p, ok := grokAccount(); ok {
-		out = append(out, p)
-	}
-	if p, ok := devinAccount(); ok {
-		out = append(out, p)
-	}
-	if p, ok := kiroAccount(); ok {
-		out = append(out, p)
-	}
-	if p, ok := zcodeAccount(); ok {
-		out = append(out, p)
-	}
-	for _, w := range []*wbSite{wbCN, wbAI} {
-		if p, ok := workBuddyAccount(w); ok {
+	// Gate before building a provider: retired builders may probe a native
+	// CLI or renew its credentials even if their result is discarded later.
+	for _, b := range []struct {
+		id    string
+		build func() (Provider, bool)
+	}{
+		{"cursor", cursorAccount}, {"grok", grokAccount}, {"devin", devinAccount},
+		{"kiro", kiroAccount}, {"zcode", zcodeAccount},
+		{"workbuddy", func() (Provider, bool) { return workBuddyAccount(wbCN) }},
+		{WorkBuddyAIID, func() (Provider, bool) { return workBuddyAccount(wbAI) }},
+		{CommandCodePlanID, commandCodeAccount},
+		{"qoder", func() (Provider, bool) { return qoderAccountOf("qoder") }},
+		{QoderCNID, func() (Provider, bool) { return qoderAccountOf(QoderCNID) }},
+		{"zed", zedAccount}, {"factory", factoryAccount}, {MiMoID, mimoAccount},
+	} {
+		if PluginServes(b.id) {
+			continue
+		}
+		if p, ok := b.build(); ok {
 			out = append(out, p)
 		}
-	}
-	if p, ok := commandCodeAccount(); ok {
-		out = append(out, p)
-	}
-	for _, agent := range qoderAgents {
-		if p, ok := qoderAccountOf(agent); ok {
-			out = append(out, p)
-		}
-	}
-	if p, ok := zedAccount(); ok {
-		out = append(out, p)
-	}
-	if p, ok := factoryAccount(); ok {
-		out = append(out, p)
-	}
-	if p, ok := mimoAccount(); ok {
-		out = append(out, p)
 	}
 	if p, ok := siwcAccount(); ok {
 		out = append(out, p)
@@ -915,7 +900,7 @@ func Accounts() []Provider {
 		}
 	}
 	// a built-in moved onto its plugin is the plugin's now (migrate.go)
-	out = slices.DeleteFunc(out, func(p Provider) bool { return Moved(p.ID) })
+	out = slices.DeleteFunc(out, func(p Provider) bool { return PluginServes(p.ID) })
 	return placeMoved(out, pluginAccounts())
 }
 
@@ -934,7 +919,7 @@ func placeMoved(out, plugins []Provider) []Provider {
 	}
 	var rest []Provider
 	for _, p := range plugins {
-		if !Moved(p.ID) || !slices.Contains(builtinOrder, p.ID) {
+		if !PluginServes(p.ID) || !slices.Contains(builtinOrder, p.ID) {
 			rest = append(rest, p)
 			continue
 		}

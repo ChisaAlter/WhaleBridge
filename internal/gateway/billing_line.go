@@ -5,8 +5,8 @@ import (
 	"encoding/json"
 	"regexp"
 
-	"github.com/tidwall/gjson"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/tidwall/gjson"
 )
 
 // Claude Code begins its system prompt with a billing line, a block of its

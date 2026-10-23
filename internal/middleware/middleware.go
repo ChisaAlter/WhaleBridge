@@ -13,6 +13,7 @@
 package middleware
 
 import (
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log"
@@ -41,28 +42,25 @@ var errTimeout = errors.New("took too long")
 
 // mw is one middleware, compiled.
 type mw struct {
-	spec, name string
-	mod        *moejs.Module
-	onReq      moejs.Hook
-	onEv       moejs.Hook
-	onResp     moejs.Hook
-	hasReq     bool
-	hasEv      bool
-	hasResp    bool
+	spec, name            string
+	mod                   *moejs.Module
+	onReq                 moejs.Hook
+	onEv                  moejs.Hook
+	onResp                moejs.Hook
+	onUse                 moejs.Hook
+	hasUse                bool
+	strats                []strat
+	pt                    *points
+	orders, rows, dropped atomic.Int64
+	hasReq                bool
+	hasEv                 bool
+	hasResp               bool
 	// events are the stream events onEvent is called for, by name; nil
 	// is every one
-	events  map[string]bool
-	options []byte // the plugin's options, as JSON
-	pool    sync.Pool
-	// strats are its strategies and onUse its onUsage (points.go), which
-	// run in pt
-	strats []strat
-	onUse  moejs.Hook
-	hasUse bool
-	pt     *points
-
+	events                 map[string]bool
+	options                []byte // the plugin's options, as JSON
+	pool                   sync.Pool
 	calls, nanos, failures atomic.Int64
-	orders, rows, dropped  atomic.Int64 // strategy calls, onUsage calls, rows dropped
 	lastErr                atomic.Pointer[string]
 	logged                 atomic.Int64 // lines logged this minute, and the minute
 }
@@ -78,10 +76,39 @@ type set struct {
 }
 
 var (
-	loadMu    sync.Mutex
-	cur       atomic.Pointer[set]
-	nextCheck atomic.Int64
+	loadMu     sync.Mutex
+	cur        atomic.Pointer[set]
+	nextCheck  atomic.Int64
+	refreshErr atomic.Pointer[string]
 )
+
+type managedRefresh struct{ schedule func() }
+
+var managed atomic.Pointer[managedRefresh]
+
+// ManagedRefresh delegates generation changes to the Host's admission/drain
+// barrier. The scheduler must only queue work and return; explicit Refresh is
+// the sole commit operation in managed mode. Old stops cannot clear a new host.
+func ManagedRefresh(schedule func()) func() {
+	entry := &managedRefresh{schedule: schedule}
+	managed.Store(entry)
+	var once sync.Once
+	return func() { once.Do(func() { managed.CompareAndSwap(entry, nil) }) }
+}
+
+func refreshRequested() {
+	if h := managed.Load(); h != nil {
+		if h.schedule != nil {
+			h.schedule()
+		}
+		return
+	}
+	_ = Refresh()
+}
+
+// Fingerprint reads configured modules and local imports without changing any
+// registration. The Host includes it before admitting the next request.
+func Fingerprint() (string, error) { st, _, err := discoverFiles(); return st, err }
 
 // current is the middleware in force, loaded again when plugins.json or a
 // middleware's file changed, which is looked at once a second.
@@ -92,25 +119,42 @@ func current() *set {
 	if s != nil && (now < n || !nextCheck.CompareAndSwap(n, now+int64(time.Second))) {
 		return s
 	}
-	st := stamp()
-	if s != nil && s.stamp == st {
+	refreshRequested()
+	if s = cur.Load(); s != nil {
 		return s
 	}
-	loadMu.Lock()
-	defer loadMu.Unlock()
-	if s := cur.Load(); s != nil && s.stamp == st {
-		return s
-	}
-	s = load(st)
-	cur.Store(s)
-	return s
+	return &set{errs: map[string]string{}}
 }
 
-// Reload drops the middleware loaded, so the next request loads it again.
-func Reload() {
+// Refresh synchronously discovers and compiles the complete next generation.
+// A read failure retains the generation in force and is exposed to the caller.
+func Refresh() error {
 	loadMu.Lock()
-	cur.Store(nil)
-	loadMu.Unlock()
+	defer loadMu.Unlock()
+	st, files, err := discoverFiles()
+	if err != nil {
+		msg := err.Error()
+		refreshErr.Store(&msg)
+		return err
+	}
+	refreshErr.Store(nil)
+	s := cur.Load()
+	if s == nil || s.stamp != st {
+		s = load(st, files)
+		cur.Store(s)
+	}
+	syncPoints(s)
+	return nil
+}
+
+// Reload requests refresh; a managed Host commits only after its drain barrier.
+func Reload() { refreshRequested() }
+
+// On counts enabled gateway modules without starting a host or native account
+// discovery. An unreadable list is unknown rather than an empty configuration.
+func On() (int, error) {
+	_, files, err := discoverFiles()
+	return len(files), err
 }
 
 type found struct {
@@ -118,35 +162,71 @@ type found struct {
 	file string
 }
 
-func middlewares() []found {
+func discoverFiles() (string, []found, error) {
+	list, err := plugin.LoadChecked()
+	if err != nil {
+		return "", nil, err
+	}
+	h := sha256.New()
+	b, _ := jsonMarshal(list)
+	h.Write(b)
 	var out []found
-	for _, e := range plugin.Load().Plugins {
+	for _, e := range list.Plugins {
 		if e.Off {
 			continue
 		}
-		if file, _ := plugin.Middleware(plugin.Target(e.Spec)); file != "" {
-			out = append(out, found{e, file})
+		file, _, err := plugin.MiddlewareChecked(plugin.Target(e.Spec))
+		if err != nil {
+			return "", nil, fmt.Errorf("discovering gateway module %s: %w", plugin.Name(e.Spec), err)
+		}
+		if file == "" {
+			continue
+		}
+		out = append(out, found{e, file})
+		b, err := os.ReadFile(file)
+		if err != nil {
+			return "", nil, fmt.Errorf("reading gateway module %s: %w", plugin.Name(e.Spec), err)
+		}
+		fmt.Fprint(h, file)
+		h.Write(b)
+		// Local imported modules also change a compiled generation. Do not
+		// walk installed dependencies: bundled modules stay within their root.
+		root := plugin.Target(e.Spec)
+		if root == file {
+			root = filepath.Dir(file)
+		}
+		err = filepath.WalkDir(root, func(path string, d os.DirEntry, walkErr error) error {
+			if walkErr != nil {
+				return walkErr
+			}
+			if d.IsDir() {
+				if path != root && (d.Name() == "node_modules" || d.Name() == ".git") {
+					return filepath.SkipDir
+				}
+				return nil
+			}
+			ext := strings.ToLower(filepath.Ext(path))
+			if ext != ".js" && ext != ".mjs" && ext != ".ts" {
+				return nil
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			fmt.Fprint(h, path)
+			h.Write(data)
+			return nil
+		})
+		if err != nil {
+			return "", nil, err
 		}
 	}
-	return out
+	return fmt.Sprintf("%x", h.Sum(nil)), out, nil
 }
 
-// stamp changes when plugins.json or a middleware's file does.
-func stamp() string {
-	var b strings.Builder
-	b.WriteString(plugin.ListStamp())
-	for _, f := range middlewares() {
-		b.WriteString("|" + f.file)
-		if fi, err := os.Stat(f.file); err == nil {
-			fmt.Fprint(&b, ":", fi.ModTime().UnixNano(), ":", fi.Size())
-		}
-	}
-	return b.String()
-}
-
-func load(st string) *set {
+func load(st string, files []found) *set {
 	s := &set{stamp: st, errs: map[string]string{}}
-	for _, f := range middlewares() {
+	for _, f := range files {
 		m, err := compile(f.e, f.file)
 		if err != nil {
 			s.errs[f.e.Spec] = err.Error()
@@ -188,8 +268,8 @@ func compile(e plugin.Entry, file string) (*mw, error) {
 	if err := m.discover(in); err != nil {
 		return nil, err
 	}
-	if !m.hasReq && !m.hasEv && !m.hasResp && len(m.strats) == 0 && !m.hasUse {
-		return nil, errors.New("exports none of onRequest, onEvent, onResponse, strategies and onUsage")
+	if !m.hasReq && !m.hasEv && !m.hasResp && !m.hasUse && len(m.strats) == 0 {
+		return nil, errors.New("exports none of onRequest, onEvent, onResponse, onUsage and strategies")
 	}
 	if names, ok := in.strings("events"); ok {
 		m.events = map[string]bool{}
@@ -411,33 +491,35 @@ func errText(err error) string {
 
 // State is a middleware as the Plugins page shows it.
 type State struct {
-	Hooks    []string `json:"hooks"`
-	Events   []string `json:"events,omitempty"`
-	Error    string   `json:"error,omitempty"` // why it didn't load
-	Calls    int64    `json:"calls"`
-	AvgMicro float64  `json:"avgMicros"`
-	Failures int64    `json:"failures"`
-	Last     string   `json:"lastError,omitempty"`
-	// Strategies are the routings it serves ("<plugin>/<name>"), Orders
-	// how many times they were asked; Usage says it has onUsage, Rows how
-	// many rows it was given and Dropped how many it missed, the queue
-	// full
 	Strategies []string `json:"strategies,omitempty"`
-	Orders     int64    `json:"orders,omitempty"`
 	Usage      bool     `json:"usage,omitempty"`
-	Rows       int64    `json:"rows,omitempty"`
-	Dropped    int64    `json:"dropped,omitempty"`
+	Orders     int64    `json:"orders"`
+	Rows       int64    `json:"rows"`
+	Dropped    int64    `json:"dropped"`
+	Hooks      []string `json:"hooks"`
+	Events     []string `json:"events,omitempty"`
+	Error      string   `json:"error,omitempty"` // why it didn't load
+	Calls      int64    `json:"calls"`
+	AvgMicro   float64  `json:"avgMicros"`
+	Failures   int64    `json:"failures"`
+	Last       string   `json:"lastError,omitempty"`
 }
 
 // States are the middleware plugins, by spec.
 func States() map[string]State {
 	s := current()
 	out := map[string]State{}
+	if e := refreshErr.Load(); e != nil {
+		out["$discovery"] = State{Hooks: []string{}, Error: *e}
+	}
 	for spec, e := range s.errs {
 		out[spec] = State{Hooks: []string{}, Error: e}
 	}
 	for _, m := range s.list {
-		st := State{Hooks: []string{}, Calls: m.calls.Load(), Failures: m.failures.Load()}
+		st := State{Hooks: []string{}, Calls: m.calls.Load(), Failures: m.failures.Load(), Usage: m.hasUse, Orders: m.orders.Load(), Rows: m.rows.Load(), Dropped: m.dropped.Load()}
+		for _, strategy := range m.strats {
+			st.Strategies = append(st.Strategies, m.routing(strategy.name))
+		}
 		for _, h := range []struct {
 			ok   bool
 			name string

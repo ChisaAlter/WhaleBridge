@@ -7,8 +7,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/tidwall/gjson"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/tidwall/gjson"
 )
 
 // A custom provider's Gemini API (#1346, NagaseMinato), behind a relay's

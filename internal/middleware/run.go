@@ -21,22 +21,6 @@ type Info = gwmw.Info
 // Reject is a request a middleware turned away (ctx.reject).
 type Reject = gwmw.Reject
 
-// Chain is the JS middleware as one agent middleware of the gateway's
-// middleware point (gwmw.Use, by plugins/middleware): every middleware
-// plugins.json has on, in its order.
-type Chain struct{}
-
-// Begin is Begin, nil when there is no middleware.
-func (Chain) Begin(info gwmw.Info) gwmw.Run {
-	if r := Begin(info); r != nil {
-		return r
-	}
-	return nil
-}
-
-// On counts the middleware plugins.json has on, whether or not it loads.
-func On() int { return len(middlewares()) }
-
 // Run is the middleware of one request. Each middleware's hooks run in
 // one runtime for the whole request, so they share ctx.state.
 type Run struct {
@@ -53,6 +37,13 @@ type Run struct {
 func Begin(info Info) *Run {
 	s := current()
 	if s == nil || !s.hooked {
+		return nil
+	}
+	hooks := false
+	for _, m := range s.list {
+		hooks = hooks || m.hasReq || m.hasEv || m.hasResp
+	}
+	if !hooks {
 		return nil
 	}
 	b, _ := json.Marshal(info)

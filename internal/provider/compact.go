@@ -16,6 +16,7 @@ import (
 // compactOf is the user's threshold for a provider's model: its own, else
 // its provider's "*"; 0 when neither is set.
 func compactOf(s settings.Settings, providerID, model string) int {
+	s = canonicalModelSettings(s)
 	if n := s.ModelCompacts[providerID+"/"+model]; n > 0 {
 		return n
 	}
@@ -154,7 +155,7 @@ func entryModel(m Member) string {
 // model id, "*" for all of them: what its editor's Compact at shows.
 func CompactsOf(providerID string) map[string]int {
 	out := map[string]int{}
-	for k, n := range settings.Load().ModelCompacts {
+	for k, n := range heldSettings().ModelCompacts {
 		if model, ok := strings.CutPrefix(k, providerID+"/"); ok && model != "" && n > 0 {
 			out[model] = n
 		}
@@ -162,16 +163,16 @@ func CompactsOf(providerID string) map[string]int {
 	return out
 }
 
-// SetModelCompacts makes a provider's thresholds cs, by model id, "*" for
-// all of them, as its editor's Compact at says: those it leaves out are
-// taken away, and every one set has to be a model the provider serves, as
-// for a reply limit (SetModelOutputs). Codex's and Claude Code's lists are
-// written again when anything changed.
+// SetModelCompacts replaces a provider's thresholds, by model id ("*"
+// for all). New or changed thresholds must name served models; unchanged
+// values for models no longer listed survive the editor's round trip.
+// Omitting one removes it, as for SetModelOutputs.
 func SetModelCompacts(providerID string, cs map[string]int) error {
 	p, err := Find(providerID)
 	if err != nil {
 		return err
 	}
+	s := settings.Load()
 	for model, n := range cs {
 		if n < 0 {
 			return errorf("a compaction threshold is a number of tokens, not %d", n)
@@ -179,11 +180,10 @@ func SetModelCompacts(providerID string, cs map[string]int) error {
 		if err := settings.CheckModelKey("a compaction threshold", p.ID+"/"+model); err != nil {
 			return err
 		}
-		if model != "*" && n > 0 && !p.serves(model) {
+		if model != "*" && n > 0 && s.ModelCompacts[p.ID+"/"+model] != n && !p.serves(model) {
 			return errorf("%s has no model %s (magpie provider %s lists them)", p.ID, model, p.ID)
 		}
 	}
-	s := settings.Load()
 	changed := false
 	for k := range s.ModelCompacts {
 		if model, ok := strings.CutPrefix(k, p.ID+"/"); ok && cs[model] <= 0 {

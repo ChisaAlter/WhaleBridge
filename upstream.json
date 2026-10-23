@@ -10,5 +10,210 @@
   "searchFeaturesArchiveSha256": "bab746000f3d9c2a5b22607b915058d6f9cf7c0bc4944ec9f0c82cb8f4117032",
   "agentFeaturesCommit": "1d6f461a99d6bae2cb5357899345d8818739031e",
   "agentFeaturesArchiveSha256": "bab746000f3d9c2a5b22607b915058d6f9cf7c0bc4944ec9f0c82cb8f4117032",
-  "version": "1.3.0"
+  "reviewedCommit": "e00fbdbbc74f9829027a78769cbeb265d6271fb4",
+  "reviewedArchiveSha256": "b1584c47cc2e2a5d8e42d41f3f987b070de308b56b7df0e056db8c0a7663e891",
+  "reviewedRelease": "v0.1.1330",
+  "patches": [
+    {
+      "commit": "88b4c00ea11c8653cada22e11edf20ab1594de43",
+      "summary": "Wait for an in-flight Codex token rotation after caller cancellation"
+    },
+    {
+      "commit": "d5847f19854dd609dc2c6b38001c9ef11da8d926",
+      "summary": "Flush and atomically replace existing native Codex and Claude credential writes"
+    },
+    {
+      "commit": "e297a8ab27461ed32b03ce8be0f9bf957a2e754d",
+      "summary": "Recover corrupt weekly Codex auto-reset records and write them durably"
+    },
+    {
+      "commit": "707fbb249df755423d3b2b77c6f001dd376d75c4",
+      "summary": "Stop backup and sync when local settings cannot be read"
+    },
+    {
+      "commit": "0dc643fdb7f1faf1031bd8e986f5d6795cd308e4",
+      "summary": "Read npm shim versions without launching the CLI and suppress Cline probe auto-updates"
+    },
+    {
+      "commit": "0f1666b3875eecb3dec3729d701b3b950fa81358",
+      "summary": "Adapt plugin handover and removed-provider records while preserving component credential ownership"
+    },
+    {
+      "commit": "9fcf6a6e7fd18601ed08622c19d39e24eb08dc0c",
+      "summary": "Retire 13 builtin provider IDs in favor of plugins without reactivating removed or disabled adapters"
+    },
+    {
+      "commit": "644ad1ed7af808ee4130f30e21dfc0f0d9bc8533",
+      "summary": "Keep unavailable protocol picks while excluding them from exposed and default models"
+    },
+    {
+      "commit": "8febe3a50c1b5a51b53d7c2e6a3223cc66e6ccfe",
+      "summary": "Remember delisted selections, restore them on relisting and preserve empty waiting-only providers"
+    },
+    {
+      "commit": "72109ea0eb32a3ae695db11b361edba816f45bdf",
+      "summary": "Union enabled plugin account catalogs while keeping per-account routing and unknown versus empty lists"
+    },
+    {
+      "commit": "e733b0722e31c824b6952a2c41f000ae83122011",
+      "summary": "Carry explicit plugin service tiers through the catalog and request translation"
+    },
+    {
+      "commit": "8233eadaec5498741166a74ad7510c1318af9739",
+      "summary": "Offer plugin Fast mode only for models declaring priority tier support"
+    },
+    {
+      "commit": "273ab9c2359bad30ad6c01b69086f56cbadce9ad",
+      "summary": "Respect provider-wide context overrides without borrowing another provider's model limits"
+    },
+    {
+      "commit": "7aad6a50ea981fcfef0c7182c193cd6e6d7fb61d",
+      "summary": "Bound wildcard contexts by the provider's own known catalog while retaining explicit per-model overrides"
+    },
+    {
+      "commit": "f985d6bdb68ed9359b35124f98b1fac5085886b3",
+      "summary": "Allow unchanged output and compaction preferences for temporarily unavailable models"
+    },
+    {
+      "commit": "f074996d93b87b17ea682c4b5951d52794bb28cb",
+      "summary": "Persist reasonless preferences and omit reasoning fields after protocol translation and extra-body merging"
+    },
+    {
+      "commit": "06c3370b749763f3ff73f29dd50ff45abdad7ee0",
+      "summary": "Report normalized model counts after catalog refreshes"
+    },
+    {
+      "commit": "62020b9c264dad63707f654c81d72b4168d51c63",
+      "summary": "Use DeepSeek-compatible chat output token fields"
+    },
+    {
+      "commit": "b9c589ebb1b0d6d5e80dda733173147755107a46",
+      "summary": "Apply explicit reply caps to ordinary provider requests"
+    },
+    {
+      "commit": "b749cffbb1b6b1ce986a5480cb9a323b1a12f590",
+      "summary": "Retry an oversized context once with a smaller output budget when enough reply room remains"
+    },
+    {
+      "commit": "ca4a1cde0dca3f3d4a1d6ef551da33ab1f41b2cf",
+      "summary": "Adapt reply budgets to WhaleBridge's DSH writer while preserving explicit outputs and compaction projections"
+    },
+    {
+      "commit": "51adf96958805e06a51e989ee571c6036bc49c24",
+      "summary": "Keep user model compatibility settings when the managed DSH model and protocol stay the same"
+    },
+    {
+      "commit": "75cbc7e1e5fdd0aa54d0b1ce39d7d626395c3081",
+      "summary": "Leave disabled and hidden providers out of background maintenance"
+    },
+    {
+      "commit": "62fc1b4b57b29fba8ea000c3328b34c9b3825b1e",
+      "summary": "Stop disabled subscriptions' proactive warmup, refresh and expiring-reset work"
+    },
+    {
+      "commit": "40df6dbd3829d77c634e185b821a2af9a445c028",
+      "summary": "Reject late builtin login credential writes after cancellation or replacement"
+    },
+    {
+      "commit": "a8ecf4020e3b9fedd1ff5cc1de64c0bfc4f5810b",
+      "summary": "Stop check-in requests and writes on unreadable ledgers while retaining last-good display state"
+    },
+    {
+      "commit": "88ce2cdd4c5ecdeb3da99222d70177e19594d5ad",
+      "summary": "Mask search queries at each existing outbound service and restore only final agent-facing search results"
+    },
+    {
+      "commit": "48aae83b82973e35bb6caa0057c6a8fe6aad065d",
+      "summary": "Partially adapt decision privacy to the existing architecture: mask askJev current text by its destination's policy"
+    },
+    {
+      "commit": "94919109cb3b9d4241bb957c9e571c6f4c236d2f",
+      "summary": "Configure HTTP/2 health checks while preserving existing custom settings and HTTP/1 exceptions"
+    },
+    {
+      "commit": "5090f3215b806fec0ad55dd1a4a449bd45ae12e7",
+      "summary": "Release dropped recent-request bodies instead of retaining them in the ring's backing array"
+    },
+    {
+      "commit": "93b87d00044db93d739db0ca2bc58c52f9f34cfc",
+      "summary": "Write GitHub backups through Git Data with atomic ref updates and bounded concurrent-change retries"
+    },
+    {
+      "commit": "a6efe07cd7977bd9d3136dcc0044765ff5f3ef1e",
+      "summary": "Split large GitHub backups into checked 16 MiB parts and clean obsolete parts in the same commit"
+    },
+    {
+      "commit": "a5d72a095b3bab14d6369d48d21fa12a900920f2",
+      "summary": "Rotate or order search keys, rest refusals, read Tavily quotas explicitly and mask pooled keys in errors"
+    },
+    {
+      "commit": "ec13d1162a757b4dc7201e6d1aa75fe56271124b",
+      "summary": "Persist search-service order and disabled state through editing and backup restoration"
+    },
+    {
+      "commit": "d432920f02c197a41db7faf0a958a681f7905769",
+      "summary": "Add DeepSeek Search to the existing private, redacted search path and settings surface"
+    },
+    {
+      "commit": "dc8dcc85d117c2c8ad5ff422733b9e125b0e1909",
+      "summary": "Allow empty-body POST for custom balance URLs with validated save and request methods"
+    },
+    {
+      "commit": "591ed58b536b17162a0715aa7210d9b7d0db4c09",
+      "summary": "Add Nous Portal with its Chat endpoint, live model list and existing Bearer credentials"
+    },
+    {
+      "commit": "430871d632e6e0aa1ea0cd2bc9f69665115be520",
+      "summary": "Offer separate SiliconFlow China and international sites without changing the existing default"
+    },
+    {
+      "commit": "c5f15cae7ccc8a67ea944f4b8d2c2fdf801611a8",
+      "summary": "Support Bedrock Mantle live models, regional endpoints and a bounded per-model route-prefix retry"
+    },
+    {
+      "commit": "11173c8a20bf8e74b10ca08b509c7675c62dadb3",
+      "summary": "Use a bounded compressed-image LRU and four-worker refitting for Codex inline images"
+    },
+    {
+      "commit": "3eee19b08be25423d5bb0a9fa41fe0a3ccfc76a2",
+      "summary": "Preflight Codex image bytes and color depth and batch fitting by estimated request decode memory"
+    },
+    {
+      "commit": "a9304efe016c832560885fc88a10018f136bdcc5",
+      "summary": "Read image configuration through long EXIF headers when estimating fitting memory"
+    },
+    {
+      "commit": "ea3dee96a89cfb4710326342e840d58811eaa79a",
+      "summary": "Guard caller and vendor media URLs with explicit machine-local fetch grants and exact provider endpoint authority"
+    },
+    {
+      "commit": "240f3eb4c5faca86fed15b48ee984ec38c49860c",
+      "summary": "Share address classification and allow fake-only DNS names through pinned TUN or loopback proxy routes"
+    },
+    {
+      "commit": "75e769a9f9b419f805b925f147146eff179111b9",
+      "summary": "Adapt Free first to inline routing with actual-account free metadata, known zero prices across all billing tiers, persistence and routing explanations"
+    },
+    {
+      "commit": "3ccbe6bc15c96a0cbb47ea574645fa5def3699fa",
+      "summary": "Adapt the headless plugin runtime with dependencies, checked configuration, reapply rollback and terminal Stop/Wait in WhaleBridge's finite assembly"
+    },
+    {
+      "commit": "af9bd6c3e227ed8a6baac5df8b33f6e934981005",
+      "summary": "Register routing strategies with consistent inactive behavior and shared provider/group rounds, retaining per-request affinity settlement receipts"
+    },
+    {
+      "commit": "9916a946080918074bc40e964613928d1a1b283f",
+      "summary": "Adapt the minimal successful-ledger observer lifecycle for JS usage hooks while retaining the existing single OTel request export path"
+    },
+    {
+      "commit": "4ac4d9ba995057935e40664b1196938130ffa815",
+      "summary": "Register gateway middleware and the existing masker with fail-closed outbound errors, captured restoration and drained service teardown"
+    },
+    {
+      "commit": "3f913b3de6b1ad51c88016c605321a02aab6dee4",
+      "summary": "Serve bounded JS gateway strategies and onUsage hooks with checked discovery, managed content-based reload and durable UI strategy selections"
+    }
+  ],
+  "version": "1.4.0"
 }

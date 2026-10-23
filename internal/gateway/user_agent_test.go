@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"io"
@@ -11,7 +12,6 @@ import (
 	"strings"
 	"sync"
 	"testing"
-	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
@@ -170,59 +170,75 @@ func TestUserAgentClaudeCodeAsBefore(t *testing.T) {
 	}
 }
 
-// A signed-in account keeps the identity its own signing gives, whatever
-// is set: Factory's is asked as droid, never as the agent, nor does the
-// flag stick to it when saved.
+// A retired account is served by its plugin's signing. The persisted
+// passUserAgent flag cannot turn it into a key+URL provider or hand the
+// caller's User-Agent to the vendor, and its old source login stays put.
 func TestUserAgentAccountUntouched(t *testing.T) {
-	home := t.TempDir()
-	t.Setenv("HOME", home)
-	t.Setenv("USERPROFILE", home)
-	t.Setenv("XDG_CONFIG_HOME", filepath.Join(home, ".config"))
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(home, ".cache"))
-	t.Setenv("XDG_DATA_HOME", filepath.Join(home, ".local", "share"))
-	f := &fake{t: t, ctype: "application/json", reply: `{"id":"c","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}]}`}
-	up := httptest.NewServer(f)
-	t.Cleanup(up.Close)
-	t.Cleanup(provider.FactoryBaseForTest(up.URL, up.URL+"/eu"))
-	auth, _ := json.Marshal(map[string]any{
-		"accessToken": "tok", "refreshToken": "r",
-		"expiresAt": time.Now().Add(time.Hour).UnixMilli(),
-		"orgId":     "org_D", "activeOrganizationId": "fac_D", "email": "d@example.com",
-	})
+	f := &fake{t: t, reply: sse(`data: {"id":"x","choices":[{"index":0,"delta":{"content":"ok"}}]}`, `data: {"id":"x","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}`, `data: [DONE]`)}
+	id := besideFake(t, "factory", f)
 	dir := filepath.Dir(provider.Path())
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	raw, _ := json.Marshal([]map[string]any{{"agent": "factory", "user": "d@example.com", "plan": "pro", "on": true, "auth": json.RawMessage(auth)}})
-	if err := os.WriteFile(filepath.Join(dir, "logins.json"), raw, 0o600); err != nil {
+	legacy := []byte(`[{"agent":"factory","user":"native@fixture","on":true,"auth":{"accessToken":"source-token","refreshToken":"source-refresh"}}]`)
+	source := filepath.Join(dir, "logins.json")
+	if err := os.WriteFile(source, legacy, 0600); err != nil {
 		t.Fatal(err)
 	}
-	// set as the file would hold it, past the editor and the CLI
 	if err := os.WriteFile(provider.Path(), []byte(`{"providers":[{"id":"factory","passUserAgent":true}]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	p, err := provider.Find("factory")
-	if err != nil {
-		t.Fatal(err)
+	provider.Changed()
+	p, err := provider.Find(id)
+	if err != nil || !p.IsPlugin() || !provider.BuiltinRetired(id) {
+		t.Fatalf("Factory did not resolve to its plugin: %+v %v", p, err)
 	}
 	if p.PassesUserAgent() {
-		t.Fatal("a signed-in account passes the agent's User-Agent on")
+		t.Fatal("a signed-in plugin passes the agent's User-Agent on")
 	}
 	for _, r := range []struct{ path, body string }{
-		{"/v1/chat/completions", `{"model":"factory/deepseek-v4.1-flash","messages":[{"role":"user","content":"hi"}]}`},
-		{"/v1/messages", `{"model":"factory/deepseek-v4.1-flash","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`},
+		{"/v1/chat/completions", `{"model":"factory/fake-1","messages":[{"role":"user","content":"hi"}]}`},
+		{"/v1/messages", `{"model":"factory/fake-1","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`},
 	} {
 		f.head = nil
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest("POST", r.path, strings.NewReader(r.body))
 		req.Header.Set("User-Agent", "pi-coding-agent/0.9.1")
 		New().upstreamHandler().ServeHTTP(rec, req)
-		if f.head == nil {
-			t.Fatalf("%s: Factory wasn't asked: %d %s", r.path, rec.Code, rec.Body)
+		if rec.Code != http.StatusOK || f.head == nil {
+			t.Fatalf("%s: plugin wasn't asked: %d %s", r.path, rec.Code, rec.Body)
 		}
-		if ua := f.head.Get("User-Agent"); !strings.HasPrefix(ua, "factory-cli/") {
-			t.Errorf("%s: Factory was asked as %q, not as droid", r.path, ua)
+		if ua := f.head.Get("User-Agent"); ua == "pi-coding-agent/0.9.1" || !strings.HasPrefix(ua, "magpie/") {
+			t.Errorf("%s: plugin request had caller User-Agent %q", r.path, ua)
 		}
+		if f.head.Get("Authorization") != "Bearer k1" {
+			t.Fatal("request bypassed the plugin's account signing")
+		}
+	}
+	var rows []struct {
+		Agent string          `json:"agent"`
+		User  string          `json:"user"`
+		Auth  json.RawMessage `json:"auth"`
+	}
+	b, err := os.ReadFile(source)
+	if err != nil || json.Unmarshal(b, &rows) != nil {
+		t.Fatalf("source logins unreadable: %v", err)
+	}
+	found := false
+	for _, row := range rows {
+		if row.Agent == "factory" && row.User == "native@fixture" {
+			found = true
+			var compact bytes.Buffer
+			if err := json.Compact(&compact, row.Auth); err != nil {
+				t.Fatal(err)
+			}
+			if compact.String() != `{"accessToken":"source-token","refreshToken":"source-refresh"}` {
+				t.Fatalf("source credential changed: %s", row.Auth)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("serving through plugin claimed the source login")
 	}
 }
 

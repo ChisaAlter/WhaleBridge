@@ -51,22 +51,22 @@ func TestCheckinAccountLeftOut(t *testing.T) {
 // Settings lists each account a check-in reaches with its own switch, and
 // the account's Usage card says it is left out.
 func TestCheckinAccountsListed(t *testing.T) {
-	home := signIn(t)
-	wbTokens.Lock()
-	wbTokens.m = map[string]wbCreds{}
-	wbTokens.Unlock()
-	future := time.Now().Add(24 * time.Hour).UnixMilli()
-	writeFile(t, wbAuthFile(home), map[string]any{
-		"account": map[string]any{"uid": "u1", "nickname": "旅行者"},
-		"auth":    map[string]any{"accessToken": "wb-access", "refreshToken": "r", "expiresAt": future, "domain": "www.codebuddy.cn"},
-	})
+	signIn(t)
+	// WorkBuddy is retired; its check-in list now comes from its plugin.
+	// This test exercises the shared per-account switch, with no host or
+	// native credential discovery needed to supply that list.
+	was := pluginCheckinProviders
+	pluginCheckinProviders = func() []pluginCheckinProvider {
+		return []pluginCheckinProvider{{ID: "workbuddy", Name: "WorkBuddy", accounts: []pluginCheckinAcct{{User: "旅行者", On: true, key: "workbuddy|u1", card: "workbuddy"}}}}
+	}
+	t.Cleanup(func() { pluginCheckinProviders = was })
 	var mine []CheckinAccount
 	for _, a := range CheckinAccounts() {
 		if a.Key == "workbuddy|u1" {
 			mine = append(mine, a)
 		}
 	}
-	if len(mine) != 1 || mine[0].By != "" || mine[0].User != "旅行者" || !mine[0].On {
+	if len(mine) != 1 || mine[0].By != "plugin:workbuddy" || mine[0].User != "旅行者" || !mine[0].On {
 		t.Fatalf("listed: %+v", CheckinAccounts())
 	}
 	qs := WithCheckins([]SubscriptionQuota{{Provider: "workbuddy", User: "旅行者"}})

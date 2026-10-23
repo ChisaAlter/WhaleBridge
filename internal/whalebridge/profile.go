@@ -6,8 +6,10 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
+	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"gopkg.in/yaml.v3"
 )
 
@@ -143,6 +145,7 @@ func editRoute(doc *yaml.Node, route any, disconnect, add bool) (changed bool, e
 			changed, err = !bytes.Equal(before, after), encodeErr
 		}
 	}()
+	var previous *yaml.Node
 	for _, row := range patchRows(doc, "llm-pi-ai") {
 		providers := member(member(row, "config"), "providers")
 		if owned := member(providers, "whalebridge"); owned != nil {
@@ -150,6 +153,7 @@ func editRoute(doc *yaml.Node, route any, disconnect, add bool) (changed bool, e
 			if key == nil || key.Value != keyName {
 				return false, fmt.Errorf("已有同名 whalebridge 渠道，未覆盖用户配置")
 			}
+			previous = owned
 			drop(providers, "whalebridge")
 			changed = true
 		}
@@ -168,6 +172,16 @@ func editRoute(doc *yaml.Node, route any, disconnect, add bool) (changed bool, e
 			}
 		}
 		return changed, nil
+	}
+	// Keep the same default choice when a retired plugin loses its old
+	// suffix. Only WhaleBridge's own model references use these aliases.
+	for _, row := range patchRows(doc, "agent-default-model") {
+		cfg := member(row, "config")
+		if p, m := member(cfg, "provider"), member(cfg, "model"); p != nil && p.Value == "whalebridge" && m != nil {
+			if next := canonicalPluginModelRef(m.Value); next != m.Value {
+				m.Value = next
+			}
+		}
 	}
 	if !add {
 		return changed, nil
@@ -195,8 +209,60 @@ func editRoute(doc *yaml.Node, route any, disconnect, add bool) (changed bool, e
 	if err := value.Encode(route); err != nil {
 		return false, err
 	}
+	keepModelCompat(previous, &value)
 	put(providers, "whalebridge", &value)
 	return true, nil
+}
+
+func canonicalPluginModelRef(ref string) string {
+	pid, model, ok := strings.Cut(ref, "/")
+	if !ok {
+		return ref
+	}
+	if canonical := provider.CanonicalProviderID(pid); canonical != pid {
+		return canonical + "/" + model
+	}
+	return ref
+}
+
+// keepModelCompat retains hand-set switches only for the same model on
+// the same route protocol. Values supplied by the new route win.
+func keepModelCompat(cur, route *yaml.Node) {
+	api, nextAPI := member(cur, "api"), member(route, "api")
+	if api == nil || nextAPI == nil || api.Value != nextAPI.Value {
+		return
+	}
+	old := map[string]*yaml.Node{}
+	if ms := member(cur, "models"); ms != nil && ms.Kind == yaml.SequenceNode {
+		for _, m := range ms.Content {
+			if id, compat := member(m, "id"), member(m, "compat"); id != nil && compat != nil && compat.Kind == yaml.MappingNode {
+				key := canonicalPluginModelRef(id.Value)
+				if old[key] == nil || key == id.Value {
+					old[key] = compat // the current spelling wins a collision
+				}
+			}
+		}
+	}
+	ms := member(route, "models")
+	if ms == nil || ms.Kind != yaml.SequenceNode {
+		return
+	}
+	for _, m := range ms.Content {
+		id := member(m, "id")
+		if id == nil || old[id.Value] == nil {
+			continue
+		}
+		compat, err := mapAt(m, "compat")
+		if err != nil {
+			continue
+		}
+		for j := 0; j+1 < len(old[id.Value].Content); j += 2 {
+			key := old[id.Value].Content[j].Value
+			if member(compat, key) == nil {
+				put(compat, key, old[id.Value].Content[j+1])
+			}
+		}
+	}
 }
 
 func writeDocument(path string, doc *yaml.Node, private bool) error {

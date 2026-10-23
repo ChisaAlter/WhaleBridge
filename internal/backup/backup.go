@@ -194,9 +194,8 @@ func Collect(keys bool, app string) (Bundle, error) {
 		searches = append(searches, a)
 	}
 	b.Searches = &searches
-	// a settings.json that can't be read stops it too: carried as the
-	// defaults, it would put them over the settings where it is put back,
-	// or on every other computer sync mirrors it to (#2269)
+	// Unknown settings must not be carried as defaults to a backup or
+	// every computer it is synced to (#2269). Only a missing file is no settings.
 	if _, err := os.Stat(settings.Path()); err == nil {
 		s, err := settings.LoadChecked()
 		if err != nil {
@@ -208,6 +207,8 @@ func Collect(keys bool, app string) (Bundle, error) {
 			s.GitHubToken = ""
 		}
 		b.Settings = &s
+	} else if !os.IsNotExist(err) {
+		return b, fmt.Errorf("could not read settings at %s: %w", settings.Path(), err)
 	}
 	return b, nil
 }

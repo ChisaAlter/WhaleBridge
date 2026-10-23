@@ -105,9 +105,10 @@ func SearcherUnused() string {
 
 // apiSearch asks the search APIs, in their order, until one answers.
 func (s *Server) apiSearch(ctx context.Context, query string) (string, []Hit, error) {
-	query, err := maskedQuery(query, nil)
-	if err != nil {
-		return "", nil, err
+	var maskErr error
+	query, maskErr = maskedQueryIn(ctx, query, nil)
+	if maskErr != nil {
+		return "", nil, maskErr
 	}
 	var errs []error
 	for _, a := range provider.SearchAPIs() {
@@ -126,10 +127,8 @@ func (s *Server) apiSearch(ctx context.Context, query string) (string, []Hit, er
 	return "", nil, errors.Join(errs...)
 }
 
-// askSearchAPIKeys asks a search API with its keys, in searchKeyOrder:
-// on to the next while one is refused (out of credit, rate limited,
-// turned away; #1477), which then rests (searchRestFor). Anything else, such as
-// no answer in time, isn't about the key, and the next isn't tried.
+// askSearchAPIKeys uses the saved pick strategy. Only key refusals try the
+// next key; network, shape and server failures do not spend the whole pool.
 func (s *Server) askSearchAPIKeys(ctx context.Context, a provider.SearchAPI, query string) ([]foundPage, error) {
 	keys := a.Keys()
 	if len(keys) == 0 {
@@ -140,7 +139,7 @@ func (s *Server) askSearchAPIKeys(ctx context.Context, a provider.SearchAPI, que
 		one := a
 		one.Key = keys[i]
 		ctx, cancel := context.WithTimeout(ctx, searchTimeout/4)
-		pages, err := s.askSearchAPI(ctx, one, query)
+		pages, err := s.askSearchAPI(ctx, one, query, keys...)
 		cancel()
 		if err == nil {
 			wakeSearchKey(a.Vendor, keys[i])
@@ -152,6 +151,8 @@ func (s *Server) askSearchAPIKeys(ctx context.Context, a provider.SearchAPI, que
 			d, why := searchRestFor(a.Vendor, r.status, r.retryAfter, time.Now())
 			restSearchKey(a.Vendor, keys[i], d, why, time.Now())
 		}
+		// Wrap with a masked message without losing the refusal's type.
+		err = maskedSearchError{err: err, message: maskSearchKeys(err.Error(), keys)}
 		if len(keys) > 1 {
 			err = fmt.Errorf("%s: %w", keyLabel(i, keys[i]), err)
 		}
@@ -163,13 +164,21 @@ func (s *Server) askSearchAPIKeys(ctx context.Context, a provider.SearchAPI, que
 	return nil, errors.Join(errs...)
 }
 
+type maskedSearchError struct {
+	err     error
+	message string
+}
+
+func (e maskedSearchError) Error() string { return e.message }
+func (e maskedSearchError) Unwrap() error { return e.err }
+
 // searchRefused is a search API's refusal of the key it was asked with,
 // by its status: 401/403 turned away, 402/432/433 out of credit (Tavily's
 // plan and pay-as-you-go limits), 429 rate limited.
 type searchRefused struct {
 	status     int
 	msg        string
-	retryAfter string // its Retry-After, "" when it said none
+	retryAfter string
 }
 
 func (e searchRefused) Error() string { return e.msg }
@@ -201,9 +210,18 @@ func pagesSaid(pages []foundPage) (string, []Hit) {
 }
 
 // askSearchAPI asks one search API for the query.
-func (s *Server) askSearchAPI(ctx context.Context, a provider.SearchAPI, query string) ([]foundPage, error) {
+func (s *Server) askSearchAPI(ctx context.Context, a provider.SearchAPI, query string, maskKeys ...string) (pages []foundPage, err error) {
+	if len(maskKeys) == 0 {
+		maskKeys = a.Keys()
+	}
+	// Every error path, including redirects and malformed replies, may echo
+	// credentials. The pool wrapper also masks sibling keys.
+	defer func() {
+		if err != nil {
+			err = maskedSearchError{err: err, message: maskSearchKeys(err.Error(), maskKeys)}
+		}
+	}()
 	var r *http.Request
-	var err error
 	post := func(path string, body any) {
 		b, _ := json.Marshal(body)
 		if r, err = http.NewRequestWithContext(ctx, http.MethodPost, a.Base()+path, bytes.NewReader(b)); err == nil {
@@ -224,6 +242,8 @@ func (s *Server) askSearchAPI(ctx context.Context, a provider.SearchAPI, query s
 			"contents": map[string]any{"text": map[string]any{"maxCharacters": pageText}}})
 	case "firecrawl":
 		post("/v2/search", map[string]any{"query": query, "limit": searchHits})
+	case "deepseek":
+		post("/v1/tools/search", map[string]any{"query": firstRunes(query, deepseekQueryMax), "count": searchHits})
 	case "searxng":
 		get("/search", url.Values{"q": {query}, "format": {"json"}})
 	case "you":
@@ -286,6 +306,9 @@ func (s *Server) askSearchAPI(ctx context.Context, a provider.SearchAPI, query s
 		return nil, fmt.Errorf("%s: it sends the search on to %s, which isn't given its key; set that address instead", res.Status, res.Header.Get("Location"))
 	}
 	if res.StatusCode >= 300 {
+		// Mask before APIError truncates an unrecognized body; otherwise a
+		// key cut at that boundary can no longer match the complete secret.
+		b = []byte(maskSearchKeys(string(b), maskKeys))
 		msg := provider.APIError(b, res.Status)
 		if a.Vendor == "you" {
 			// You.com's error is a code ("payment_required"), its message
@@ -305,7 +328,7 @@ func (s *Server) askSearchAPI(ctx context.Context, a provider.SearchAPI, query s
 		}
 		return nil, errors.New(msg)
 	}
-	pages, err := readSearchAPI(a.Vendor, b)
+	pages, err = readSearchAPI(a.Vendor, b)
 	if err != nil {
 		return nil, fmt.Errorf("unexpected reply: %w", err)
 	}
@@ -327,6 +350,9 @@ func readSearchAPI(vendor string, b []byte) ([]foundPage, error) {
 		Description string `json:"description"`
 		Text        string `json:"text"`
 		Markdown    string `json:"markdown"`
+		Summary     string `json:"summary"`
+		Snippet     string `json:"snippet"`
+		Date        string `json:"date"`
 	}
 	var out struct {
 		Results []result `json:"results"` // tavily, exa, searxng
@@ -358,7 +384,7 @@ func readSearchAPI(vendor string, b []byte) ([]foundPage, error) {
 			continue
 		}
 		text := r.Content
-		for _, t := range []string{r.Text, r.Description, r.Markdown} {
+		for _, t := range []string{r.Summary, r.Text, r.Description, r.Markdown, r.Snippet} {
 			if text == "" {
 				text = t
 			}
@@ -367,9 +393,26 @@ func readSearchAPI(vendor string, b []byte) ([]foundPage, error) {
 		if title == "" {
 			title = r.URL
 		}
-		pages = append(pages, foundPage{Title: title, URL: r.URL, Text: clipText(searchPlain(text), pageText)})
+		pages = append(pages, foundPage{Title: title, URL: r.URL, Text: clipText(searchPlain(text), pageText), Age: r.Date})
 	}
 	return pages, nil
+}
+
+const deepseekQueryMax = 128
+
+// firstRunes clips Unicode characters without appending an ellipsis.
+func firstRunes(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	i := 0
+	for at := range s {
+		if i == n {
+			return s[:at]
+		}
+		i++
+	}
+	return s
 }
 
 // readYouSearch reads You.com's reply, free or keyed alike: its pages

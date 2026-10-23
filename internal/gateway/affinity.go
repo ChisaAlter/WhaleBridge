@@ -430,7 +430,7 @@ func affine(scope, mode string, rotate bool, in http.Header, from provider.Proto
 		a.Why = "strict"
 	case pl.order[at].Rest != nil:
 		a.Why = "resting"
-	case at > 0 && pl.order[at].Known && pl.order[at].Used >= provider.SpentShareOf(cs[at].p.Routing):
+	case at > 0 && pl.order[at].Known && pl.order[at].Used >= provider.SpentShareOf(routingOf(cs[at].p.Routing)):
 		// all but used up, and put behind another: first still — the
 		// one key or account it has (#1016), or every one used up — it
 		// doesn't move

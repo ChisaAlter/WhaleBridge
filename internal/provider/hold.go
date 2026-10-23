@@ -119,7 +119,17 @@ func heldPlugins() []plugin.Provider {
 // heldSettings is the settings, read once while a request holds the
 // catalog: a look at the agents asks them for every model of every agent.
 // Only for reading — what it gives is shared by the request's look-ups.
-func heldSettings() settings.Settings { return heldOf("settings", settings.Load) }
+func heldSettings() settings.Settings {
+	return heldOf("settings", func() settings.Settings { return canonicalModelSettings(settings.Load()) })
+}
+
+// heldProviderID resolves safe legacy aliases once per held catalog.
+func heldProviderID(id string) string {
+	if canonical := heldOf("legacy-plugin-aliases", LegacyPluginAliases)[id]; canonical != "" {
+		return canonical
+	}
+	return id
+}
 
 // HeldSettings is the settings as heldSettings reads them, for a look
 // outside the package made many times in one request.

@@ -29,6 +29,8 @@ type Method struct {
 	// Placeholder is the hint an "api" method gives in its key's field
 	// (magpie's own field: OpenCode's says "API key")
 	Placeholder string `json:"placeholder,omitempty"`
+	// Keyless skips personal-key entry; authorize supplies the credential.
+	Keyless bool `json:"keyless,omitempty"`
 }
 
 // KeyTitle is what an "api" method's key is asked as: its label, as
@@ -147,6 +149,9 @@ type Provider struct {
 	// Accounts are the accounts signed in to it, the one kept under its
 	// own id first; SignedIn, AuthType and AccountID are that one's.
 	Accounts []Account `json:"accounts"`
+	// Single says signing in replaces one identity, as a native client's
+	// account does, rather than creating another slot for the same client.
+	Single bool `json:"single,omitempty"`
 	// MaxConcurrency is how many requests the plugin says each of its
 	// accounts takes at once (magpie's own field, which OpenCode ignores:
 	// the auth hook's maxConcurrency, else package.json's
@@ -195,11 +200,16 @@ type Account struct {
 	AccountID string `json:"accountId"`
 	// Hint tells an account with no id from another: the end of its key.
 	Hint string `json:"hint,omitempty"`
-	// Models are the ids of the provider's models this account has, when
-	// the provider has more than one account; none, it has them all.
-	Models    []string `json:"models,omitempty"`
-	FellBack  bool     `json:"fellBack,omitempty"`
-	ListError string   `json:"listError,omitempty"`
+	// Models are the ids of the provider's models this account has. Nil
+	// means unknown (or the provider's whole list); an empty list is a
+	// known account with no models, and must stay empty across disk reads.
+	Models []string `json:"models"`
+	// FreeModels are this account's models explicitly served for free.
+	// Nil is unknown (an old cache or an unread list); [] is known to
+	// have no free models. Never borrow this fact from another account.
+	FreeModels []string `json:"freeModels"`
+	FellBack   bool     `json:"fellBack,omitempty"`
+	ListError  string   `json:"listError,omitempty"`
 }
 
 var (
@@ -421,25 +431,105 @@ func keepListed(ps, last []Provider) []Provider {
 		if !ok {
 			continue
 		}
-		if p.FellBack && !l.FellBack && len(l.Models) > 0 {
-			ps[i].Models, ps[i].FellBack, ps[i].ListError = l.Models, false, ""
-			// the first account's list is the provider's: it is kept with it
-			if len(ps[i].Accounts) > 0 && ps[i].Accounts[0].Models == nil {
-				ps[i].Accounts[0].FellBack, ps[i].Accounts[0].ListError = false, ""
+		if len(p.Accounts) == 0 {
+			if p.FellBack && !l.FellBack && l.Models != nil {
+				ps[i].Models, ps[i].FellBack, ps[i].ListError = l.Models, false, ""
+			}
+			continue
+		}
+		// A provider's models are the union of its accounts' lists. Keep
+		// only a failed account's old list, including its model details:
+		// replacing the whole union loses another account's new models,
+		// while keeping ids alone leaves them with no model to route to.
+		previous := map[string]Account{}
+		for _, a := range l.Accounts {
+			previous[a.Key] = a
+		}
+		restored, successful := map[string]bool{}, map[string]bool{}
+		recovered := false
+		for _, a := range p.Accounts {
+			if a.FellBack {
+				continue
+			}
+			ids := a.Models
+			if ids == nil {
+				ids = modelIDs(p.Models)
+			}
+			for _, id := range ids {
+				successful[id] = true
 			}
 		}
 		for j, a := range p.Accounts {
 			if !a.FellBack {
 				continue
 			}
-			for _, b := range l.Accounts {
-				if b.Key == a.Key && !b.FellBack && len(b.Models) > 0 {
-					ps[i].Accounts[j].Models, ps[i].Accounts[j].FellBack, ps[i].Accounts[j].ListError = b.Models, false, ""
+			b, known := previous[a.Key]
+			// Older caches may have the provider's list but no accounts.
+			if !known && j == 0 && len(l.Accounts) == 0 && !l.FellBack {
+				known = true
+			}
+			if !known || b.FellBack {
+				continue
+			}
+			ids := b.Models
+			if ids == nil {
+				if l.FellBack || l.Models == nil {
+					continue
+				}
+				ids = modelIDs(l.Models)
+			}
+			p.Accounts[j].Models = slices.Clone(ids)
+			p.Accounts[j].FreeModels = slices.Clone(b.FreeModels)
+			p.Accounts[j].FellBack, p.Accounts[j].ListError = false, ""
+			for _, id := range ids {
+				restored[id] = true
+			}
+			if j == 0 {
+				p.FellBack, p.ListError = false, ""
+			}
+			// Even an explicitly empty list is a successful recovery.
+			recovered = true
+		}
+		if recovered {
+			now, old := map[string]Model{}, map[string]Model{}
+			for _, m := range p.Models {
+				now[m.ID] = m
+			}
+			for _, m := range l.Models {
+				old[m.ID] = m
+			}
+			models, seen := make([]Model, 0, len(p.Models)), map[string]bool{}
+			for _, a := range p.Accounts {
+				ids := a.Models
+				if ids == nil {
+					ids = modelIDs(p.Models)
+				}
+				for _, id := range ids {
+					if seen[id] {
+						continue
+					}
+					m, found := now[id]
+					if kept, ok := old[id]; restored[id] && !successful[id] && ok {
+						m, found = kept, true
+					}
+					if found {
+						models, seen[id] = append(models, m), true
+					}
 				}
 			}
+			p.Models = models
 		}
+		ps[i] = p
 	}
 	return ps
+}
+
+func modelIDs(models []Model) []string {
+	ids := make([]string, len(models))
+	for i, m := range models {
+		ids[i] = m.ID
+	}
+	return ids
 }
 
 // keepUnloaded is ps with the providers last known of an installed
@@ -493,7 +583,7 @@ func UseCached(ps []Provider) {
 // Listed is every provider the plugins last listed, an off plugin's among
 // them, as Cached keeps them, with no sign-in read: false when no listing
 // is known (none kept, plugin-providers.json missing or unreadable), which
-// is never "no providers".
+// is never "no providers". It neither starts the host nor downloads Bun.
 func Listed() ([]Provider, bool) {
 	provMu.Lock()
 	ps := provCache
@@ -620,6 +710,7 @@ func Cached() []Provider {
 			for _, w := range was {
 				if w.Key == a.Key {
 					p.Accounts[i].Models, p.Accounts[i].FellBack, p.Accounts[i].ListError = w.Models, w.FellBack, w.ListError
+					p.Accounts[i].FreeModels = slices.Clone(w.FreeModels)
 				}
 			}
 		}

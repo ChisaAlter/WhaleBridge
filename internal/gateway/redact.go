@@ -1,6 +1,8 @@
 package gateway
 
 import (
+	"context"
+	"errors"
 	"net/http"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/gwmw"
@@ -9,110 +11,148 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
-// redacted masks a request's secrets, as the settings say, before it goes
-// to a vendor, and wraps w so what the vendor answers has them back; done
-// writes what the wrapper still holds. Nothing masked, nothing wrapped. It
-// fails closed: masking wanted with no masker serving, or a masker that
-// fails, is an error, and the request goes nowhere (gwmw.Masking).
-func redacted(w http.ResponseWriter, body []byte) (http.ResponseWriter, []byte, func(), error) {
-	m, err := gwmw.Masking(redactionWanted())
-	if m == nil {
-		return w, body, func() {}, err
-	}
-	type out struct {
-		b []byte
-		n int
-	}
-	o, err := gwmw.Safely(func() out { b, n := m.JSON(body); return out{b, n} })
-	if err != nil || o.n == 0 {
-		return w, body, func() {}, err
-	}
-	rw, done := m.Writer(w)
-	return rw, o.b, done, nil
-}
-
-// redactedPrompt masks a parsed image or video prompt before any vendor
-// body is built, including multipart forms, and restores the reply's text.
-// It fails closed as redacted does.
-func redactedPrompt(w http.ResponseWriter, prompt string) (http.ResponseWriter, string, func(), error) {
-	m, masked, n, err := maskText(prompt)
-	if err != nil || n == 0 {
-		return w, prompt, func() {}, err
-	}
-	rw, done := m.Writer(w)
-	return rw, masked, done, nil
-}
-
-// maskedText is s masked as the settings say, and how many values it
-// swapped; an error when it can't be (fail closed).
-func maskedText(s string) (string, int, error) {
-	_, masked, n, err := maskText(s)
-	return masked, n, err
-}
-
-// maskText is maskedText with the masker that masked it.
-func maskText(s string) (gwmw.Masker, string, int, error) {
-	m, err := gwmw.Masking(redactionWanted())
-	if m == nil {
-		return nil, s, 0, err
-	}
-	type out struct {
-		s string
-		n int
-	}
-	o, err := gwmw.Safely(func() out { t, n := m.Text(s); return out{t, n} })
+func requestMasker() (gwmw.Masker, error) {
+	st, err := settings.LoadChecked()
 	if err != nil {
-		return nil, s, 0, err
+		return nil, errors.New("privacy settings could not be read; nothing was sent")
 	}
-	return m, o.s, o.n, nil
+	return gwmw.Masking(masking.Wanted(st))
 }
 
-// restored is s with what a masker masked before put back; s when none
-// serves.
-func restored(s string, escaped bool) string {
-	if m, ok := gwmw.Served(); ok {
-		return m.Restore(s, escaped)
+type maskingOutput[T any] struct {
+	value T
+	count int
+}
+type maskingWriter struct {
+	writer http.ResponseWriter
+	done   func()
+}
+
+func wrapMasker(w http.ResponseWriter, m gwmw.Masker) (http.ResponseWriter, func(), error) {
+	if m == nil {
+		rw, done := masking.RestoreWriter(w)
+		return rw, done, nil
 	}
-	return s
-}
-
-// restoring wraps w so values masked before come back, when a masker
-// serves.
-func restoring(w http.ResponseWriter) (http.ResponseWriter, func()) {
-	if m, ok := gwmw.Served(); ok {
-		return m.Writer(w)
+	out, err := gwmw.Safely(func() maskingWriter { rw, done := m.Writer(w); return maskingWriter{rw, done} })
+	if err != nil {
+		return w, func() {}, err
 	}
-	return w, func() {}
+	if out.writer == nil || out.done == nil {
+		return w, func() {}, errors.New("masking writer unavailable; nothing was sent")
+	}
+	return out.writer, out.done, nil
 }
 
-// redactionWanted: the settings ask for something to be masked. The
-// masking itself is served by the redact plugin (plugins/redact); this is
-// the core's own reading, so a request isn't sent unmasked when the plugin
-// isn't there to mask it.
-func redactionWanted() bool {
-	return masking.Wanted(settings.Load())
+func redactedDestination(w http.ResponseWriter, body []byte, ctx context.Context) (http.ResponseWriter, []byte, func(), error) {
+	captured, ok := ctx.Value(maskingContextKey{}).(capturedMasker)
+	if !ok {
+		return redacted(w, body)
+	}
+	return redactWith(w, body, captured.masker)
 }
 
-// maskedQuery masks a web search's query, as the settings say, before it
-// goes to a search service that isn't a model's endpoint: a search API, or
-// a Kimi Code plan's or WorkBuddy's search (to p, nil for an API; one the
-// user set to go unmasked keeps it as it is). A model's web_search writes
-// its query from a request already masked, but an agent's call to the
-// search MCP carries it as the agent's model wrote it, values put back
-// (lc on Discord). It fails closed as redacted does.
+// redacted captures the masker before sending, and the reply writer belongs
+// to that same instance even when runtime reconciliation swaps registrations.
+func redacted(w http.ResponseWriter, body []byte) (http.ResponseWriter, []byte, func(), error) {
+	m, err := requestMasker()
+	if err != nil {
+		return w, nil, func() {}, err
+	}
+	return redactWith(w, body, m)
+}
+func redactWith(w http.ResponseWriter, body []byte, m gwmw.Masker) (http.ResponseWriter, []byte, func(), error) {
+	if m == nil {
+		return w, body, func() {}, nil
+	}
+	out, err := gwmw.Safely(func() maskingOutput[[]byte] { b, n := m.JSON(body); return maskingOutput[[]byte]{b, n} })
+	if err != nil {
+		return w, nil, func() {}, err
+	}
+	if out.value == nil && len(body) > 0 {
+		return w, nil, func() {}, errors.New("masking returned no request; nothing was sent")
+	}
+	if out.count == 0 {
+		return w, out.value, func() {}, nil
+	}
+	rw, done, err := wrapMasker(w, m)
+	return rw, out.value, done, err
+}
+func redactedPrompt(w http.ResponseWriter, prompt string) (http.ResponseWriter, string, func(), error) {
+	m, err := requestMasker()
+	if err != nil {
+		return w, "", func() {}, err
+	}
+	if m == nil {
+		return w, prompt, func() {}, nil
+	}
+	out, err := gwmw.Safely(func() maskingOutput[string] { s, n := m.Text(prompt); return maskingOutput[string]{s, n} })
+	if err != nil {
+		return w, "", func() {}, err
+	}
+	if out.count == 0 {
+		return w, out.value, func() {}, nil
+	}
+	rw, done, err := wrapMasker(w, m)
+	return rw, out.value, done, err
+}
+
+type maskingContextKey struct{}
+type capturedMasker struct{ masker gwmw.Masker }
+
+func captureMasking(ctx context.Context) (context.Context, error) {
+	if _, ok := ctx.Value(maskingContextKey{}).(capturedMasker); ok {
+		return ctx, nil
+	}
+	m, err := requestMasker()
+	if err != nil {
+		return ctx, err
+	}
+	return context.WithValue(ctx, maskingContextKey{}, capturedMasker{m}), nil
+}
+
+func maskTextWith(m gwmw.Masker, text string) (string, int, error) {
+	if m == nil {
+		return text, 0, nil
+	}
+	out, err := gwmw.Safely(func() maskingOutput[string] { value, count := m.Text(text); return maskingOutput[string]{value, count} })
+	return out.value, out.count, err
+}
+
 func maskedQuery(query string, p *provider.Provider) (string, error) {
+	return maskedQueryIn(context.Background(), query, p)
+}
+func maskedQueryIn(ctx context.Context, query string, p *provider.Provider) (string, error) {
 	if p != nil && p.SkipsRedaction() {
 		return query, nil
 	}
-	masked, _, err := maskedText(query)
-	return masked, err
+	var m gwmw.Masker
+	if captured, ok := ctx.Value(maskingContextKey{}).(capturedMasker); ok {
+		m = captured.masker
+	} else {
+		var err error
+		m, err = requestMasker()
+		if err != nil {
+			return "", err
+		}
+	}
+	if m == nil {
+		return query, nil
+	}
+	return gwmw.Safely(func() string { s, _ := m.Text(query); return s })
+}
+func restoreMasked(ctx context.Context, text string) (string, error) {
+	captured, ok := ctx.Value(maskingContextKey{}).(capturedMasker)
+	if !ok {
+		return "", errors.New("masking response context unavailable")
+	}
+	if captured.masker == nil {
+		return masking.Restore(text, false), nil
+	}
+	return gwmw.Safely(func() string { return captured.masker.Restore(text, false) })
 }
 
-// unredactedRoute says a request resolved to p, or to the group whose
-// models are ms, goes only where the user set requests to go unmasked
-// (provider.SkipsRedaction): p and each of its fallbacks, or every model of
-// the group (a member's own fallbacks are not the group's, see planGroup).
-// One that may go on to anyone else stays masked for all of them.
+// unredactedRoute keeps the existing local-only exception: a fallback to a
+// remote destination still requires masking for the entire route.
 func unredactedRoute(p provider.Provider, isGroup bool, ms []provider.Member) bool {
 	if isGroup {
 		if len(ms) == 0 {
@@ -129,7 +169,6 @@ func unredactedRoute(p provider.Provider, isGroup bool, ms []provider.Member) bo
 		return false
 	}
 	for _, id := range p.Fallback {
-		// one that resolves to nothing isn't tried (plan)
 		if fp, _, ok := provider.Resolve(id); ok && !fp.SkipsRedaction() {
 			return false
 		}

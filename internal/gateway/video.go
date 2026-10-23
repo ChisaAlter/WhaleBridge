@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/gwmw"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 	"github.com/ChisaAlter/WhaleBridge/internal/usage"
@@ -727,23 +728,11 @@ func (s *Server) videosCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	call.To = provider.Chat
 	var unmask func()
-	prompt := f.Prompt
-	w, f.Prompt, unmask, err = redactedPrompt(w, f.Prompt)
+	w, unmask, err = maskFilming(w, &f)
 	defer unmask()
-	// the fields passed on as they came are masked as the prompt is: a
-	// negative_prompt is the user's text all the same
-	n := 0
-	if err == nil {
-		n, err = maskStrings(f.Extra)
-	}
 	if err != nil { // fails closed
 		fail(http.StatusServiceUnavailable, err.Error())
 		return
-	}
-	if n > 0 && f.Prompt == prompt { // the prompt's mask wraps w already
-		var done func()
-		w, done = restoring(w)
-		defer done()
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), drawTimeout)
 	defer cancel()
@@ -946,7 +935,16 @@ func (s *Server) openAIVideo(ctx context.Context, p provider.Provider, vendorID,
 // videosGet answers how a video is going.
 func (s *Server) videosGet(w http.ResponseWriter, r *http.Request) {
 	// A later poll can echo the prompt masked when the video was created.
-	w, done := restoring(w)
+	m, maskErr := requestMasker()
+	if maskErr != nil {
+		writeError(w, provider.Chat, http.StatusServiceUnavailable, maskErr.Error())
+		return
+	}
+	w, done, maskErr := wrapMasker(w, m)
+	if maskErr != nil {
+		writeError(w, provider.Chat, http.StatusServiceUnavailable, maskErr.Error())
+		return
+	}
 	defer done()
 	id := r.PathValue("id")
 	p, vendorID, started, err := videoMaker(id)
@@ -1111,15 +1109,37 @@ func (s *Server) remoteVideoContent(ctx context.Context, w http.ResponseWriter, 
 	io.Copy(w, io.LimitReader(res.Body, maxVideoBytes))
 }
 
+// maskFilming captures one producer for the prompt, all extra fields and the
+// restoration writer, even if that producer retires while masking the prompt.
+func maskFilming(w http.ResponseWriter, f *filming) (http.ResponseWriter, func(), error) {
+	m, err := requestMasker()
+	if err != nil {
+		return w, func() {}, err
+	}
+	var promptCount int
+	f.Prompt, promptCount, err = maskTextWith(m, f.Prompt)
+	if err != nil {
+		return w, func() {}, err
+	}
+	extraCount, err := maskStrings(m, f.Extra)
+	if err != nil {
+		return w, func() {}, err
+	}
+	if promptCount+extraCount == 0 {
+		return w, func() {}, nil
+	}
+	return wrapMasker(w, m)
+}
+
 // maskStrings masks every string in v (a decoded JSON value) in place as a
 // prompt is masked, and says how many values it swapped; an error when it
 // can't (fail closed).
-func maskStrings(v any) (int, error) {
+func maskStrings(m gwmw.Masker, v any) (int, error) {
 	n := 0
 	one := func(str string) (string, error) {
-		m, c, err := maskedText(str)
+		value, c, err := maskTextWith(m, str)
 		n += c
-		return m, err
+		return value, err
 	}
 	var err error
 	switch x := v.(type) {
@@ -1129,7 +1149,7 @@ func maskStrings(v any) (int, error) {
 				x[k], err = one(str)
 			} else {
 				var c int
-				c, err = maskStrings(e)
+				c, err = maskStrings(m, e)
 				n += c
 			}
 			if err != nil {
@@ -1142,7 +1162,7 @@ func maskStrings(v any) (int, error) {
 				x[i], err = one(str)
 			} else {
 				var c int
-				c, err = maskStrings(e)
+				c, err = maskStrings(m, e)
 				n += c
 			}
 			if err != nil {

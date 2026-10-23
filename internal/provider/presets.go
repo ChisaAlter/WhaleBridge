@@ -432,6 +432,13 @@ var presets = []PresetDef{
 		Note:    "Nous Research · Hermes and other models",
 		Website: "https://portal.nousresearch.com", KeysURL: "https://portal.nousresearch.com"},
 
+	// Nous Portal hosts multiple makers on Chat. Its Messages endpoint
+	// serves only a subset, so all models use the shared Chat translation.
+	{ID: "nous", Name: "Nous Portal", Icon: "nousresearch", Kind: KindVendor, Hosts: true,
+		Chat:    "https://inference-api.nousresearch.com/v1",
+		Note:    "Nous Research · Hermes and other models",
+		Website: "https://portal.nousresearch.com", KeysURL: "https://portal.nousresearch.com"},
+
 	{ID: "openrouter", Name: "OpenRouter", Icon: "openrouter", Kind: KindRelay, Catalog: "openrouter",
 		Chat: "https://openrouter.ai/api/v1", Anthropic: "https://openrouter.ai/api",
 		// its decision models (liquid/d1, cloudflare/clef, Jev …), listed

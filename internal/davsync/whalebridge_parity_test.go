@@ -132,6 +132,8 @@ func TestSyncOwnsOnlyDSHModelSettings(t *testing.T) {
 	s.OrderedModels = map[string][]string{"dsh": {"local/m"}, "codex": {"private/m"}}
 	s.PickedModels = map[string][]string{"dsh": {}, "codex": {}}
 	s.FastPicks = map[string][]string{"dsh": {"local/m"}, "codex": {"private/m"}}
+	s.UltraPicks = map[string][]string{"dsh": {"local/m"}, "codex": {"private/m"}}
+	s.DesktopSubagentModel, s.DesktopSubagentEffort = "local/model", "high"
 	s.AgentEfforts = map[string]string{"dsh": "low", "codex": "high"}
 	s.OwnModelsHidden = []string{"codex", "dsh"}
 	s.UIFont = json.RawMessage(`{"family":"Local Font"}`)
@@ -145,13 +147,26 @@ func TestSyncOwnsOnlyDSHModelSettings(t *testing.T) {
 	if len(local.Settings.Visible) != 1 || local.Settings.Visible["dsh"][0] != "local" || len(local.Settings.HiddenModels) != 1 || len(local.Settings.OrderedModels) != 1 || len(local.Settings.PickedModels) != 1 || len(local.Settings.FastPicks) != 1 || len(local.Settings.AgentEfforts) != 1 || !slices.Equal(local.Settings.OwnModelsHidden, []string{"dsh"}) || local.Settings.UIFont != nil {
 		t.Fatal("first upload must contain dsh preferences only and no local fonts")
 	}
+	if len(local.Settings.UltraPicks) != 1 || !slices.Equal(local.Settings.UltraPicks["dsh"], []string{"local/m"}) || local.Settings.DesktopSubagentModel != "local/model" || local.Settings.DesktopSubagentEffort != "high" {
+		t.Fatal("first upload must keep only dsh ultrafast picks and retain global routing policies")
+	}
 	remote := backup.Bundle{Settings: &settings.Settings{Currency: "usd", Visible: map[string][]string{"dsh": {"old"}, "codex": {"remote-private"}}, PickedModels: map[string][]string{"codex": {}}, AgentEfforts: map[string]string{"codex": "xhigh"}, OwnModelsHidden: []string{"codex"}, UIFont: json.RawMessage(`{"family":"Remote Font"}`)}}
+	remote.Settings.UltraPicks = map[string][]string{"codex": {"remote/ultra"}}
+	remote.Settings.DesktopSubagentModel, remote.Settings.DesktopSubagentEffort = "remote/model", "low"
 	before := hashes(remote)["settings"]
 	remote.Settings.Visible["codex"] = []string{"remote-private-changed"}
+	remote.Settings.UltraPicks["codex"] = []string{"remote/ultra-changed"}
 	if hashes(remote)["settings"] != before {
 		t.Fatal("external model preferences must not count as component settings conflicts")
 	}
+	remote.Settings.DesktopSubagentEffort = "medium"
+	if hashes(remote)["settings"] == before {
+		t.Fatal("global Desktop subagent routing policy must count as a settings change")
+	}
 	take(&remote, local, "settings")
+	if !slices.Equal(remote.Settings.UltraPicks["codex"], []string{"remote/ultra-changed"}) || !slices.Equal(remote.Settings.UltraPicks["dsh"], []string{"local/m"}) || remote.Settings.DesktopSubagentModel != "local/model" || remote.Settings.DesktopSubagentEffort != "high" {
+		t.Fatal("upload must preserve remote external ultrafast picks and carry global routing policies")
+	}
 	if !slices.Equal(remote.Settings.Visible["codex"], []string{"remote-private-changed"}) || remote.Settings.AgentEfforts["codex"] != "xhigh" || !slices.Equal(remote.Settings.Visible["dsh"], []string{"local"}) || string(remote.Settings.UIFont) != `{"family":"Remote Font"}` {
 		t.Fatalf("upload changed opaque remote preferences: %+v", remote.Settings)
 	}

@@ -208,7 +208,9 @@ func (a *autoResets) use(user string, look func(now time.Time) (week *time.Time,
 	asked := time.Now()
 	a.Lock() // one look at a time: those waiting take what it did
 	defer a.Unlock()
-	a.load()
+	if err := a.load(); err != nil {
+		return ResetOutcome{}, err
+	}
 	now := time.Now()
 	if s, ok := a.spent[autoResetAny]; ok && now.Before(s.Until) {
 		return ResetOutcome{}, nil
@@ -255,43 +257,40 @@ func weekUsedUp(windows []QuotaWindow, now time.Time) *time.Time {
 	return nil
 }
 
-// load reads what was spent, once; a.Lock is held. A file that can't be
-// read or doesn't parse is unknown, never none: read as none, the week's
-// auto-use would spend a second reset (#2017). What was spent is then
-// taken from codex-resets-used.json, which keeps every reset used for a
-// week used up, and when that can't be read either no account spends one
-// by itself for a week, the longest a spend the file held could still
-// count. A file that doesn't parse is copied aside, as noteResetUsed keeps
-// codex-resets-used.json's, and only then written over.
-func (a *autoResets) load() {
+// load reads what was spent, once; a.Lock is held. An unreadable ledger
+// is unknown, never none: rebuild it from the history of resets spent for
+// a used-up week. If that history is unknown too, hold every account for
+// a week, the longest a lost spend could still count. Keep corrupt bytes
+// aside before writing the rebuilt ledger over them. If it cannot be
+// read or kept aside, stop before spending or writing anything over it.
+func (a *autoResets) load() error {
 	if a.path == a.where() {
-		return
+		return nil
 	}
 	a.path = a.where()
 	a.spent, a.next = map[string]autoResetSpent{}, map[string]time.Time{}
 	b, err := os.ReadFile(a.path)
 	if errors.Is(err, fs.ErrNotExist) {
-		return
+		return nil
 	}
-	kept := false
-	if err == nil {
-		if err = json.Unmarshal(b, &a.spent); err == nil {
-			if a.spent == nil {
-				a.spent = map[string]autoResetSpent{}
-			}
-			return
+	if err != nil {
+		a.path = "" // try again after the file can be read
+		return err
+	}
+	if err = json.Unmarshal(b, &a.spent); err == nil {
+		if a.spent == nil {
+			a.spent = map[string]autoResetSpent{}
 		}
-		aside := a.path + ".bad-" + time.Now().UTC().Format("20060102T150405.000000000")
-		if werr := os.WriteFile(aside, b, 0o600); werr != nil {
-			err = fmt.Errorf("%w; keeping it aside: %v", err, werr)
-		} else {
-			kept = true
-			err = fmt.Errorf("%w; kept aside as %s", err, aside)
-		}
+		return nil
 	}
-	if a.spent == nil {
-		a.spent = map[string]autoResetSpent{}
+	aside := a.path + ".bad-" + time.Now().UTC().Format("20060102T150405.000000000")
+	if werr := os.WriteFile(aside, b, 0o600); werr != nil {
+		a.path = "" // never overwrite bytes that have not been kept
+		return fmt.Errorf("%w; keeping it aside: %v", err, werr)
 	}
+	err = fmt.Errorf("%w; kept aside as %s", err, aside)
+	// A type error can leave entries behind. Rebuild only from known history.
+	a.spent = map[string]autoResetSpent{}
 	now := time.Now()
 	uses, uerr := readResetsUsed()
 	if uerr != nil {
@@ -307,9 +306,8 @@ func (a *autoResets) load() {
 		}
 		log.Printf("%s: %v; what was spent is taken from %s", a.path, err, resetsUsedPath())
 	}
-	if kept {
-		a.save()
-	}
+	a.save()
+	return nil
 }
 
 // autoResetAny stands for every account in spent, when what was spent

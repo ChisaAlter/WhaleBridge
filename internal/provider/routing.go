@@ -28,16 +28,16 @@ const (
 	// Weighted spreads a provider's requests over its keys by each key's
 	// weight (KeyAccount.Weight, #841), smoothly: 3 and 1 go a, a, b, a…
 	Weighted = "weight"
+	// FreeFirst tries models the vendor serves at no cost before paid
+	// models, preserving their order within each set.
+	FreeFirst = "free"
 )
 
-// pluginRouting is a routing a plugin serves: "<plugin>/<name>".
-var pluginRouting = regexp.MustCompile(`^[A-Za-z0-9._-]+/[A-Za-z0-9][A-Za-z0-9._-]*$`)
+var pluginRouting = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$`)
 
-// PluginRouting says whether routing is one a plugin serves,
-// "<plugin>/<name>" (a JS gateway plugin's strategies). providers.json
-// keeps one as saved, served now or not: one no plugin serves is tried in
-// its listed order.
-func PluginRouting(routing string) bool { return pluginRouting.MatchString(routing) }
+// PluginRouting recognizes the durable name of a JS gateway strategy. A
+// temporarily disabled strategy keeps its saved choice until enabled again.
+func PluginRouting(name string) bool { return pluginRouting.MatchString(name) }
 
 // SetRouting changes how a provider's requests spread over its keys or
 // accounts.

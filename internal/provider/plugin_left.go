@@ -84,8 +84,7 @@ func setAside(pkg string, ids []string) error {
 	moved := false
 	for _, p := range f.Providers {
 		if slices.Contains(ids, p.ID) && OnlyPicks(p) {
-			// one set aside before under the same id gives way to this
-			f.PluginLeft = slices.DeleteFunc(f.PluginLeft, func(l LeftRecord) bool { return l.Provider.ID == p.ID })
+			f.PluginLeft = slices.DeleteFunc(slices.Clone(f.PluginLeft), func(l LeftRecord) bool { return l.Provider.ID == p.ID })
 			f.PluginLeft = append(f.PluginLeft, LeftRecord{Package: pkg, Provider: p})
 			moved = true
 			continue
@@ -108,14 +107,11 @@ func takeBackLeft(spec string) error {
 	if err != nil {
 		return err
 	}
-	if !slices.ContainsFunc(f.PluginLeft, func(l LeftRecord) bool { return l.Package == pkg }) {
-		return nil
-	}
-	left := f.PluginLeft[:0]
+	left := make([]LeftRecord, 0, len(f.PluginLeft))
 	changed := false
 	for _, l := range f.PluginLeft {
 		if l.Package == pkg && !slices.ContainsFunc(f.Providers, func(p Provider) bool { return p.ID == l.Provider.ID }) {
-			f.Providers = append(f.Providers, l.Provider)
+			f.Providers = append(slices.Clone(f.Providers), l.Provider)
 			changed = true
 			continue
 		}
@@ -128,10 +124,22 @@ func takeBackLeft(spec string) error {
 	return store(f)
 }
 
-// AddPlugin installs the plugin spec, as plugin.Add does, and puts back
-// what was set aside of it when it was last removed.
+// AddPlugin installs the adapter and restores model picks from its last
+// removal. Credential ownership is handled separately by HandOver.
 func AddPlugin(ctx context.Context, spec string) (plugin.Entry, error) {
 	e, err := addPlugin(ctx, spec)
+	return finishAddPlugin(e, err)
+}
+
+// AddPluginWithProgress retains the component's download progress callback.
+func AddPluginWithProgress(ctx context.Context, spec string, downloaded func()) (plugin.Entry, error) {
+	e, err := addPluginWithProgress(ctx, spec, downloaded)
+	return finishAddPlugin(e, err)
+}
+
+var addPluginWithProgress = plugin.AddWithProgress
+
+func finishAddPlugin(e plugin.Entry, err error) (plugin.Entry, error) {
 	if err != nil {
 		return e, err
 	}

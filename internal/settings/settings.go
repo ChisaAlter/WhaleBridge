@@ -951,7 +951,7 @@ func (s *Settings) KeepOwn(cur Settings) {
 	s.QuotaReads = cur.QuotaReads
 	s.NoAccountDiscovery = cur.NoAccountDiscovery
 	s.LAN, s.AllowIPs = cur.LAN, cur.AllowIPs
-	s.FetchPrivate = cur.FetchPrivate
+	s.FetchPrivate = slices.Clone(cur.FetchPrivate)
 	s.SessionTerminal = cur.SessionTerminal
 }
 

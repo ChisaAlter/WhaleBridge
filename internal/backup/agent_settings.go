@@ -34,6 +34,7 @@ func KeepOtherAgentSettings(in *settings.Settings, current settings.Settings) {
 	in.OrderedModels = lists(in.OrderedModels, current.OrderedModels)
 	in.PickedModels = lists(in.PickedModels, current.PickedModels)
 	in.FastPicks = lists(in.FastPicks, current.FastPicks)
+	in.UltraPicks = lists(in.UltraPicks, current.UltraPicks)
 	hidden := slices.DeleteFunc(slices.Clone(current.OwnModelsHidden), func(id string) bool { return strings.EqualFold(id, "dsh") })
 	for _, id := range in.OwnModelsHidden {
 		if strings.EqualFold(id, "dsh") {

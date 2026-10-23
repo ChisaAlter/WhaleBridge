@@ -228,13 +228,18 @@ func Append(r Record) {
 	if r.Time.IsZero() {
 		r.Time = Clock()
 	}
-	observeLedger(r)
 	b, err := json.Marshal(r)
 	if err != nil {
 		return
 	}
 	mu.Lock()
-	defer mu.Unlock()
+	wrote := false
+	defer func() {
+		mu.Unlock()
+		if wrote {
+			observeLedger(r)
+		}
+	}()
 	if err := os.MkdirAll(filepath.Dir(Path()), 0o755); err != nil {
 		return
 	}
@@ -245,6 +250,7 @@ func Append(r Record) {
 	defer f.Close()
 	before, _ := statLogHandle(f)
 	if _, err := f.Write(append(b, '\n')); err == nil {
+		wrote = true
 		after, _ := statLogHandle(f)
 		noteLogAppend(Path(), before, after)
 	}

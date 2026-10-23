@@ -32,9 +32,8 @@ func init() {
 }
 
 func TestMain(m *testing.M) {
-	serveRotation()
 	groupsServed = provider.ServeGroups()
-	serveMiddleware()
+	chained = gwmw.Use(middleware.Chain{})
 	searchOn = gwtool.Serve(gwtool.WebSearch)
 	limitsOn = gwbudget.Limit(budget.Limiter{})
 	code, err := isolatedTests(m)
@@ -48,7 +47,27 @@ func TestMain(m *testing.M) {
 // Isolate every process, including the cold-start redaction tests. HOME
 // alone does not isolate the macOS Keychain, and account caches eventually
 // expire: discovery must keep finding only the test's sign-ins and CLIs.
+var builtinMaskerRemove func()
+var routeBuiltinStop func()
+
+func withoutBuiltinRoutes(t *testing.T) {
+	t.Helper()
+	routeBuiltinStop()
+	t.Cleanup(serveRotation)
+}
+
+func withoutBuiltinMasker(t *testing.T) {
+	t.Helper()
+	builtinMaskerRemove()
+	t.Cleanup(func() { masked = gwmw.Mask(masking.Masker{}); builtinMaskerRemove = masked })
+}
+
 func isolatedTests(m *testing.M) (int, error) {
+	serveRotation()
+	defer func() { routeBuiltinStop() }()
+	masked = gwmw.Mask(masking.Masker{})
+	builtinMaskerRemove = masked
+	defer func() { builtinMaskerRemove() }()
 	home, err := os.MkdirTemp("", "magpie-gateway-test-")
 	if err != nil {
 		return 1, err
@@ -152,7 +171,7 @@ func serveMiddleware() {
 // withoutMasker takes the masker away for t, as plugins/redact off does.
 func withoutMasker(t *testing.T) {
 	masked()
-	t.Cleanup(func() { masked = gwmw.Mask(masking.Masker{}) })
+	t.Cleanup(func() { masked = gwmw.Mask(masking.Masker{}); builtinMaskerRemove = masked })
 }
 
 // withoutMiddleware takes the JS middleware chain away for t, as
@@ -163,9 +182,8 @@ func withoutMiddleware(t *testing.T) {
 }
 
 func serveRotation() {
-	for name, s := range routes.Builtin {
-		rotation = append(rotation, routes.Register(name, s))
-	}
+	rotation = []func(){routes.RegisterBuiltins()}
+	routeBuiltinStop = rotation[0]
 }
 
 // withoutRotation takes them away for t, as plugins/rotation off does.

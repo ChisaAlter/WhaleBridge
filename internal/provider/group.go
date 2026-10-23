@@ -403,7 +403,8 @@ func withoutRemoved(g Group, have map[string]bool) Group {
 			return false
 		}
 		pid, _, ok := strings.Cut(m, "/")
-		if !ok || have[pid] || (g.Routing == Manual && m == g.Picked()) {
+		canonical := heldOf("legacy-plugin-aliases", LegacyPluginAliases)[pid]
+		if !ok || have[pid] || canonical != "" && have[canonical] || (g.Routing == Manual && m == g.Picked()) {
 			return false
 		}
 		return !slices.ContainsFunc(g.Rules, func(r Rule) bool { return r.Use == m })
@@ -525,7 +526,7 @@ func GroupSlug(name string) string {
 // AutoGroupID of the model the user said it is the same as (settings'
 // ModelSameAs), else of its own id.
 func AutoGroupOf(pid, model string) string {
-	return "auto-" + Slug(mergeKey(pid, model, settings.Load().ModelSameAs))
+	return "auto-" + Slug(mergeKey(pid, model, heldSettings().ModelSameAs))
 }
 
 // MergeName is the name the groups magpie finds merge a model by, when
@@ -852,11 +853,11 @@ func groupEntries(entries []Entry) []Entry {
 			var efforts []string
 			images, thinks, ctx, output := false, false, 0, 0
 			var imageInput *bool
-			unknown, reasonless := false, false
+			unknown, reasonless, outputSet := false, false, false
 			for _, x := range entries {
 				if x.Provider.ID == m.Provider.ID && x.Model == m.Model {
 					efforts, images, thinks, ctx, output, imageInput = x.Efforts, x.Images, x.Reasoning, x.Context, x.Output, x.ImageInput
-					unknown, reasonless = levelsUnknown(x), x.Reasonless
+					unknown, reasonless, outputSet = levelsUnknown(x), x.Reasonless, x.OutputSet
 				}
 			}
 			// it reasons when a member does: the gateway sends the
@@ -874,7 +875,9 @@ func groupEntries(entries []Entry) []Entry {
 			// maxTokens was its smallest member's, and agents' replies were
 			// "truncated before completion")
 			if output > e.Output {
-				e.Output = output
+				e.Output, e.OutputSet = output, outputSet
+			} else if output == e.Output && outputSet {
+				e.OutputSet = true // an explicit limit also wins a tied maximum
 			}
 			// it takes images when a member does: the gateway sends a
 			// request with an image to the members that see it, and the
@@ -1111,7 +1114,7 @@ func SaveGroup(g Group) error {
 	if err := cleanDecisionGroup(&g, groupsIn(entries)); err != nil {
 		return err
 	}
-	if g.Routing != Ordered && g.Routing != Rotate && g.Routing != LeastUsed && g.Routing != Pace && g.Routing != Weighted && g.Routing != Manual && !PluginRouting(g.Routing) {
+	if g.Routing != Ordered && g.Routing != Rotate && g.Routing != LeastUsed && g.Routing != Pace && g.Routing != Weighted && g.Routing != FreeFirst && g.Routing != Manual && !PluginRouting(g.Routing) {
 		g.Routing = ""
 	}
 	if !slices.Contains(Affinities, g.Affinity) {

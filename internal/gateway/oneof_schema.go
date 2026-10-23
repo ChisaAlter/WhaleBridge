@@ -3,8 +3,8 @@ package gateway
 import (
 	"bytes"
 
-	"github.com/tidwall/gjson"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
+	"github.com/tidwall/gjson"
 )
 
 // toolOneOfAsAnyOf is body with every oneOf in its tools' schemas named

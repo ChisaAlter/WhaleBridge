@@ -259,7 +259,7 @@ func qoderCards(accts []qoderCheckinAcct) []checkinCard {
 func qoderCheckinAccounts() []qoderCheckinAcct {
 	var out []qoderCheckinAcct
 	for _, pp := range heldPlugins() {
-		if _, ok := qoderCampaignURLs[pp.ID]; !ok || movingNow(pp.ID) || pluginChecksIn(pp) {
+		if _, ok := qoderCampaignURLs[pp.ID]; !ok || !PluginServes(pp.ID) || movingNow(pp.ID) || pluginChecksIn(pp) {
 			continue
 		}
 		auths := plugin.Auths(pp.ID)

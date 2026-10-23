@@ -427,6 +427,10 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 		}
 		var unmask func()
 		w, d.Prompt, unmask, err = redactedPrompt(w, d.Prompt)
+		if err != nil {
+			fail(http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		defer unmask()
 		if err != nil {
 			fail(http.StatusServiceUnavailable, err.Error())
@@ -483,10 +487,9 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 		}
 		s.record(call)
 		// asked for the image itself, one the vendor keeps at a URL is
-		// fetched through the vendor's proxy (#1576: the 4K image a relay
-		// drew in 40 s was lost to generate_image's own download), from
-		// public addresses or the vendor's own host only: the URL is in
-		// its answer, which the request can steer (vendorClient). One
+		// fetched through its proxy, allowing its configured endpoint's
+		// own host as well as public addresses (#1576: the 4K image a relay
+		// drew in 40 s was lost to generate_image's own download). One
 		// that can't be fetched is answered by its URL all the same, never
 		// dropped: it is drawn, and paid for.
 		data := make([]map[string]any, 0, len(out.Images))
@@ -1275,9 +1278,9 @@ func readImagesAnswer(p provider.Provider, url string, b []byte, code int) (draw
 }
 
 // fetchPicture downloads an image an edit was given by URL, for an images
-// API that takes only files. The URL is the caller's: it is fetched from
-// public addresses only (publicClient), from wherever the request came,
-// and what comes must be an image.
+// API that takes only files. The URL is the caller's: publicClient permits
+// public addresses and explicit fetchPrivate entries, regardless of caller
+// address or the provider's own host. What comes must be an image.
 func (s *Server) fetchPicture(ctx context.Context, url string) ([]byte, string, error) {
 	b, _, err := FetchImage(ctx, publicClient, url)
 	if err != nil {

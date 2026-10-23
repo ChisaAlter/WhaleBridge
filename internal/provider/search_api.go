@@ -59,6 +59,7 @@ var SearchVendors = []SearchVendor{
 	{ID: "exa", Name: "Exa", Base: "https://api.exa.ai", KeysURL: "https://dashboard.exa.ai/api-keys"},
 	{ID: "firecrawl", Name: "Firecrawl", Base: "https://api.firecrawl.dev", KeysURL: "https://www.firecrawl.dev/app/api-keys"},
 	{ID: "you", Name: "You.com", Base: "https://ydc-index.io", KeysURL: "https://you.com/platform", KeyOptional: true},
+	{ID: "deepseek", Name: "DeepSeek", Base: "https://api.deepseek.com", KeysURL: "https://platform.deepseek.com/api_keys"},
 	{ID: "searxng", Name: "SearXNG", KeyOptional: true},
 }
 
@@ -244,7 +245,7 @@ func SwitchSearchAPI(vendor string, on bool) error {
 	if err != nil {
 		return err
 	}
-	i := slices.IndexFunc(f.Searches, func(x SearchAPI) bool { return x.Vendor == vendor })
+	i := slices.IndexFunc(f.Searches, func(a SearchAPI) bool { return a.Vendor == vendor })
 	if i < 0 {
 		return fmt.Errorf("no %s search API is set up", vendor)
 	}
@@ -266,11 +267,11 @@ func ArrangeSearchAPIs(order []string) error {
 	}
 	out := make([]SearchAPI, 0, len(f.Searches))
 	for _, v := range order {
-		i := slices.IndexFunc(f.Searches, func(x SearchAPI) bool { return x.Vendor == v })
+		i := slices.IndexFunc(f.Searches, func(a SearchAPI) bool { return a.Vendor == v })
 		if i < 0 {
 			return fmt.Errorf("no %s search API is set up", v)
 		}
-		if slices.ContainsFunc(out, func(x SearchAPI) bool { return x.Vendor == v }) {
+		if slices.ContainsFunc(out, func(a SearchAPI) bool { return a.Vendor == v }) {
 			return fmt.Errorf("%s is named twice", v)
 		}
 		out = append(out, f.Searches[i])

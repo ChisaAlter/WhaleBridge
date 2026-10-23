@@ -212,7 +212,7 @@ async function run() {
     } while (Date.now() < deadline);
     const status = await js(`({ editorType: editor?.type, closed: editor?.closed, request: editor?.request,
       loginFlow, open: document.querySelector('#editor').open, fields: document.querySelector('#fields').textContent,
-      error: document.querySelector('#form-error').textContent })`);
+      error: document.querySelector('#message-text').textContent })`);
     throw new Error(`DOM did not settle: ${expression}\n${JSON.stringify({ scenario, status,
       calls: calls.slice(-12), flows: [...flows.entries()] })}`);
   };
@@ -221,7 +221,7 @@ async function run() {
     const button = get('#fields [data-action="install-adapter"]');
     return { selected: get('#f-agent')?.value, methods: [...(get('#f-method')?.options || [])].map(option => option.textContent),
       hasAdapterButton: !!button, adapterDisabled: button?.disabled,
-      error: get('#form-error').hidden ? '' : get('#form-error').textContent };
+      error: get('#message').hidden || get('#message').dataset.error !== 'true' ? '' : get('#message-text').textContent };
   })()`);
   const readSuccess = () => js(`(() => {
     const get = selector => document.querySelector(selector), success = get('.connection-success');
@@ -241,7 +241,7 @@ async function run() {
       whaleRendered: !!whale && whale.complete && whale.naturalWidth > 0 && whale.getBoundingClientRect().width > 0,
       primary: get('#save').textContent, primaryHidden: get('#save').hidden, primaryDisabled: get('#save').disabled,
       completion: get('#cancel-editor').textContent, fieldCount: get('#fields').querySelectorAll('input,select,textarea').length,
-      error: get('#form-error').hidden ? '' : get('#form-error').textContent };
+      error: get('#message').hidden || get('#message').dataset.error !== 'true' ? '' : get('#message-text').textContent };
   })()`);
   const waitForSuccess = async () => {
     await waitFor(`document.querySelector('.connection-success') && !document.querySelector('#refresh').disabled`);
@@ -321,7 +321,7 @@ async function run() {
     await chooseCursor();
     const previousCatalogs = catalogs.length;
     await js(`document.querySelector('#fields [data-action="install-adapter"]').click()`);
-    await waitFor(`!document.querySelector('#form-error').hidden && !document.querySelector('#fields [data-action="install-adapter"]').disabled`);
+    await waitFor(`!(document.querySelector('#message').hidden||document.querySelector('#message').dataset.error!=='true') && !document.querySelector('#fields [data-action="install-adapter"]').disabled`);
     const failed = await read(), failureRefreshes = catalogs.length - previousCatalogs;
     await closeEditor();
 
@@ -342,7 +342,7 @@ async function run() {
     })()`);
     await waitFor(`document.querySelector('input#f-answer') && !document.querySelector('#save').disabled`);
     await js(`document.querySelector('#f-answer').value = 'invalid'; document.querySelector('#save').click()`);
-    await waitFor(`!document.querySelector('#form-error').hidden && !document.querySelector('#save').disabled`);
+    await waitFor(`!(document.querySelector('#message').hidden||document.querySelector('#message').dataset.error!=='true') && !document.querySelector('#save').disabled`);
     const promptValidationError = (await read()).error;
     await js(`document.querySelector('#f-answer').value = 'fixture-tenant'; document.querySelector('#save').click()`);
     await waitFor(`document.querySelector('select#f-answer') && !document.querySelector('#save').disabled`);
@@ -390,7 +390,7 @@ async function run() {
       scenario = next;
       await open(); await chooseSubscription('claude');
       await js(`document.querySelector('#save').click()`);
-      await waitFor(`!document.querySelector('#form-error').hidden`);
+      await waitFor(`!(document.querySelector('#message').hidden||document.querySelector('#message').dataset.error!=='true')`);
       unsuccessful.push({ scenario, ...(await readSuccess()) });
       await closeEditor();
     }
@@ -444,7 +444,7 @@ async function run() {
     for(let read=0;read<2;read++){
       while(!pendingUsage.length){
         if (Date.now() > delayedDeadline) throw new Error('the delayed account and settings allowance reads did not arrive: '+JSON.stringify({pending:pendingUsage.length,
-          calls:calls.filter(c=>c.scenario==='account-parity-delay'), dom:await js(`({type:editor.type, quotaLoaded:editor.quotas!==undefined, closed:editor.closed, error:document.querySelector('#form-error').textContent})`)}));
+          calls:calls.filter(c=>c.scenario==='account-parity-delay'), dom:await js(`({type:editor.type, quotaLoaded:editor.quotas!==undefined, closed:editor.closed, error:document.querySelector('#message-text').textContent})`)}));
         await new Promise(resolve => setTimeout(resolve, 20));
       }
       pendingUsage.shift()();

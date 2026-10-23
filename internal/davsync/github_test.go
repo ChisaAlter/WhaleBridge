@@ -34,6 +34,52 @@ type githubFixture struct {
 	initialBranch string
 	defaultBranch string
 	public        bool
+	heads         map[string]string
+	blobs         map[string][]byte
+	trees         map[string]fixtureTree
+	commits       map[string]fixtureCommit
+	made          int
+	contentsLimit int
+	blobLimit     int
+	biggestBlob   int
+	beforeRef     func()
+	requests      []string
+}
+
+type fixtureTree struct {
+	base    string
+	entries []struct {
+		Path string
+		SHA  *string
+	}
+}
+
+type fixtureCommit struct{ tree, parent string }
+
+func (f *githubFixture) head(branch string) string {
+	if f.heads[branch] == "" {
+		f.advance(branch)
+	}
+	return f.heads[branch]
+}
+
+func (f *githubFixture) advance(branch string) {
+	f.made++
+	sha := fmt.Sprintf("%040x", f.made)
+	f.commits[sha] = fixtureCommit{tree: "tree-" + sha, parent: f.heads[branch]}
+	f.heads[branch] = sha
+}
+
+func (f *githubFixture) branchAt(ref string) (string, bool) {
+	for b, h := range f.heads {
+		if h == ref {
+			return b, true
+		}
+	}
+	if _, ok := f.commits[ref]; ok {
+		return "", false
+	}
+	return ref, true
 }
 
 type githubTransport struct {
@@ -61,7 +107,7 @@ func githubSHA(b []byte) string {
 
 func newGithubFixture(t *testing.T) *githubFixture {
 	t.Helper()
-	f := &githubFixture{objects: map[string][]byte{}, defaultBranch: "main"}
+	f := &githubFixture{objects: map[string][]byte{}, defaultBranch: "main", heads: map[string]string{}, blobs: map[string][]byte{}, trees: map[string]fixtureTree{}, commits: map[string]fixtureCommit{}, blobLimit: 24 << 20}
 	srv := httptest.NewServer(http.HandlerFunc(f.serve))
 	t.Cleanup(srv.Close)
 	target, _ := url.Parse(srv.URL)
@@ -92,6 +138,10 @@ func (f *githubFixture) serve(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, f.redirect, http.StatusFound)
 		return
 	}
+	f.requests = append(f.requests, r.Method+" "+r.URL.Path)
+	if f.git(w, r, send, fail) {
+		return
+	}
 	base := "/repos/alice/private"
 	if r.URL.Path == base {
 		send(200, map[string]any{"default_branch": f.defaultBranch, "private": !f.public})
@@ -110,11 +160,15 @@ func (f *githubFixture) serve(w http.ResponseWriter, r *http.Request) {
 			fail(404, "Not Found")
 			return
 		}
-		send(200, map[string]string{"ref": "refs/heads/" + branch})
+		send(200, map[string]any{"ref": "refs/heads/" + branch, "object": map[string]string{"sha": f.head(branch)}})
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, base+"/git/blobs/") {
 		sha := strings.TrimPrefix(r.URL.Path, base+"/git/blobs/")
+		if b, ok := f.blobs[sha]; ok && r.Header.Get("Accept") == "application/vnd.github.raw+json" {
+			w.Write(b)
+			return
+		}
 		for _, b := range f.objects {
 			if githubSHA(b) == sha && r.Header.Get("Accept") == "application/vnd.github.raw+json" {
 				w.Write(b)
@@ -134,7 +188,11 @@ func (f *githubFixture) serve(w http.ResponseWriter, r *http.Request) {
 			fail(404, "This repository is empty.")
 			return
 		}
-		branch := r.URL.Query().Get("ref")
+		branch, current := f.branchAt(r.URL.Query().Get("ref"))
+		if !current {
+			fail(404, "the fixture keeps no old trees")
+			return
+		}
 		b, ok := f.objects[branch+"|"+path]
 		if ok {
 			c := githubContent{Type: "file", SHA: githubSHA(b), Size: int64(len(b)), Encoding: "base64", Content: base64.StdEncoding.EncodeToString(b)}
@@ -178,6 +236,7 @@ func (f *githubFixture) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == http.MethodDelete {
 		delete(f.objects, key)
+		f.advance(in.Branch)
 		f.writes++
 		send(200, map[string]any{"content": nil})
 		return
@@ -187,7 +246,12 @@ func (f *githubFixture) serve(w http.ResponseWriter, r *http.Request) {
 		fail(422, "Invalid content")
 		return
 	}
+	if f.contentsLimit > 0 && len(b) > f.contentsLimit {
+		fail(422, "Sorry, the file is too large to be processed")
+		return
+	}
 	f.objects[key] = b
+	f.advance(in.Branch)
 	f.writes++
 	if f.empty {
 		f.initialBranch = initialBranch
@@ -198,6 +262,140 @@ func (f *githubFixture) serve(w http.ResponseWriter, r *http.Request) {
 		status = http.StatusCreated
 	}
 	send(status, map[string]any{"content": githubContent{Type: "file", SHA: githubSHA(b), Size: int64(len(b))}})
+}
+
+// git serves immutable blobs and commits, trees based on a parent, and a
+// non-force ref update. beforeRef simulates a concurrent writer atomically.
+func (f *githubFixture) git(w http.ResponseWriter, r *http.Request, send func(int, any), fail func(int, string)) bool {
+	base := "/repos/alice/private/"
+	switch {
+	case r.Method == http.MethodPost && r.URL.Path == base+"git/blobs":
+		var in struct{ Content, Encoding string }
+		if json.NewDecoder(r.Body).Decode(&in) != nil || in.Encoding != "base64" {
+			fail(422, "invalid blob")
+			return true
+		}
+		b, err := base64.StdEncoding.DecodeString(in.Content)
+		if err != nil {
+			fail(422, "invalid blob content")
+			return true
+		}
+		if len(b) > f.biggestBlob {
+			f.biggestBlob = len(b)
+		}
+		if f.blobLimit > 0 && len(b) > f.blobLimit {
+			fail(422, "Sorry, your input was too large to process")
+			return true
+		}
+		sha := githubSHA(b)
+		f.blobs[sha] = b
+		send(201, map[string]string{"sha": sha})
+	case r.Method == http.MethodGet && strings.HasPrefix(r.URL.Path, base+"git/commits/"):
+		sha := strings.TrimPrefix(r.URL.Path, base+"git/commits/")
+		c, ok := f.commits[sha]
+		if !ok {
+			fail(404, "unknown commit")
+			return true
+		}
+		send(200, map[string]any{"tree": map[string]string{"sha": c.tree}})
+	case r.Method == http.MethodPost && r.URL.Path == base+"git/trees":
+		var in struct {
+			Base string `json:"base_tree"`
+			Tree []struct {
+				Path, Mode, Type string
+				SHA              *string
+			} `json:"tree"`
+		}
+		if json.NewDecoder(r.Body).Decode(&in) != nil || in.Base == "" {
+			fail(422, "invalid tree")
+			return true
+		}
+		t := fixtureTree{base: in.Base}
+		for _, e := range in.Tree {
+			if e.Mode != "100644" || e.Type != "blob" {
+				fail(422, "invalid tree entry")
+				return true
+			}
+			if e.SHA != nil {
+				if _, ok := f.blobs[*e.SHA]; !ok {
+					fail(422, "unknown blob")
+					return true
+				}
+			} else {
+				found := false
+				for branch, head := range f.heads {
+					if f.commits[head].tree == in.Base {
+						_, found = f.objects[branch+"|"+e.Path]
+					}
+				}
+				if !found {
+					fail(422, "cannot delete missing path")
+					return true
+				}
+			}
+			t.entries = append(t.entries, struct {
+				Path string
+				SHA  *string
+			}{e.Path, e.SHA})
+		}
+		f.made++
+		sha := fmt.Sprintf("tree-%040x", f.made)
+		f.trees[sha] = t
+		send(201, map[string]string{"sha": sha})
+	case r.Method == http.MethodPost && r.URL.Path == base+"git/commits":
+		var in struct {
+			Message, Tree string
+			Parents       []string
+		}
+		if json.NewDecoder(r.Body).Decode(&in) != nil || len(in.Parents) != 1 {
+			fail(422, "invalid commit")
+			return true
+		}
+		f.made++
+		sha := fmt.Sprintf("%040x", f.made)
+		f.commits[sha] = fixtureCommit{tree: in.Tree, parent: in.Parents[0]}
+		send(201, map[string]string{"sha": sha})
+	case r.Method == http.MethodPatch && strings.HasPrefix(r.URL.Path, base+"git/refs/heads/"):
+		branch := strings.TrimPrefix(r.URL.Path, base+"git/refs/heads/")
+		var in struct {
+			SHA   string
+			Force *bool
+		}
+		if json.NewDecoder(r.Body).Decode(&in) != nil {
+			fail(422, "invalid ref")
+			return true
+		}
+		if f.beforeRef != nil {
+			f.beforeRef()
+		}
+		c, ok := f.commits[in.SHA]
+		if f.heads[branch] == "" || !ok {
+			fail(422, "Reference does not exist")
+			return true
+		}
+		if in.Force == nil || *in.Force || c.parent != f.heads[branch] {
+			fail(422, "Update is not a fast forward")
+			return true
+		}
+		t := f.trees[c.tree]
+		if t.base != f.commits[c.parent].tree {
+			fail(422, "invalid base tree")
+			return true
+		}
+		for _, e := range t.entries {
+			if e.SHA == nil {
+				delete(f.objects, branch+"|"+e.Path)
+			} else {
+				f.objects[branch+"|"+e.Path] = f.blobs[*e.SHA]
+			}
+		}
+		f.heads[branch] = in.SHA
+		f.writes++
+		send(200, map[string]any{"ref": "refs/heads/" + branch, "object": map[string]string{"sha": in.SHA}})
+	default:
+		return false
+	}
+	return true
 }
 
 func githubConfig() Config {

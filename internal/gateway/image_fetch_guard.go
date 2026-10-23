@@ -9,254 +9,208 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"slices"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/netguard"
 	"github.com/ChisaAlter/WhaleBridge/internal/netproxy"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
-// A URL magpie didn't choose itself is downloaded only from public
-// addresses: an image a caller names (an edit's, or one to draw from) for
-// a vendor that takes only the bytes, an image or video a vendor answers
-// with (its URL may come from what the model was steered to say), and a
-// page web_fetch reads. Never from this computer (loopback), the user's
-// own network (RFC 1918, fc00::/7), link-local addresses (169.254/16 with
-// the cloud metadata service, fe80::/10), CGNAT (100.64/10, Tailscale's),
-// or the other special ranges below — through any redirect too. Otherwise
-// whoever can send magpie a request could have it read a service only
-// this computer reaches and get its answer back as the "image".
+// URLs supplied by callers or returned by vendors are fetched from public
+// addresses only. A request received on loopback may have been relayed from
+// elsewhere; its origin grants no access to this computer or its network.
+// settings.json's fetchPrivate can name explicit hosts, host:port pairs,
+// addresses or CIDRs. A vendor's own configured endpoint host:port is also
+// allowed when fetching that vendor's answer, never a caller's input URL.
 //
-// Where the request came from changes nothing: one that reaches magpie
-// on loopback may well be a reverse proxy's or a relay's on the same
-// machine, passing on someone else's. Two exceptions, both named by the
-// user rather than guessed:
-//   - settings.json's fetchPrivate: hosts (name or name:port), addresses
-//     and CIDR ranges the user lets these downloads reach;
-//   - a vendor's answer may name its own host and port (a provider the
-//     user set up on localhost or their network serves its images there).
-//
-// How it holds:
-//   - the host is resolved, and every address it resolves to must be
-//     public; the request is then sent to the address checked (pinned),
-//     with the host kept for the Host header and TLS, so a name that
-//     resolves differently the second time (DNS rebinding) changes
-//     nothing;
-//   - a direct connection is checked again on the address actually
-//     dialled (privateDialer's Control);
-//   - through a proxy (magpie's, the provider's, the system's) the proxy
-//     is dialled, and it is sent the pinned address, never the name, so
-//     it can't resolve it to another (an https:// CONNECT, SOCKS, or a
-//     plain http:// request whose Host is then the address too);
-//   - each redirect goes through the same, at most imageRedirects of them.
-
-// imageRedirects is how many redirects a caller's image URL is followed
-// through.
+// Every DNS answer is checked and the chosen address is pinned through a
+// direct dial, HTTP CONNECT, SOCKS or a plain HTTP proxy. Each redirect is
+// checked again. A named host whose entire answer is a fake-IP pool is an
+// exception: pure TUN dials only the checked fake address, while a proxy on
+// loopback or localhost receives the name. A remote proxy cannot use that
+// exception. What a fake resolver routes the name to is then its decision.
 const imageRedirects = 5
 
-// errPrivateAddress is a URL that leads somewhere other than the public
-// internet.
 var errPrivateAddress = errors.New(`it is at a private address, which magpie doesn't download from: send the image itself (a data: URL or a file) instead, or name the host in settings.json's "fetchPrivate"`)
 
-// fetchAllow is where a download may go beyond public addresses: the
-// user's fetchPrivate, and the hosts a transport was made for.
+// lookupIP resolves a download host; tests replace it with isolated answers.
+var lookupIP = func(ctx context.Context, host string) ([]netip.Addr, error) {
+	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+}
+
+// fetchAllow is the explicit permission for private downloads: names
+// (optionally with a port), addresses and subnets. DNS is still pinned.
 type fetchAllow struct {
-	hosts map[string]bool // "name" (any port) or "name:port", lower case
+	hosts map[string]bool
 	nets  []netip.Prefix
 }
 
-// allowFor reads fetchPrivate, and adds also. A settings.json that can't
-// be read is unknown, so it allows nothing of its own.
 func allowFor(also []string) fetchAllow {
 	a := fetchAllow{hosts: map[string]bool{}}
-	var list []string
-	if st, err := settings.LoadChecked(); err == nil {
-		list = st.FetchPrivate
-	}
-	for _, e := range append(list, also...) {
-		e = strings.ToLower(strings.TrimSpace(e))
-		if e == "" {
-			continue
+	add := func(entry string) {
+		s := strings.TrimSpace(entry)
+		if s == "" {
+			return
 		}
-		if p, err := netip.ParsePrefix(e); err == nil {
+		if p, err := netip.ParsePrefix(s); err == nil {
 			a.nets = append(a.nets, p.Masked())
-		} else if ip, err := netip.ParseAddr(strings.Trim(e, "[]")); err == nil {
-			a.nets = append(a.nets, netip.PrefixFrom(ip.Unmap(), ip.Unmap().BitLen()))
+		} else if ip, err := netip.ParseAddr(strings.Trim(s, "[]")); err == nil {
+			ip = ip.WithZone("").Unmap()
+			a.nets = append(a.nets, netip.PrefixFrom(ip, ip.BitLen()))
+		} else if host, port, err := net.SplitHostPort(s); err == nil && host != "" && port != "" {
+			a.hosts[net.JoinHostPort(fetchHost(host), port)] = true
 		} else {
-			a.hosts[e] = true
+			a.hosts[fetchHost(s)] = true
 		}
+	}
+	if st, err := settings.LoadChecked(); err == nil {
+		// Keep the settings slice untouched: appending provider endpoints
+		// into spare capacity could give another download that permission.
+		for _, entry := range st.FetchPrivate {
+			add(entry)
+		}
+	}
+	for _, entry := range also {
+		add(entry)
 	}
 	return a
 }
 
-// addr says a may be fetched from: public, or in a range the user named.
-func (a fetchAllow) addr(ip netip.Addr) bool {
-	if publicAddr(ip) {
-		return true
+// fetchHost canonicalizes names without changing an IPv6 interface zone.
+func fetchHost(host string) string {
+	if ip, err := netip.ParseAddr(strings.Trim(host, "[]")); err == nil {
+		return ip.Unmap().String()
 	}
-	for _, n := range a.nets {
-		if n.Contains(ip.Unmap()) {
+	return strings.TrimSuffix(strings.ToLower(host), ".")
+}
+
+func (a fetchAllow) host(host, port string) bool {
+	host = fetchHost(host)
+	return a.hosts[host] || a.hosts[net.JoinHostPort(host, port)]
+}
+
+func (a fetchAllow) addr(ip netip.Addr) bool {
+	if !ip.IsValid() {
+		return false
+	}
+	// netip.Prefix.Contains rejects zoned addresses. The zone chooses an
+	// interface, not a different network; keep it on the actual pinned dial.
+	ip = ip.WithZone("").Unmap()
+	for _, p := range a.nets {
+		if p.Contains(ip) {
 			return true
 		}
 	}
 	return false
 }
 
-// host says host:port was named itself, so whatever it resolves to may be
-// fetched from.
-func (a fetchAllow) host(host, port string) bool {
-	host = strings.ToLower(strings.Trim(host, "[]"))
-	return a.hosts[host] || a.hosts[net.JoinHostPort(host, port)]
-}
-
-// hostOf is u's host and port as fetchAllow names it, "" for none.
-func hostOf(u string) string {
-	p, err := url.Parse(strings.TrimSpace(u))
-	if err != nil || p.Hostname() == "" {
+func hostOf(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil || u.Hostname() == "" || u.Scheme != "http" && u.Scheme != "https" {
 		return ""
 	}
-	port := p.Port()
-	if port == "" {
-		port = map[string]string{"http": "80", "https": "443"}[p.Scheme]
-	}
-	if port == "" {
-		return ""
-	}
-	return net.JoinHostPort(strings.ToLower(p.Hostname()), port)
+	return net.JoinHostPort(fetchHost(u.Hostname()), fetchPort(u))
 }
 
-// vendorClient downloads what a vendor answered with by URL: from public
-// addresses, and the hosts its own endpoints are at.
+func fetchPort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	if u.Scheme == "https" {
+		return "443"
+	}
+	return "80"
+}
+
+// vendorClient grants only this provider's explicitly configured endpoints,
+// including their effective ports. Its caller keeps p.Via on the context.
 func vendorClient(p provider.Provider) *http.Client {
-	var own []string
-	for _, u := range []string{p.Chat, p.Responses, p.Anthropic, p.Gemini} {
-		if h := hostOf(u); h != "" {
-			own = append(own, h)
+	var hosts []string
+	for _, raw := range []string{p.Chat, p.Responses, p.Anthropic, p.Gemini} {
+		if h := hostOf(raw); h != "" {
+			hosts = append(hosts, h)
 		}
 	}
-	return guardedClient(own...)
+	return guardedClient(hosts...)
 }
 
-// lookupIP resolves a host for a caller's image; a test swaps it.
-var lookupIP = func(ctx context.Context, host string) ([]netip.Addr, error) {
-	return net.DefaultResolver.LookupNetIP(ctx, "ip", host)
-}
+func publicAddr(a netip.Addr) bool { return netguard.Public(a) }
 
-// specialNets are ranges no caller's image is fetched from beyond those
-// net/netip names (loopback, private, link-local, multicast, unspecified).
-var specialNets = func() []netip.Prefix {
-	var out []netip.Prefix
-	for _, s := range []string{
-		"0.0.0.0/8",       // "this" network
-		"100.64.0.0/10",   // CGNAT, Tailscale
-		"192.0.0.0/24",    // IETF protocol assignments
-		"192.0.2.0/24",    // documentation
-		"198.18.0.0/15",   // benchmarking
-		"198.51.100.0/24", // documentation
-		"203.0.113.0/24",  // documentation
-		"240.0.0.0/4",     // reserved, broadcast
-		"::/96",           // IPv4-compatible (deprecated)
-		"100::/64",        // discard
-		"2001::/32",       // Teredo
-		"2001:db8::/32",   // documentation
-		"fec0::/10",       // site-local (deprecated)
-		"64:ff9b:1::/48",  // local-use NAT64
-	} {
-		out = append(out, netip.MustParsePrefix(s))
-	}
-	return out
-}()
-
-// publicAddr says a may be fetched a caller's image from.
-func publicAddr(a netip.Addr) bool {
-	a = a.Unmap() // ::ffff:127.0.0.1 is 127.0.0.1
-	if !a.IsValid() || a.IsLoopback() || a.IsPrivate() || a.IsUnspecified() ||
-		a.IsLinkLocalUnicast() || a.IsLinkLocalMulticast() || a.IsInterfaceLocalMulticast() || a.IsMulticast() {
-		return false
-	}
-	for _, n := range specialNets {
-		if n.Contains(a) {
-			return false
+var privateDialer = &net.Dialer{
+	Timeout:   30 * time.Second,
+	KeepAlive: 30 * time.Second,
+	Control: func(_, address string, _ syscall.RawConn) error {
+		ap, err := netip.ParseAddrPort(address)
+		if err != nil || !publicAddr(ap.Addr()) {
+			return fmt.Errorf("%s: %w", address, errPrivateAddress)
 		}
-	}
-	if a.Is6() {
-		b := a.As16()
-		// an IPv4 address inside an IPv6 one: NAT64 (64:ff9b::/96) and
-		// 6to4 (2002::/16) reach it
-		if netip.MustParsePrefix("64:ff9b::/96").Contains(a) {
-			return publicAddr(netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}))
-		}
-		if b[0] == 0x20 && b[1] == 0x02 {
-			return publicAddr(netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]}))
-		}
-	}
-	return true
+		return nil
+	},
 }
 
-// guardDialer dials only addresses ok allows, checked on the address the
-// socket is about to connect to.
-func guardDialer(ok func(netip.Addr) bool) *net.Dialer {
-	return &net.Dialer{
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-		Control: func(_, address string, _ syscall.RawConn) error {
-			ap, err := netip.ParseAddrPort(address)
-			if err != nil || !ok(ap.Addr()) {
-				return errPrivateAddress
-			}
-			return nil
-		},
-	}
-}
-
-// privateDialer dials only public addresses.
-var privateDialer = guardDialer(publicAddr)
-
-// publicTransport sends a request to a public address only (see above), or
-// one fetchPrivate or also names.
 type publicTransport struct{ also []string }
 
+// dialPinned allows a test to stand a local server in for a public/TUN dial.
+var dialPinned = func(ctx context.Context, d *net.Dialer, network, addr string) (net.Conn, error) {
+	return d.DialContext(ctx, network, addr)
+}
+
+// dialMediaProxy is used only for the configured proxy's socket; the
+// destination has already passed the address checks and is pinned below.
+var dialMediaProxy = (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext
+
 func (pt publicTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
-		return nil, fmt.Errorf("%s isn't an http(s) URL", req.URL.Redacted())
+	if req.URL == nil || req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+		return nil, errors.New("the image URL must be http:// or https://")
 	}
 	host := req.URL.Hostname()
-	if host == "" {
-		return nil, errors.New("the URL names no host")
+	port := fetchPort(req.URL)
+	var addrs []netip.Addr
+	literal := false
+	if a, err := netip.ParseAddr(host); err == nil {
+		literal = true
+		addrs = []netip.Addr{a.Unmap()}
+	} else {
+		var err error
+		addrs, err = lookupIP(req.Context(), host)
+		if err != nil {
+			return nil, err
+		}
+		addrs = dropLoon(addrs)
 	}
-	// the proxy this request would take, as any other of magpie's: chosen
-	// by the name, before it is pinned to an address
-	proxy, err := netproxy.Func(req)
+	if len(addrs) == 0 {
+		return nil, errors.New("the image URL's host has no addresses")
+	}
+	// Even a named permission cannot make an invalid DNS answer dialable.
+	for _, a := range addrs {
+		if !a.IsValid() {
+			return nil, fmt.Errorf("%s: %w", host, errPrivateAddress)
+		}
+	}
+	proxy, err := netproxy.Func(req) // choose the route before replacing the name
 	if err != nil {
 		return nil, err
 	}
-	var addrs []netip.Addr
-	if a, err := netip.ParseAddr(strings.TrimSuffix(strings.TrimPrefix(host, "["), "]")); err == nil {
-		addrs = []netip.Addr{a}
-	} else if addrs, err = lookupIP(req.Context(), host); err != nil {
-		return nil, err
-	}
-	if len(addrs) == 0 {
-		return nil, fmt.Errorf("%s resolves to no address", host)
-	}
-	port := req.URL.Port()
-	if port == "" {
-		port = map[string]string{"http": "80", "https": "443"}[req.URL.Scheme]
+	fake := !literal && fakeAnswer(addrs)
+	byName := fake && proxy != nil && localProxy(proxy)
+	if fake && proxy != nil && !byName {
+		fake = false
 	}
 	allow := allowFor(pt.also)
 	named := allow.host(host, port)
 	for _, a := range addrs {
-		if !named && !allow.addr(a) {
-			return nil, errPrivateAddress
+		if !named && !allow.addr(a) && !publicAddr(a) && !fake {
+			return nil, fmt.Errorf("%s: %w", host, errPrivateAddress)
 		}
 	}
-	var tc *tls.Config
+	pinned := addrs[0].Unmap()
+	tc := &tls.Config{}
 	if upstreamTLS != nil {
 		tc = upstreamTLS.Clone()
-	} else {
-		tc = &tls.Config{}
 	}
 	tc.ServerName = host
 	t := &http.Transport{
@@ -266,44 +220,80 @@ func (pt publicTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		DisableKeepAlives:     true,
 		TLSHandshakeTimeout:   30 * time.Second,
 		ResponseHeaderTimeout: 2 * time.Minute,
+		DialContext:           dialMediaProxy,
 	}
 	if proxy == nil {
-		pinned := addrs[0].Unmap()
-		t.DialContext = guardDialer(func(a netip.Addr) bool {
-			return allow.addr(a) || named && a.Unmap() == pinned
-		}).DialContext
+		d := privateDialer
+		if named || len(allow.nets) > 0 || fake {
+			copy := *privateDialer
+			copy.Control = func(_, address string, _ syscall.RawConn) error {
+				ap, err := netip.ParseAddrPort(address)
+				if err != nil || !ap.Addr().IsValid() {
+					return fmt.Errorf("%s: %w", address, errPrivateAddress)
+				}
+				a := ap.Addr().Unmap()
+				if (named || fake) && a == pinned || allow.addr(a) || publicAddr(a) {
+					return nil
+				}
+				return fmt.Errorf("%s: %w", address, errPrivateAddress)
+			}
+			d = &copy
+		}
+		t.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return dialPinned(ctx, d, network, addr)
+		}
 	}
 	out := req.Clone(req.Context())
-	out.URL.Host = net.JoinHostPort(addrs[0].Unmap().String(), port)
-	out.Host = req.Host
+	u := *req.URL
+	if byName {
+		u.Host = net.JoinHostPort(host, port)
+	} else {
+		u.Host = net.JoinHostPort(pinned.String(), port)
+	}
+	out.URL = &u
 	if out.Host == "" {
 		out.Host = req.URL.Host
 	}
-	// a plain http:// URL through an HTTP proxy is sent to it whole, its
-	// host taken from Host: the proxy would resolve the name again, so it
-	// is given the address instead (a site that serves only by name won't
-	// answer it; https://, and any URL through SOCKS, keep the name)
+	// HTTP proxies resolve the absolute URL/Host themselves; use the pinned
+	// IP except for a local fake-IP proxy, which needs the original name.
 	if proxy != nil && req.URL.Scheme == "http" && (proxy.Scheme == "http" || proxy.Scheme == "https") {
 		out.Host = out.URL.Host
 	}
 	return t.RoundTrip(out)
 }
 
-// publicClient downloads a URL magpie didn't choose: from public
-// addresses only (and fetchPrivate's), through at most imageRedirects
-// redirects, each checked the same.
+func dropLoon(addrs []netip.Addr) []netip.Addr {
+	out := make([]netip.Addr, 0, len(addrs))
+	for _, a := range addrs {
+		if !netguard.LoonPaired(a, addrs) {
+			out = append(out, a)
+		}
+	}
+	return out
+}
+
+func fakeAnswer(addrs []netip.Addr) bool {
+	return len(addrs) > 0 && slices.IndexFunc(addrs, func(a netip.Addr) bool { return !netguard.FakeIP(a) }) < 0
+}
+
+func localProxy(u *url.URL) bool {
+	host := strings.TrimSuffix(u.Hostname(), ".")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	a, err := netip.ParseAddr(host)
+	return err == nil && a.Unmap().IsLoopback()
+}
+
 var publicClient = guardedClient()
 
-// PublicClient is publicClient, for a download outside the gateway of a
-// URL magpie didn't choose (generate_image's of a vendor's image).
+// PublicClient is the guarded downloader for URLs not chosen by magpie.
 func PublicClient() *http.Client { return publicClient }
 
-// guardedClient is publicClient that also reaches also's hosts
-// ("name:port").
 func guardedClient(also ...string) *http.Client {
 	return &http.Client{
-		Transport: publicTransport{also: also},
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+		Transport: publicTransport{also: slices.Clone(also)},
+		CheckRedirect: func(_ *http.Request, via []*http.Request) error {
 			if len(via) > imageRedirects {
 				return fmt.Errorf("it redirects more than %d times", imageRedirects)
 			}

@@ -55,11 +55,11 @@ func (s *Server) wbSearch(ctx context.Context, p provider.Provider, query string
 	// its client gives the service 20 s
 	ctx, cancel := context.WithTimeout(s.metered(p.Via(ctx), p, ""), searchTimeout/2)
 	defer cancel()
-	q, err := maskedQuery(query, &p)
-	if err != nil {
-		return "", nil, err
+	masked, maskErr := maskedQueryIn(ctx, query, &p)
+	if maskErr != nil {
+		return "", nil, maskErr
 	}
-	body, _ := json.Marshal(map[string]any{"query": q, "type": "text2text", "max_results": wbSearchResults})
+	body, _ := json.Marshal(map[string]any{"query": masked, "type": "text2text", "max_results": wbSearchResults})
 	r, err := http.NewRequestWithContext(ctx, http.MethodPost, origin+wbSearchPath, bytes.NewReader(body))
 	if err != nil {
 		return "", nil, err

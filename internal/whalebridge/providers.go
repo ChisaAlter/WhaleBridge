@@ -45,6 +45,13 @@ func supplierInfo(p provider.Provider) map[string]any {
 			prefs[m] = v
 		}
 	}
+	for ref, n := range set.ModelReasonless {
+		if m, ok := strings.CutPrefix(ref, p.ID+"/"); ok {
+			v := prefs[m]
+			v.Reasonless = &n
+			prefs[m] = v
+		}
+	}
 	for ref, n := range set.ModelImages {
 		if m, ok := strings.CutPrefix(ref, p.ID+"/"); ok {
 			v := prefs[m]
@@ -90,7 +97,7 @@ func supplierInfo(p provider.Provider) map[string]any {
 	exposed := map[string]bool{}
 	defaultModels := []string{}
 	defaults := p
-	defaults.Models, defaults.PickedFrom, defaults.NoModels = nil, nil, false
+	defaults.Models, defaults.PickedFrom, defaults.Delisted, defaults.NoModels = nil, nil, nil, false
 	for _, m := range defaults.Exposed() {
 		defaultModels = append(defaultModels, m.ID)
 	}
@@ -135,6 +142,7 @@ func supplierInfo(p provider.Provider) map[string]any {
 			row["api"] = api
 		}
 		row["auto"], row["same"], row["merge"] = p.ListedAPIs(m.ID), set.ModelSameAs[p.ID+"/"+m.ID], provider.MergeName(m.ID)
+		row["noAPI"], row["reasonless"], row["serviceTiers"] = p.NoAPIFor(m.ID), provider.Reasonless(p.ID, m.ID), m.Tiers
 		if n, ok := set.ModelNames[p.ID+"/"+m.ID]; ok {
 			row["default"], row["name"] = m.Name, n
 		}
@@ -162,19 +170,19 @@ func supplierInfo(p provider.Provider) map[string]any {
 		"catalog": p.Catalog, "family": p.Family, "website": p.Website, "keysUrl": p.KeysURL,
 		"headerNames": headers, "keySet": p.Key != "", "keyMasked": provider.Mask(p.Key), "keyList": keys,
 		"models": p.Models, "chosen": p.Picks(), "noModels": p.NoModels, "pickedFrom": p.PickedFrom, "marksKinds": p.MarksKinds(), "available": available, "modelCount": len(p.Exposed()),
-		"defaultModels": defaultModels,
-		"modelPrefs":    prefs, "modelPrices": prices, "modelNames": p.ModelNames(), "modelEfforts": p.ModelEfforts(),
+		"defaultModels": defaultModels, "delisted": p.Delisted, "catalogCount": len(p.Available()),
+		"modelPrefs": prefs, "modelPrices": prices, "modelNames": p.ModelNames(), "modelEfforts": p.ModelEfforts(),
 		"contexts": p.Contexts, "outputs": provider.OutputsOf(p.ID), "compacts": provider.CompactsOf(p.ID),
 		"ready": p.Ready(), "off": p.Off, "unlisted": p.Unlisted, "searches": p.Searches, "unredacted": p.Unredacted,
 		"routing": p.Routing, "affinity": p.Affinity, "sink": p.Sink, "proxy": p.Proxy, "fallback": p.Fallback,
 		"maxConcurrency": p.MaxConcurrency, "pluginConcurrency": p.PluginConcurrency(), "accountConcurrency": p.AccountConcurrency,
 		"queueLimit": p.QueueLimit, "queueWait": p.QueueWait, "priceRate": p.PriceRate, "maxRPM": p.MaxRPM, "quotaRest": p.QuotaRest,
 		"extraBody": p.ExtraBody, "ownClient": p.OwnClient(), "passUserAgent": p.PassUserAgent, "authHeader": p.AuthHeader, "codexAsSent": p.CodexAsSent,
-		"cline": p.ClinePinnable(), "pinUpstream": p.PinUpstream, "balanceURL": p.BalanceURL, "balancePath": p.BalancePath,
+		"cline": p.ClinePinnable(), "pinUpstream": p.PinUpstream, "balanceURL": p.BalanceURL, "balancePath": p.BalancePath, "balanceMethod": p.BalanceMethod,
 		"modelsURL": p.ModelsURL, "balanceTokenSet": p.BalanceToken != "", "balanceTokenTakes": provider.TakesBalanceToken(p),
 		"account": p.Account != nil, "accountProxies": p.AccountProxies, "accountModels": p.AccountModels, "accountCaps": p.AccountCaps, "accountWindowCaps": p.AccountWindowCaps, "accountNames": p.AccountNames,
 		"modelTest": p.ModelTest(), "decideTest": p.AsksDecideModels(), "listError": p.ListError(),
-		"quotaResetAt": p.QuotaResetAt, "restCap": p.RestCap, "balanceMethod": p.BalanceMethod,
+		"quotaResetAt": p.QuotaResetAt, "restCap": p.RestCap,
 		"insecureTLS": p.InsecureTLS, "takesInsecureTLS": p.TakesInsecureTLS(),
 		"nativeCompaction": p.NativeCompaction, "carriesCompaction": p.CarriesCompaction(),
 		"ownList": p.Account == nil && !p.IsPlugin() && !p.DecideOnly(), "refreshEvery": p.RefreshEvery, "autoInclude": p.AutoInclude,
@@ -184,6 +192,10 @@ func supplierInfo(p provider.Provider) map[string]any {
 	}
 	if p.Account != nil {
 		out["accountAgent"], out["accountUser"] = p.Account.Agent, p.Account.User
+		out["plugin"] = p.IsPlugin()
+		out["retired"] = provider.BuiltinRetired(p.ID)
+	} else {
+		out["speaks"] = p.Speaks()
 	}
 	optional := p.Account != nil || p.IsVertex()
 	if pr := provider.Preset(p.Preset); pr != nil {
@@ -240,7 +252,7 @@ func bodyValue[T any](in map[string]json.RawMessage, name string) (T, error) {
 // patchProvider preserves every field omitted by the editor. The initial
 // DTO carries only header names; a null header value removes that header.
 func patchProvider(p provider.Provider, in map[string]json.RawMessage) (provider.Provider, error) {
-	allowed := strings.Fields("id name icon iconUrl preset keyName keyProtocol keyWeight keys chat responses anthropic gemini vertex decide baseAPI catalog website keysUrl family models noModels pickedFrom unlisted off contexts fallback routing affinity sink searches pinUpstream unredacted proxy accountProxies accountModels accountCaps accountWindowCaps accountNames accountConcurrency balanceURL balancePath modelsURL zhipuTeam maxConcurrency queueLimit queueWait priceRate maxRPM quotaRest extraBody passUserAgent authHeader codexAsSent quotaResetAt restCap balanceMethod insecureTLS nativeCompaction")
+	allowed := strings.Fields("id name icon iconUrl preset keyName keyProtocol keyWeight keys chat responses anthropic gemini vertex decide baseAPI catalog website keysUrl family models noModels pickedFrom unlisted off contexts fallback routing affinity sink searches pinUpstream unredacted proxy accountProxies accountModels accountCaps accountWindowCaps accountNames accountConcurrency balanceURL balancePath balanceMethod modelsURL zhipuTeam maxConcurrency queueLimit queueWait priceRate maxRPM quotaRest extraBody passUserAgent authHeader codexAsSent quotaResetAt restCap insecureTLS nativeCompaction")
 	patch := map[string]json.RawMessage{}
 	for _, k := range allowed {
 		if v, ok := in[k]; ok {
@@ -250,6 +262,19 @@ func patchProvider(p provider.Provider, in map[string]json.RawMessage) (provider
 	data, _ := json.Marshal(patch)
 	if err := json.Unmarshal(data, &p); err != nil {
 		return p, err
+	}
+	if removed, err := bodyValue[[]string](in, "removeDelisted"); err != nil {
+		return p, err
+	} else if len(removed) > 0 {
+		p.Delisted = slices.DeleteFunc(slices.Clone(p.Delisted), func(id string) bool { return slices.Contains(removed, id) })
+		if len(p.Delisted) == 0 {
+			p.Delisted = []string{} // explicit removal, rather than omitted state
+		}
+	}
+	if clear, err := bodyValue[bool](in, "clearDelisted"); err != nil {
+		return p, err
+	} else if clear {
+		p.Delisted = []string{}
 	}
 	for key, dst := range map[string]*int{"queueLimit": &p.QueueLimit, "queueWait": &p.QueueWait, "maxRPM": &p.MaxRPM, "quotaRest": &p.QuotaRest, "restCap": &p.RestCap} {
 		if string(in[key]) == "null" {
@@ -521,6 +546,34 @@ func saveProviderBody(ctx context.Context, in map[string]json.RawMessage) (strin
 			return "", err
 		}
 	}
+	// Check capacity edits before saving the supplier. Existing limits for a
+	// temporarily absent model may round-trip unchanged; a new typo must not
+	// leave a half-saved supplier name or credential.
+	storedSettings := settings.Load()
+	storedID := p.ID
+	if old != nil {
+		storedID = old.ID
+	}
+	for _, limits := range []struct {
+		name   string
+		values map[string]int
+		kept   map[string]int
+	}{
+		{"an output limit", outs, storedSettings.ModelOutputs},
+		{"a compaction threshold", compacts, storedSettings.ModelCompacts},
+	} {
+		for model, n := range limits.values {
+			if n < 0 {
+				return "", fmt.Errorf("%s is a number of tokens, not %d", limits.name, n)
+			}
+			if err := settings.CheckModelKey(limits.name, priceID+"/"+model); err != nil {
+				return "", err
+			}
+			if n > 0 && model != "*" && limits.kept[storedID+"/"+model] != n && !provider.ServesModel(p, model) {
+				return "", fmt.Errorf("%s has no model %s", priceID, model)
+			}
+		}
+	}
 	if p.IconURL != "" {
 		iconCtx, cancel := context.WithTimeout(ctx, 15*time.Second)
 		icon, err := provider.FetchIcon(iconCtx, p.IconURL)
@@ -723,7 +776,7 @@ func providerRoutes(mux *http.ServeMux, server *gateway.Server) {
 					data, _ := json.Marshal(m)
 					row := map[string]any{}
 					_ = json.Unmarshal(data, &row)
-					row["id"], row["name"] = m.ID, m.Name
+					row["id"], row["name"], row["auto"], row["serviceTiers"] = m.ID, m.Name, m.APIs, m.Tiers
 					rows = append(rows, row)
 				}
 				writeJSON(w, map[string]any{"models": rows})
@@ -901,7 +954,7 @@ func providerRoutes(mux *http.ServeMux, server *gateway.Server) {
 			p, err = draftProvider(in)
 			if err == nil {
 				ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
-				ms, dropped, e := p.Refetch(ctx)
+				_, dropped, taken, e := p.RefetchTaking(ctx)
 				cancel()
 				err = e
 				if e == nil {
@@ -909,7 +962,7 @@ func providerRoutes(mux *http.ServeMux, server *gateway.Server) {
 					if e != nil {
 						err = e
 					} else {
-						out["count"], out["dropped"], out["provider"] = len(ms), dropped, supplierInfo(*saved)
+						out["count"], out["dropped"], out["taken"], out["provider"] = len(saved.Available()), dropped, taken, supplierInfo(*saved)
 					}
 				}
 			}
@@ -1050,8 +1103,8 @@ func providerRoutes(mux *http.ServeMux, server *gateway.Server) {
 				}
 			case "reset":
 				name, api, same, kind := "", "", "", ""
-				levels := []string{}
-				err = provider.SetModelPrefs(id, map[string]provider.ModelPref{model: {Name: &name, Efforts: &levels, OwnImages: true, API: &api, Same: &same, Kind: &kind}})
+				levels, reasonless := []string{}, false
+				err = provider.SetModelPrefs(id, map[string]provider.ModelPref{model: {Name: &name, Efforts: &levels, Reasonless: &reasonless, OwnImages: true, API: &api, Same: &same, Kind: &kind}})
 				if err == nil {
 					err = provider.SetModelPrice(ref, nil)
 				}

@@ -423,7 +423,7 @@ func fetchSubscriptionUsage(ctx context.Context) []SubscriptionQuota {
 	// would be a second card of the same account
 	placed := map[string]bool{}
 	moved := func(id string) bool {
-		if !Moved(id) {
+		if !PluginServes(id) {
 			return false
 		}
 		placed[id] = true

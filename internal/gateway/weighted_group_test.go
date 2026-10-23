@@ -33,9 +33,7 @@ func TestWeightedGroup(t *testing.T) {
 		{ID: "group/wsub", Path: []string{"group/wsub", "wc/m"}, Via: []provider.Group{sub}, Provider: c, Model: "m"},
 		{ID: "group/wsub", Path: []string{"group/wsub", "wd/m"}, Via: []provider.Group{sub}, Provider: d, Model: "m"},
 	}
-	t.Cleanup(func() {
-		routes.Forget(provider.GroupPrefix + g.ID)
-	})
+	t.Cleanup(func() { routes.Forget(provider.GroupPrefix + g.ID) })
 	unitOf := map[string]string{"wa": "a", "wb": "b", "wc": "sub", "wd": "sub"}
 	plan := func() []candidate {
 		t.Helper()

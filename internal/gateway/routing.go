@@ -194,6 +194,8 @@ const (
 	// failFloor: the request asked for a shorter reply than the provider
 	// gives, and is sent again asking for the least it takes
 	failFloor = "floor"
+	// failRoom: the prompt fits when its requested reply is made smaller.
+	failRoom = "room"
 	// failUpdate: the upstream turned away the configuration_update items
 	// a changed effort went as (#617), and the request is sent again
 	// without them
@@ -999,7 +1001,7 @@ func (s *Server) rateRest(c candidate, header http.Header, body []byte, sharedPo
 // unless the vendor said it was out (#530).
 func (c candidate) full(now time.Time) time.Time {
 	a, _ := c.allowance()
-	return a.Full(c.model, provider.SpentShareOf(c.p.Routing), now)
+	return a.Full(c.model, provider.SpentShareOf(routingOf(c.p.Routing)), now)
 }
 
 // allowance is the candidate's allowance as last known: a subscription
@@ -1092,13 +1094,6 @@ func retryAfter(h http.Header, now time.Time) time.Duration {
 
 var allowances = provider.Allowances
 
-// Shares of an allowance past which an account is kept for when the others
-// can't take a request (routes.LowShare, routes.UsedShare).
-const (
-	lowShare  = routes.LowShare
-	usedShare = routes.UsedShare
-)
-
 // route orders one provider's candidates as its routing says.
 func route(p provider.Provider, cs []candidate, model string, from provider.Protocol) []candidate {
 	cs, _ = weigh(p, cs, model, from)
@@ -1110,6 +1105,7 @@ func route(p provider.Provider, cs []candidate, model string, from provider.Prot
 // each served lately. The routing trace shows the same.
 type weighing struct {
 	lefts map[allowanceKey]left // the allowance of each account and model
+	free  map[allowanceKey]bool // Free first only: classification of this exact model
 
 	tokens map[string]float64 // least used: tokens each served lately
 }
@@ -1160,11 +1156,8 @@ func weigh(p provider.Provider, cs []candidate, model string, from provider.Prot
 	return cs, wg
 }
 
-// routingOf is how a pool routed so is routed now. A routing no strategy
-// serves (routes.Find: plugins/rotation off) is its listed order, In
-// order's, and so is what the core does for one besides ordering it: a
-// turn's mark, spreading a group's sessions, sending the rate limited back
-// and a group's heads.
+// routingOf gives the effective policy for planning outside ordering too.
+// An inactive or unknown strategy behaves as listed order everywhere.
 func routingOf(routing string) string {
 	if routing == "" || routing == provider.Manual || routes.Served(routing) {
 		return routing
@@ -1172,15 +1165,22 @@ func routingOf(routing string) string {
 	return provider.Ordered
 }
 
-// goesRound: routed so, a pool goes round by itself (in turn, by weight),
-// so its first is marked as the turn's and the rate limited aren't sent
-// back.
-func goesRound(routing string) bool {
-	r := routingOf(routing)
-	return r == provider.Rotate || r == provider.Weighted
+func rotates(routing string) bool {
+	st, ok := routes.Find(routing)
+	return ok && st.Rotates()
 }
 
-// weighRouted is weigh by the routing alone.
+func weighsByWeight(routing string) bool {
+	st, ok := routes.Find(routing)
+	return ok && st.Weighted()
+}
+
+func goesRound(routing string) bool {
+	st, ok := routes.Find(routing)
+	return ok && (st.Rotates() || st.Weighted())
+}
+
+// weighRouted is weigh by the currently registered strategy alone.
 func weighRouted(p provider.Provider, cs []candidate, model string, from provider.Protocol) ([]candidate, weighing) {
 	var wg weighing
 	if len(cs) == 0 {
@@ -1192,7 +1192,17 @@ func weighRouted(p provider.Provider, cs []candidate, model string, from provide
 	known := map[string]map[string]provider.Allowance{}
 	now := time.Now()
 	wg.lefts = map[allowanceKey]left{}
+	st, served := routes.Find(p.Routing)
+	if served && st.ByFree {
+		wg.free = map[allowanceKey]bool{}
+	}
 	for _, c := range cs {
+		// Reading a model list to classify cost belongs only to Free first.
+		// Keep even a lone candidate's result for its trace, by model as
+		// well as account: one account can serve both free and paid models.
+		if wg.free != nil {
+			wg.free[c.allowanceKey()] = c.p.FreeModel(c.model)
+		}
 		var a provider.Allowance
 		var ok bool
 		if c.p.Account == nil {
@@ -1215,13 +1225,7 @@ func weighRouted(p provider.Provider, cs []candidate, model string, from provide
 				restarts: rs, dueRestart: !rs.IsZero() && due.Equal(rs)} // one not known counts as unused
 		}
 	}
-	if len(cs) < 2 {
-		return cs, wg
-	}
-	// the routing's strategy orders them (internal/routes): Smart, or one
-	// a plugin registered; one not registered leaves them in their order
-	st, ok := routes.Find(p.Routing)
-	if !ok {
+	if len(cs) < 2 || !served {
 		return cs, wg
 	}
 	seats := make([]routes.Seat, len(cs))
@@ -1233,7 +1237,8 @@ func weighRouted(p provider.Provider, cs []candidate, model string, from provide
 			pace = provider.FreshPace
 		}
 		seats[i] = routes.Seat{Key: c.rest, Account: c.p.Account != nil, Known: known, Learns: learns(c, wg.lefts),
-			Used: l.used, Soon: l.soon, Pace: pace, Weight: keyWeight(c), Resting: resting(c), Tokens: routed.used[c.restKey()].now(now)}
+			Used: l.used, Soon: l.soon, Pace: pace, Weight: keyWeight(c), Resting: resting(c),
+			Tokens: routed.used[c.restKey()].now(now), Free: wg.free[c.allowanceKey()]}
 	}
 	routed.Unlock()
 	if st.ByUse {
@@ -1242,10 +1247,12 @@ func weighRouted(p provider.Provider, cs []candidate, model string, from provide
 			wg.tokens[c.rest] = seats[i].Tokens
 		}
 	}
-	order := routes.Apply(st, p.ID, seats)
+	order, receipt := routes.ApplyPick(st, p.ID, seats)
 	out := make([]candidate, 0, len(cs))
 	for _, i := range order {
-		out = append(out, cs[i])
+		c := cs[i]
+		c.roundPick = receipt
+		out = append(out, c)
 	}
 	cs = out
 	if st.Exact {

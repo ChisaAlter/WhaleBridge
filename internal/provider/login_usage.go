@@ -85,7 +85,7 @@ func loginUsageAt(ctx context.Context, agent string) (map[string]SubscriptionQuo
 		return out, asked
 	}
 	out := map[string]SubscriptionQuota{}
-	if agent == "grok" {
+	if agent == "grok" && !PluginServes(agent) {
 		if _, ok := pluginOfAgent(agent); !ok {
 			return grokLoginUsage(ctx), asked
 		}
@@ -254,6 +254,9 @@ func usageLogins(agent string) (logins []Login, ok bool) {
 	if pp, ok := pluginOfAgent(agent); ok {
 		return pluginUsageLogins(pp), true
 	}
+	if PluginServes(agent) {
+		return nil, false
+	}
 	if agent == "grok" {
 		return nil, false
 	}
@@ -263,6 +266,9 @@ func usageLogins(agent string) (logins []Login, ok bool) {
 // builtinLogins are the accounts of a built-in subscription whose
 // allowance can be asked; false for an agent that tells none.
 func builtinLogins(agent string) (logins []Login, ok bool) {
+	if PluginServes(agent) {
+		return nil, false
+	}
 	switch agent {
 	case "claude", "codex":
 		logins = Logins(agent)
@@ -314,6 +320,9 @@ func loginQuota(ctx context.Context, l Login) SubscriptionQuota {
 	ctx = ViaLogin(ctx, loginProvider(l), l.User) // asked through the account's own proxy
 	if strings.HasPrefix(l.Agent, "plugin:") {
 		return pluginLoginQuota(ctx, l)
+	}
+	if PluginServes(l.Agent) {
+		return SubscriptionQuota{Provider: l.Agent, User: l.User, Plan: l.Plan, Windows: []QuotaWindow{}, Error: "this subscription is served by its plugin"}
 	}
 	if l.Agent == "qoder" || l.Agent == QoderCNID {
 		return qoderLoginQuota(ctx, l)

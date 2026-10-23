@@ -9,6 +9,7 @@ type WhaleBridgeSubscription struct {
 	PID      string          `json:"pid,omitempty"`
 	Name     string          `json:"name"`
 	Plugin   bool            `json:"plugin"`
+	Retired  bool            `json:"retired,omitempty"`
 	Checkin  bool            `json:"checkin,omitempty"`
 	Methods  []plugin.Method `json:"methods,omitempty"`
 	Package  string          `json:"package,omitempty"`
@@ -17,14 +18,19 @@ type WhaleBridgeSubscription struct {
 
 func WhaleBridgeSubscriptions() []WhaleBridgeSubscription {
 	out := []WhaleBridgeSubscription{}
+	plugins := plugin.Cached()
+	installed := map[string]bool{}
+	for _, p := range plugins {
+		installed[PluginID(p.ID)] = true
+	}
 	for _, id := range builtinOrder {
-		if Moved(id) {
+		if Moved(id) && !BuiltinRetired(id) || installed[id] {
 			continue
 		}
-		out = append(out, WhaleBridgeSubscription{ID: id, Name: nameOf(id), Package: MovePackage(id), RiskNote: subscriptionRisk(id)})
+		out = append(out, WhaleBridgeSubscription{ID: id, PID: id, Name: nameOf(id), Retired: BuiltinRetired(id), Package: MovePackage(id), RiskNote: subscriptionRisk(id)})
 	}
-	for _, p := range plugin.Cached() {
-		out = append(out, WhaleBridgeSubscription{ID: PluginID(p.ID), PID: p.ID, Name: p.Name, Plugin: true, Methods: p.Methods, Checkin: p.Checkin, RiskNote: subscriptionRisk(p.ID)})
+	for _, p := range plugins {
+		out = append(out, WhaleBridgeSubscription{ID: PluginID(p.ID), PID: p.ID, Name: p.Name, Plugin: true, Retired: BuiltinRetired(p.ID), Package: MovePackage(p.ID), Methods: p.Methods, Checkin: p.Checkin, RiskNote: subscriptionRisk(p.ID)})
 	}
 	return out
 }
@@ -36,13 +42,13 @@ func subscriptionRisk(id string) string {
 	case CommandCodePlanID:
 		return "Go 套餐通过 Command Code 私有接口使用，供应商可能视作违反条款并限制账号。Pro、Max 等套餐使用 Provider API。"
 	case "qoder", QoderCNID:
-		return "Qoder 未提供此用途的公开 API；鲸桥按其桌面客户端方式签名请求，供应商可能将其视为第三方使用并限制账号。"
+		return "Qoder 未提供此用途的公开 API；鲸Bridge按其桌面客户端方式签名请求，供应商可能将其视为第三方使用并限制账号。"
 	case "zed":
-		return "Zed 为其编辑器提供这些模型；鲸桥按编辑器方式签名请求，供应商可能限制第三方使用的账号。"
+		return "Zed 为其编辑器提供这些模型；鲸Bridge按编辑器方式签名请求，供应商可能限制第三方使用的账号。"
 	case "factory":
-		return "Factory 为 Droid CLI 提供这些模型；鲸桥按 Droid 方式签名请求，供应商可能限制第三方使用的账号。"
+		return "Factory 为 Droid CLI 提供这些模型；鲸Bridge按 Droid 方式签名请求，供应商可能限制第三方使用的账号。"
 	case MiMoID:
-		return "这些模型面向小米 MiMo 应用；鲸桥按应用方式发送请求，供应商可能限制第三方使用的账号。"
+		return "这些模型面向小米 MiMo 应用；鲸Bridge按应用方式发送请求，供应商可能限制第三方使用的账号。"
 	case "antigravity":
 		return "Google 可能限制或封禁在 Antigravity 之外使用的 Antigravity 账号，请在授权前了解这一风险。"
 	}

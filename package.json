@@ -6,7 +6,8 @@
   "license": "MIT",
   "scripts": {
     "build": "node scripts/build.mjs",
-    "test:web": "node --test test/web/*.test.js"
+    "test:web": "node --test test/web/*.test.js",
+    "test:ui-native": "node scripts/qa-layout-native.mjs"
   },
   "engines": { "node": ">=24.0.0" },
   "devDependencies": { "electron": "44.2.0" }

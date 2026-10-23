@@ -15,12 +15,12 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pelletier/go-toml/v2"
 	"github.com/ChisaAlter/WhaleBridge/internal/agent"
 	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"github.com/ChisaAlter/WhaleBridge/internal/filememo"
 	"github.com/ChisaAlter/WhaleBridge/internal/proc"
+	"github.com/pelletier/go-toml/v2"
 	"gopkg.in/yaml.v3"
 )
 
@@ -141,7 +141,7 @@ var rtkSpecs = map[string]rtkSpec{
 	},
 	"opencode": {
 		flags: []string{"--opencode"}, patch: true, withClaude: true, blocked: openCodeBlocked,
-		has:    func(a *agent.Agent) bool { return exists(opencodePlugin(a)) },
+		has:    openCodeHas,
 		files:  func(a *agent.Agent) []string { return []string{opencodePlugin(a)} },
 		remove: func(a *agent.Agent) error { return rm(opencodePlugin(a)) },
 		dir:    func(a *agent.Agent) string { return filepath.Dir(a.Path) },
@@ -171,6 +171,26 @@ var rtkSpecs = map[string]rtkSpec{
 				dropBlock(filepath.Join(d, "copilot-instructions.md"), "<!-- rtk-instructions", "<!-- /rtk-instructions -->"))
 		},
 		dir: func(*agent.Agent) string { return filepath.Join(home(), ".copilot") },
+	},
+	// Antigravity CLI (agy): rtk 0.51 on writes a plugin of its own into
+	// Antigravity's global customization folder, ~/.gemini/config, shared
+	// by the CLI and the IDE (src/hooks/init/antigravity.rs): plugin.json,
+	// hooks.json (PreToolUse → rtk hook antigravity) and rules/AGENTS.md,
+	// all in plugins/rtk. agy discovers a plugin there by its plugin.json.
+	// The Antigravity branch reads no patch mode, so --auto-patch isn't
+	// given; rtk's own uninstaller for it ran Claude Code's
+	// (rtk-ai/rtk#3404), so the folder is taken out by magpie.
+	"agy": {
+		flags: []string{"--agent", "antigravity"}, blocked: agyBlocked,
+		has: func(*agent.Agent) bool {
+			return contains(filepath.Join(agyPlugin(), "hooks.json"), "rtk hook antigravity")
+		},
+		files: func(*agent.Agent) []string {
+			d := agyPlugin()
+			return []string{filepath.Join(d, "plugin.json"), filepath.Join(d, "hooks.json"), filepath.Join(d, "rules", "AGENTS.md")}
+		},
+		remove: func(*agent.Agent) error { return os.RemoveAll(agyPlugin()) },
+		dir:    func(*agent.Agent) string { return filepath.Dir(filepath.Dir(agyPlugin())) },
 	},
 	"pi":  extensionSpec("pi"),
 	"omp": extensionSpec("omp"),
@@ -219,20 +239,52 @@ func opencodePlugin(a *agent.Agent) string {
 }
 
 // openCodeBlocked: rtk's OpenCode plugin (hooks/opencode/rtk.ts, which
-// rtk init --opencode writes to plugins/rtk.ts, up to rtk 0.50 and its
-// develop branch) is written for OpenCode 1's plugin API — a named export
-// of a function. OpenCode 2 reads the same plugins folder but takes only a
-// default export of {id, setup|effect}, and turns rtk's away: "Plugin must
-// export a default definition with an id and an effect or setup function"
-// (rtk-ai/rtk#4311, #3898; the fix, #4187, isn't merged). So with an
-// OpenCode 2 here, rtk isn't given to OpenCode: it would only add a plugin
-// that fails to load.
+// rtk init --opencode writes to plugins/rtk.ts) was written for OpenCode
+// 1's plugin API up to rtk 0.51 — a named export of a function. OpenCode 2
+// reads the same plugins folder but takes only a default export of
+// {id, setup|effect}, and turns that one away: "Plugin must export a
+// default definition with an id and an effect or setup function"
+// (rtk-ai/rtk#4311, #3898). rtk 0.52 on (rtk-ai/rtk#4187, in 0.52.0,
+// 1.0.0 and 1.0.1) writes one default object with OpenCode 2's id and
+// setup() beside OpenCode 1's server(). So with an OpenCode 2 here, rtk is
+// given to OpenCode only by an rtk of 0.52 or newer; an older one, or one
+// that doesn't say its version, would only add a plugin that fails to load.
 func openCodeBlocked() string {
 	v := openCodeVersion()
-	if major, _, _ := strings.Cut(v, "."); major != "" && major != "0" && major != "1" {
-		return fmt.Sprintf("RTK doesn't support OpenCode 2 yet: its plugin is written for OpenCode 1, and OpenCode %s refuses to load it (\"Plugin must export a default definition with an id and an effect or setup function\", github.com/rtk-ai/rtk/issues/4311)", v)
+	if !openCode2(v) {
+		return ""
 	}
-	return ""
+	r := rtkVersion()
+	if r != "" && !older(r, 0, 52) {
+		return ""
+	}
+	if r == "" {
+		return fmt.Sprintf("OpenCode %s needs RTK 0.52 or newer, whose plugin OpenCode 2 loads; older ones write a plugin for OpenCode 1, which OpenCode 2 refuses to load (github.com/rtk-ai/rtk/issues/4311). Install or update RTK, then switch it on", v)
+	}
+	return fmt.Sprintf("OpenCode %s needs RTK 0.52 or newer, and this RTK is %s, whose plugin is written for OpenCode 1: OpenCode 2 refuses to load it (github.com/rtk-ai/rtk/issues/4311). Update RTK (brew upgrade rtk, or its installer again), then switch it on", v, r)
+}
+
+// openCode2 says whether OpenCode version v is 2 or later.
+func openCode2(v string) bool {
+	major, _, _ := strings.Cut(v, ".")
+	return major != "" && major != "0" && major != "1"
+}
+
+// openCodeHas says whether OpenCode has rtk's plugin. Under OpenCode 2 a
+// plugin an rtk before 0.52 wrote (no setup(), OpenCode 1's API only) is
+// refused at load. With an rtk here that writes the new one, that old
+// plugin doesn't count: the row is off, and switching it on runs rtk's
+// installer, which writes the new one over it. With an older rtk it still
+// counts, so the row can be switched off to take it out.
+func openCodeHas(a *agent.Agent) bool {
+	p := opencodePlugin(a)
+	if !exists(p) {
+		return false
+	}
+	if contains(p, "setup(") || !openCode2(openCodeVersion()) {
+		return true
+	}
+	return openCodeBlocked() != ""
 }
 
 // codexBlocked: rtk has a hook for Codex from 0.50.0 on (rtk hook codex in
@@ -244,6 +296,20 @@ func codexBlocked() string {
 		return ""
 	}
 	return fmt.Sprintf("Codex's hook needs RTK 0.50 or newer, and this RTK is %s: older ones only add @RTK.md to AGENTS.md, which rewrites no command. Update RTK (brew upgrade rtk, or its installer again), then switch it on", v)
+}
+
+// agyPlugin is the folder rtk's installer writes its Antigravity plugin to.
+func agyPlugin() string { return filepath.Join(home(), ".gemini", "config", "plugins", "rtk") }
+
+// agyBlocked: rtk installs for Antigravity globally from 0.51.0 on; 0.50
+// knows it only per project and fails rtk init -g --agent antigravity
+// ("Antigravity is project-scoped"), so an older rtk isn't run for it.
+func agyBlocked() string {
+	v := rtkVersion()
+	if v == "" || !older(v, 0, 51) {
+		return ""
+	}
+	return fmt.Sprintf("Antigravity CLI's hook needs RTK 0.51 or newer, and this RTK is %s, which installs it only per project, not for every project. Update RTK (brew upgrade rtk, or its installer again), then switch it on", v)
 }
 
 // older says whether version v is before major.minor.
@@ -626,7 +692,11 @@ func rtkAgents(agents []*agent.Agent) []*agent.Agent {
 	}
 	var out []*agent.Agent
 	for _, a := range agents {
-		if _, ok := rtkSpecs[a.ID]; ok {
+		sp, ok := rtkSpecs[a.ID]
+		// an uninstall that left the folder behind (#2254) isn't given rtk,
+		// as the library gives it nothing (Targets); one with rtk's hook
+		// still shows, so the hook can be taken out
+		if ok && (!a.CLIMissing() || sp.has(a)) {
 			out = append(out, a)
 		}
 	}
@@ -653,7 +723,7 @@ func ReadRTK() *RTKView {
 		v.Agents = append(v.Agents, ra)
 	}
 	for _, a := range agents {
-		if why, ok := rtkNoHook[a.ID]; ok {
+		if why, ok := rtkNoHook[a.ID]; ok && !a.CLIMissing() {
 			v.Agents = append(v.Agents, RTKAgent{ID: a.ID, Name: a.Name, Icon: a.Icon, Blocked: why, NoHook: true})
 		}
 	}

@@ -197,6 +197,23 @@ func kimiEfforts(efforts []string, was string) []edit.KV {
 
 func kimi(home string) *Agent { return kimiIn(here(home)) }
 
+// kimiProvider writes magpie's keys into its provider table, each in place
+// when the table is there, so the rest of it stays: custom_headers, env or a
+// default_model the user set on it (Kimi Code's ProviderConfig,
+// packages/agent-core-v2/src/app/kosongConfig/configSection.ts), which a
+// table written afresh dropped on every sync (#2030).
+func kimiProvider(path, table string, kvs ...edit.KV) error {
+	if t, err := edit.GetTOMLTable(path, table); err != nil || t == nil {
+		return edit.SetTOMLTable(path, table, kvs...)
+	}
+	for _, kv := range kvs {
+		if err := edit.SetTOMLKey(path, table, kv.Path, kv.Value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // kimiIn is Kimi Code at a place: this machine's home, or a WSL distro's
 // (see wsl.go), its provider naming the gateway as it reaches it from there.
 func kimiIn(at place) *Agent {
@@ -206,7 +223,7 @@ func kimiIn(at place) *Agent {
 	get := func() string { v, _ := edit.GetTOMLTop(path, "default_model"); return v }
 	providerTable := "providers." + magpieID
 	writeMagpie := func() error {
-		if err := edit.SetTOMLTable(path, providerTable,
+		if err := kimiProvider(path, providerTable,
 			edit.KV{Path: "type", Value: "kimi"},
 			edit.KV{Path: "base_url", Value: at.v1()},
 			edit.KV{Path: "api_key", Value: at.gwKey()},

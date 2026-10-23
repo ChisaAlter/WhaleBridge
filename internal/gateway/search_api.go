@@ -35,9 +35,13 @@ type foundPage struct {
 	Age              string // how old the search said it is, "" when it didn't
 }
 
-// canSearch is whether magpie can answer its web_search tool: a provider
-// searches for it, or a search API does.
+// canSearch is whether magpie can answer its web_search tool: plugins/search
+// is on (searchServed), and a provider searches for it, or a search API
+// does.
 func canSearch() bool {
+	if !searchServed() {
+		return false
+	}
 	if _, _, ok := searcher(); ok {
 		return true
 	}
@@ -313,6 +317,11 @@ func (s *Server) askSearchAPI(ctx context.Context, a provider.SearchAPI, query s
 			if json.Unmarshal(b, &e) == nil && e.Message != "" {
 				msg = e.Message
 			}
+		}
+		// an API that says the key back in its error doesn't get it into
+		// magpie's logs or the model's turn
+		if a.Key != "" {
+			msg = strings.ReplaceAll(msg, a.Key, provider.MaskSearchKey(a.Key))
 		}
 		if keyRefusal(res.StatusCode) {
 			return nil, searchRefused{res.StatusCode, msg, res.Header.Get("Retry-After")}

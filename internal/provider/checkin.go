@@ -27,7 +27,7 @@ type checkinAcct struct {
 	User     string
 	On       bool
 	key      string // its entry in the file; "" for one that can't be told apart
-	provider string // the provider whose background switch applies
+	provider string // the provider its card is under, which the user can switch off
 	do       func(context.Context) WorkBuddyCheckin
 }
 
@@ -78,6 +78,11 @@ func (c checkiner) checkinNow(ctx context.Context, soon bool) []WorkBuddyCheckin
 	off := checkinOff()
 	for _, a := range c.accounts() {
 		if !a.On || a.key == "" || asked[a.key] || off[a.key] || !soon && leftAlone(a.provider) {
+			continue
+		}
+		// nor, by the loop, one whose provider is switched off or removed
+		// (leftAlone); a press still checks it in
+		if !soon && leftAlone(a.provider) {
 			continue
 		}
 		asked[a.key] = true

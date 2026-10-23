@@ -1,6 +1,7 @@
 package proc
 
 import (
+	"errors"
 	"os/exec"
 	"unsafe"
 
@@ -50,6 +51,10 @@ func (g *group) kill(*exec.Cmd) <-chan struct{} {
 }
 
 var closed = func() chan struct{} { c := make(chan struct{}); close(c); return c }()
+
+// term is never sent: Windows has no signal a console-less process can be
+// asked to end by, so Stop kills the job at once.
+func (g *group) term(*exec.Cmd) error { return errors.ErrUnsupported }
 
 func (g *group) sweep(*exec.Cmd) {
 	if g.job != 0 {

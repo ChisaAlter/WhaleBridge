@@ -32,6 +32,8 @@ func TestRestorePreservesOtherAgentPreferencesAndLocalConsent(t *testing.T) {
 	s.OrderedModels = map[string][]string{"claude": {"own/second", "own/first"}}
 	s.PickedModels = map[string][]string{"codex": {}}
 	s.FastPicks = map[string][]string{"claude": {"own/fast"}}
+	s.UltraPicks = map[string][]string{"codex": {"own/ultra"}}
+	s.DesktopSubagentModel, s.DesktopSubagentEffort = "own/model", "low"
 	s.AgentEfforts = map[string]string{"codex": "xhigh"}
 	s.OwnModelsHidden = []string{"codex"}
 	s.NoAccountDiscovery, s.QuotaReads = true, "asked"
@@ -45,6 +47,8 @@ func TestRestorePreservesOtherAgentPreferencesAndLocalConsent(t *testing.T) {
 	}
 	before := settings.Load()
 	in := settings.Settings{Currency: "cny", Visible: map[string][]string{"codex": {"foreign"}, "dsh": {"new-dsh"}}, HiddenModels: map[string][]string{"codex": {"foreign/m"}}, OrderedModels: map[string][]string{"claude": {"foreign/m"}}, PickedModels: map[string][]string{"codex": {"foreign/m"}, "dsh": {}}, FastPicks: map[string][]string{"claude": {"foreign/m"}}, OwnModelsHidden: []string{"claude", "dsh"}, AgentEfforts: map[string]string{"codex": "low", "dsh": "medium"}, UIFont: json.RawMessage(`{"family":"Foreign Font"}`)}
+	in.UltraPicks = map[string][]string{"codex": {"foreign/ultra"}, "dsh": {"new-dsh/model"}}
+	in.DesktopSubagentModel, in.DesktopSubagentEffort = "foreign/model", "high"
 	result, err := Restore(Bundle{Version: BundleVersion, Keys: true, Settings: &in}, Parts{Settings: true})
 	if err != nil || !result.Settings {
 		t.Fatalf("restore: %+v %v", result, err)
@@ -55,6 +59,12 @@ func TestRestorePreservesOtherAgentPreferencesAndLocalConsent(t *testing.T) {
 	}
 	if !reflect.DeepEqual(got.Visible["codex"], before.Visible["codex"]) || !reflect.DeepEqual(got.HiddenModels, before.HiddenModels) || !reflect.DeepEqual(got.OrderedModels, before.OrderedModels) || !reflect.DeepEqual(got.FastPicks, before.FastPicks) || got.AgentEfforts["codex"] != before.AgentEfforts["codex"] || !slices.Equal(got.OwnModelsHidden, []string{"codex", "dsh"}) {
 		t.Fatalf("restored external agent preferences: %+v", got)
+	}
+	if !slices.Equal(got.UltraPicks["codex"], before.UltraPicks["codex"]) || !slices.Equal(got.UltraPicks["dsh"], in.UltraPicks["dsh"]) {
+		t.Fatal("restore changed external ultrafast picks or lost dsh picks")
+	}
+	if got.DesktopSubagentModel != in.DesktopSubagentModel || got.DesktopSubagentEffort != in.DesktopSubagentEffort {
+		t.Fatal("restore lost the global Desktop subagent routing policy")
 	}
 	if picks, exists := got.PickedModels["codex"]; !exists || len(picks) != 0 {
 		t.Fatal("empty external only-picked list lost its meaning")

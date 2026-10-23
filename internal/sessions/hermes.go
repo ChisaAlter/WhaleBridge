@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
+	"github.com/ChisaAlter/WhaleBridge/internal/dirent"
 )
 
 // Hermes stores canonical, non-overlapping input/cache buckets. Reasoning is
@@ -34,7 +35,7 @@ func HermesDirs() []string {
 	}
 	dirs := []string{root}
 	for _, e := range readDirectory(filepath.Join(root, "profiles")) {
-		if !strings.HasPrefix(e.Name(), ".") && (e.IsDir() || e.Type()&os.ModeSymlink != 0) {
+		if !strings.HasPrefix(e.Name(), ".") && dirent.IsFolder(filepath.Join(root, "profiles"), e) {
 			dirs = append(dirs, filepath.Join(root, "profiles", e.Name()))
 		}
 	}

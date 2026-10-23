@@ -43,16 +43,21 @@ type traceHeaderCache struct {
 	ok      bool
 }
 
+// TraceIdentityTTL is how long Visible reuses a discovery scan, a miss
+// included, before scanning the transcripts again. Tests that need a
+// cached miss to stay cached for a whole request lengthen it.
+var TraceIdentityTTL = 2 * time.Second
+
 func (x *TraceSessionIndex) Visible(agent, id string) bool {
 	if agent != "codex" && agent != "pi" {
 		return false
 	}
 	snapshot := x.snapshot.Load()
-	if snapshot == nil || time.Since(snapshot.at) >= 2*time.Second {
+	if snapshot == nil || time.Since(snapshot.at) >= TraceIdentityTTL {
 		if x.refresh.TryLock() {
 			// A refresh may have completed while this caller was acquiring the lock.
 			snapshot = x.snapshot.Load()
-			if snapshot == nil || time.Since(snapshot.at) >= 2*time.Second {
+			if snapshot == nil || time.Since(snapshot.at) >= TraceIdentityTTL {
 				snapshot = x.update(traceRecentFiles(traceLineFiles()))
 			}
 			x.refresh.Unlock()

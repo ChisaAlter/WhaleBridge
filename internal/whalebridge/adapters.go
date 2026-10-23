@@ -2,7 +2,10 @@ package whalebridge
 
 import (
 	"context"
+	"fmt"
+	"maps"
 	"net/http"
+	"slices"
 	"strings"
 	"time"
 
@@ -35,6 +38,57 @@ func setAdapterMirror(on bool) error {
 	if changed {
 		plugin.RefreshMarket()
 	}
+	return nil
+}
+
+// providerOptions are the switches spec's providers declare (auth.options),
+// each with where it stands: the user's value, else the plugin's default.
+func providerOptions(ps []plugin.Provider, spec string) []map[string]any {
+	chosen := settings.Load().PluginOptions
+	out := []map[string]any{}
+	for _, p := range ps {
+		if p.Spec != spec || len(p.Options) == 0 {
+			continue
+		}
+		opts := []map[string]any{}
+		for _, o := range p.Options {
+			opts = append(opts, map[string]any{"key": o.Key, "label": o.Label, "description": o.Description, "confirm": o.Confirm, "on": plugin.OptionOn(chosen, p.ID, o)})
+		}
+		out = append(out, map[string]any{"id": p.ID, "name": p.Name, "options": opts})
+	}
+	return out
+}
+
+// setProviderOption keeps one switch a plugin declares for its provider and
+// hands the switches to the running plugin host at once.
+func setProviderOption(ctx context.Context, providerID, key string, on bool) error {
+	declared := false
+	for _, p := range plugin.Cached() {
+		if p.ID == providerID && slices.ContainsFunc(p.Options, func(o plugin.Option) bool { return o.Key == key }) {
+			declared = true
+		}
+	}
+	if !declared {
+		return fmt.Errorf("插件没有声明这个选项")
+	}
+	s := settings.Load()
+	s.PluginOptions = maps.Clone(s.PluginOptions)
+	if s.PluginOptions == nil {
+		s.PluginOptions = map[string]map[string]bool{}
+	}
+	own := maps.Clone(s.PluginOptions[providerID])
+	if own == nil {
+		own = map[string]bool{}
+	}
+	own[key] = on
+	s.PluginOptions[providerID] = own
+	if err := settings.Save(s); err != nil {
+		return err
+	}
+	// best effort: a host that misses it reads them when it next starts
+	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	_ = plugin.SetProviderOptions(ctx)
 	return nil
 }
 
@@ -91,6 +145,7 @@ func subscriptionAdapters(ctx context.Context) map[string]any {
 		if state, ok := middlewares[e.Spec]; ok {
 			row["middleware"] = state
 		}
+		row["providerOptions"] = providerOptions(ps, e.Spec)
 		conflicts := []map[string]any{}
 		for _, clash := range clashes[e.Spec] {
 			name := providerNames[clash.ID]

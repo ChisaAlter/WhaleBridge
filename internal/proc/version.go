@@ -68,7 +68,9 @@ var runVersion = func(bin string) (string, error) {
 	defer cancel()
 	cmd := ProbeContext(ctx, bin, "--version")
 	cmd.Stdin = nil // /dev/null: one that would ask something gets nothing
-	// Asking Cline's version must not schedule its detached npm updater.
+	// Cline checks for an update on every start, --version too, and at exit
+	// spawns a detached npm install -g cline@latest the user never asked
+	// for (新v学员 on Discord); asking its version mustn't update it.
 	cmd.Env = append(os.Environ(), "NO_COLOR=1", "CLINE_NO_AUTO_UPDATE=1")
 	out, err := cmd.CombinedOutput()
 	if ctx.Err() != nil {
@@ -100,9 +102,11 @@ func npmVersion(real string) string {
 	}
 }
 
-// shimVersion reads the package named by an npm cmd, PowerShell or sh shim.
-// Windows installs these beside node_modules rather than linking into it.
-// Reading the package avoids starting a CLI just to discover its version.
+// shimVersion is the version of the npm package a shim at real starts, ""
+// when real is no shim. npm on Windows puts a cline.cmd (and .ps1, and a sh
+// script) beside node_modules, not a link into it, so npmVersion can't
+// follow it; the shim names %dp0%\node_modules\cline\bin\cline, and that
+// package's package.json says the version without running anything.
 func shimVersion(real string) string {
 	st, err := os.Stat(real)
 	if err != nil || st.IsDir() || st.Size() > 64<<10 {

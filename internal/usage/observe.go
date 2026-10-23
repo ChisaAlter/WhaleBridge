@@ -1,16 +1,64 @@
 package usage
 
 import (
+	"net/http"
 	"slices"
 	"sync"
 )
 
 // Observer receives completed ledger rows without altering accounting. Ledger
-// must return promptly (queue bounded work); it is never a second ledger writer
-// or request/OTel exporter. Existing ExportOTel and SkipOTel keep that contract.
+// must return promptly; request-aware observers may also implement RequestObserver.
 type Observer interface {
 	Serve() (stop func())
 	Ledger(Record)
+}
+
+// RequestObserver watches attempts separately from their eventual ledger row.
+// Legacy metadata observers need only Serve and Ledger.
+type RequestObserver interface {
+	Observer
+	Bodies() Bodies
+	Begin(Request) Watch
+}
+
+type Watch interface {
+	Attempt(Record)
+	End(Record)
+}
+
+type Request struct {
+	Header         http.Header
+	Agent, Session string
+	Kind           string
+	Plain          bool
+}
+
+type Bodies int
+
+const (
+	NoBodies Bodies = iota
+	CapturedBodies
+	WholeBodies
+)
+
+const BodyCut = "\n… (cut here by magpie)"
+
+func RequestObservers() []RequestObserver {
+	var out []RequestObserver
+	for _, observer := range Observers() {
+		if request, ok := observer.(RequestObserver); ok {
+			out = append(out, request)
+		}
+	}
+	return out
+}
+
+func ObservedBodies() Bodies {
+	bodies := NoBodies
+	for _, observer := range RequestObservers() {
+		func() { defer func() { _ = recover() }(); bodies = max(bodies, observer.Bodies()) }()
+	}
+	return bodies
 }
 
 type observing struct {
@@ -112,11 +160,17 @@ func Observers() []Observer {
 }
 
 func observeLedger(r Record) {
-	// Body and trace ownership remain with existing request telemetry. Ledger
-	// plugins get only metadata, and each observer owns its cost pointer copy.
-	r.BodyIn, r.BodyOut, r.OTel = "", "", nil
 	for _, o := range Observers() {
 		copy := r
+		// Request-aware exporters own their opt-in body capture. Metadata-only
+		// plugins never receive prompts, replies or shared mutable cost pointers.
+		allowed := false
+		if request, ok := o.(RequestObserver); ok {
+			func() { defer func() { _ = recover() }(); allowed = request.Bodies() > NoBodies }()
+		}
+		if !allowed {
+			copy.BodyIn, copy.BodyOut = "", ""
+		}
 		if r.OwnCost != nil {
 			cost := *r.OwnCost
 			copy.OwnCost = &cost

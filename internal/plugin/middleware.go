@@ -8,10 +8,11 @@ import (
 	"strings"
 )
 
-// Middleware is the gateway middleware a plugin at target has: the file
-// its package.json's magpie.middleware names, or the file itself for a
-// path to a *.middleware.js (or .mjs). only is whether it is nothing
-// else: no OpenCode plugin for the host to load (no main, no exports).
+// Middleware is the gateway module a plugin at target has: the file its
+// package.json's magpie.middleware (or magpie.gateway, the same) names, or
+// the file itself for a path to a *.middleware.js or *.gateway.js (or
+// .mjs). only is whether it is nothing else: no OpenCode plugin for the
+// host to load (no main, no exports).
 func Middleware(target string) (file string, only bool) {
 	file, only, _ = MiddlewareChecked(target)
 	return

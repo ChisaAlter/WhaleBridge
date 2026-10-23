@@ -96,7 +96,9 @@ func TestWhaleBridgeUpstreamCollectMissingEmptyAndRecoveredSettings(t *testing.T
 	})
 	t.Run("last good generation", func(t *testing.T) {
 		upstreamSettingsHome(t)
-		s := settings.Settings{Theme: "dark", Lang: "ja", TextSize: 125, GitHubToken: "private-fixture-token"}
+		s := settings.Settings{Theme: "dark", Lang: "ja", TextSize: 125, GitHubToken: "private-fixture-token", Colorblind: true, NoAutoDownload: true, AutoRestart: true,
+			PluginOptions: map[string]map[string]bool{"fixture": {"longContext": true}}, CodexAutoReset: []string{"fixture@example.invalid"}, CodexAutoResetOnly: map[string]string{"fixture@example.invalid": "week"},
+			DesktopSubagentModel: "fixture/model", DesktopSubagentEffort: "high"}
 		good, err := json.Marshal(s)
 		if err != nil {
 			t.Fatal(err)
@@ -114,6 +116,18 @@ func TestWhaleBridgeUpstreamCollectMissingEmptyAndRecoveredSettings(t *testing.T
 			}
 			if (b.Settings.GitHubToken != "") != keys {
 				t.Fatal("recovered settings bypassed backup credential redaction")
+			}
+			sealed, err := Seal(b, "synthetic-main-fields-passphrase")
+			if err != nil {
+				t.Fatal(err)
+			}
+			opened, err := Open(sealed, "synthetic-main-fields-passphrase")
+			if err != nil || opened.Settings == nil {
+				t.Fatalf("opening recovered settings: %v", err)
+			}
+			got := opened.Settings
+			if !got.Colorblind || !got.NoAutoDownload || !got.AutoRestart || !got.PluginOptions["fixture"]["longContext"] || got.CodexAutoResetOnly["fixture@example.invalid"] != "week" || got.DesktopSubagentModel != "fixture/model" || got.DesktopSubagentEffort != "high" {
+				t.Fatal("encrypted backup lost main's new shared settings")
 			}
 			if b.Library != nil {
 				t.Fatal("WhaleBridge backup unexpectedly carries the library")

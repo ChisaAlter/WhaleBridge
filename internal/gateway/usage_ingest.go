@@ -36,8 +36,8 @@ import (
 // GET /v1/magpie/usage is: this computer, or another with an enabled
 // gateway key while magpie is shared. A request with a browser's marks
 // needs an enabled gateway key even from this computer: corsGuard lets
-// a page on localhost or 127.0.0.1 (any port) and an opaque origin
-// through, and none of them should be able to write what the page counts.
+// a page on localhost or 127.0.0.1 (any port) through keyless, and it
+// shouldn't be able to write what the page counts.
 
 const (
 	// ingestMaxBody is the most a post may carry: a full batch of

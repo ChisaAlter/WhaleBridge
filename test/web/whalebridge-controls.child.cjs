@@ -1,5 +1,6 @@
 'use strict';
 const { app, BrowserWindow, nativeTheme } = require('electron');
+const { inspectAlignment } = require('../../scripts/lib/ui-alignment.cjs');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -148,6 +149,7 @@ async function run(){
   const release=()=>{const observed={path:heldPath,baseline:heldApiBaseline};heldPath=undefined;const resolve=releaseRequest;releaseRequest=undefined;resolve();return observed;};
   if(!focused){
   await subscribe();await click('[data-action="install-adapter"]');await wait(`document.querySelector('[data-action="install-adapter"] .button-spinner')`);
+  assert.deepEqual((await js(`(${inspectAlignment.toString()})()`)).issues.filter(i=>i.kind.startsWith('control-')),[],'busy labels and spinners stay centered');
   assert.equal(await js(`document.querySelector('#f-agent').disabled&&document.querySelector('#save').disabled`),true);
   assert.equal(await js(`document.querySelector('#adapter-progress progress')`),null,'no progress bar');
   assert.equal(await js(`document.querySelector('[data-action="install-adapter"]').textContent`),'下载中');
@@ -230,7 +232,7 @@ async function run(){
   if(!messagesOnly){
   const providerDraft=async(name,id)=>{await click('[data-tab="providers"]');await wait(`document.querySelector('[data-action="add-provider"]')`);await addProvider();await wait(`document.querySelector('#f-name')&&document.querySelector('#f-id')`);await type('#f-name',name);await type('#f-id',id);};
   const assertProviderDraft=async(name,id)=>assert.deepEqual(await js(`({open:document.querySelector('#editor').open,title:document.querySelector('#editor-title').textContent,name:document.querySelector('#f-name')?.value,id:document.querySelector('#f-id')?.value,enabled:!document.querySelector('#save').disabled,errorHidden:(document.querySelector('#message').hidden||document.querySelector('#message').dataset.error!=='true')})`),{open:true,title:'添加供应商',name,id,enabled:true,errorHidden:true});
-  const quotas=async()=>{await click('[data-tab="usage"]');await wait(`document.querySelector('[data-global-section="quotas"]')`);await click('[data-global-section="quotas"]');await wait(`document.querySelector('[data-action="quota-settings"]')`);};
+  const quotas=async()=>{await click('[data-tab="usage"]');await wait(`tab==='usage'&&document.querySelector('#content').getAttribute('aria-busy')==='false'&&document.querySelector('[data-global-section="quotas"]')`);await click('[data-global-section="quotas"]');await wait(`document.querySelector('[data-global-section="quotas"]').getAttribute('aria-selected')==='true'&&document.querySelector('#content').getAttribute('aria-busy')==='false'&&document.querySelector('#quota-section')?.getAttribute('aria-busy')==='false'&&document.querySelector('[data-action="quota-settings"]')`);};
   for(const [action,savePath,name,id] of [['subscription-settings','/api/subscription/settings','Subscription return draft','subscription-return'],['quota-settings','/api/accounts/settings','Account return draft','account-return']]){
    await quotas();await click(`[data-action="${action}"]`);await wait(`document.querySelector('#editor').open&&!document.querySelector('#save').disabled`);
    heldPath=savePath;await click('#save');await held();assert.equal(await js(`document.querySelector('#save').disabled`),true);

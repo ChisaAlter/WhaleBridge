@@ -18,6 +18,11 @@
 // and it runs in moejs in magpie's own process, as gateway middleware
 // does: there is no Node here, so a package it imports is bundled into it.
 //
+// An agent whose model is picked in the agent itself (Raycast's own
+// picker, among the models connect writes) leaves model out: it is connect
+// only, a switch on the Agents page as an app whose one setting is magpie
+// as its provider is, and connect is called without a model (#2374).
+//
 // The agent export may also say where its agent reads what magpie's
 // Library gives (internal/library): an instructions file, an MCP file in
 // one of MCPFormats, and a skills folder; each is optional.
@@ -258,6 +263,11 @@ func Compile(spec, file string) (*Agent, error) {
 			}
 		}
 	}
+	// connect only: with no model key, connect's keys are all magpie
+	// writes, so a module with neither would write nothing
+	if a.Desc.Model == "" && !a.has {
+		return nil, errors.New("agent.model names no key, and there is no connect to write the gateway: say one or both")
+	}
 	return a, nil
 }
 
@@ -268,9 +278,8 @@ func (d *Desc) check() error {
 		return fmt.Errorf("agent.id %q: lower-case letters, digits, '.', '_' and '-' only", d.ID)
 	case strings.TrimSpace(d.Config) == "":
 		return errors.New("agent.config names no file")
-	case strings.TrimSpace(d.Model) == "":
-		return errors.New("agent.model names no key")
 	}
+	d.Model = strings.TrimSpace(d.Model)
 	if d.Name == "" {
 		d.Name = d.ID
 	}

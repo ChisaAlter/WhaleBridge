@@ -20,6 +20,7 @@ import (
 
 	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 	"github.com/ChisaAlter/WhaleBridge/internal/catalog"
+	"github.com/ChisaAlter/WhaleBridge/internal/dirent"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
@@ -163,7 +164,7 @@ func ompProfiles(home string) []*Agent {
 	var names []string
 	for _, e := range entries {
 		name := e.Name()
-		if !e.IsDir() || !ompProfileOK(name) {
+		if !dirent.IsFolder(filepath.Join(root, "profiles"), e) || !ompProfileOK(name) {
 			continue
 		}
 		if filepath.Join(root, "profiles", name, "agent") == cur {
@@ -198,7 +199,8 @@ func ompIn(at place) *Agent {
 // ompAt is omp with its agent folder at dir, magpie's entry in its
 // models.yml being entry's.
 func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
-	ompProvider := entry
+	// magpie's entry laid over the one in the models file at path (ompKept)
+	ompProvider := func(path string) any { return ompKept(path, entry()) }
 	// omp reads the .yml and falls back to the .yaml
 	pick := func(name string) string {
 		yml := filepath.Join(dir, name+".yml")
@@ -208,6 +210,8 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 		return yml
 	}
 	path := pick("config")
+	// the entries of enabledModels a sync took out (scope_gone.go)
+	gone := at.key("omp.scope.gone")
 	roleGet := func(name string) func() string {
 		return func() string {
 			k := "modelRoles." + name
@@ -238,7 +242,7 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 				return err
 			}
 		}
-		return edit.SetYAML(models, edit.KV{Path: "providers." + magpieID, Value: ompProvider()})
+		return edit.SetYAML(models, edit.KV{Path: "providers." + magpieID, Value: ompProvider(models)})
 	}
 	// dropMagpie takes magpie's provider out of models.yml once nothing in
 	// the config is on magpie; while something is (a fallback chain, another
@@ -266,6 +270,7 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 		if err := ompScopeWithout(path); err != nil {
 			return err
 		}
+		forget(gone)
 		return edit.DelYAML(pick("models"), "providers."+magpieID)
 	}
 	// was are the stash's keys for the roles, one each
@@ -451,7 +456,13 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 		// a list of models is the user's own
 		SplitSuffix: ompSplit,
 		Sync: func() error {
-			return syncYAML(pick("models"), "providers."+magpieID, func() any { return ompProvider() })
+			models := pick("models")
+			if err := syncYAML(models, "providers."+magpieID, func() any { return ompProvider(models) }); err != nil {
+				return err
+			}
+			// an entry on a model magpie no longer gives omp names nothing
+			// (#2055, scope_gone.go)
+			return ompScopeSynced(path, models, gone)
 		},
 		// a provider renamed takes its models' ids in models.yml with it; a
 		// name left on the old one omp would pass over, with a warning. So
@@ -478,6 +489,7 @@ func ompAt(at place, dir string, entry func() ompProviderEntry) *Agent {
 			if err := ompScopeOnce(path); err != nil {
 				return moved, err
 			}
+			scopeGoneRename(gone, from, to)
 			for _, w := range was {
 				s := stashLoad()[w]
 				ns := move(s)
@@ -670,6 +682,18 @@ func ompProviderAt(gw, version string) ompProviderEntry {
 		e.Auth, e.APIKey = "", key
 	}
 	return e
+}
+
+// ompKept is magpie's entry e laid over the one in the models.yml at path.
+// omp keeps keys its schema doesn't name and never writes the file itself,
+// so what is there beside magpie's is the user's: modelOverrides (a model's
+// context or cost), discovery, disableStrictTools, remoteCompaction, a
+// header or compat flag of their own (models-config-schema-bundle.ts
+// ProviderConfigSchema). Each stays; the address, API, auth, key and model
+// list are magpie's, an auth or key it no longer writes gone with it, so a
+// loopback's auth: none never sits beside the key a WSL omp needs (#2030).
+func ompKept(path string, e ompProviderEntry) any {
+	return yamlKept(path, "providers."+magpieID, e, "baseUrl", "api", "auth", "apiKey", "models")
 }
 
 // ompOwnOptions lists the models of the providers the user added to omp's

@@ -11,8 +11,15 @@ package gateway
 // session; within a turn only — while the agent sends tool results back,
 // until the user speaks again; never; or, by default, worked out from the
 // conversation itself: within a turn always, and across turns while what
-// the vendor said it read from its cache the last time is worth keeping
-// and not yet gone cold.
+// the vendor said it read from its cache the last time, or wrote to it, is
+// worth keeping and not yet gone cold. Written counts as read: a first
+// turn reads nothing and writes the whole prompt, which the next turn
+// reads if it stays (vilicvane on Discord: the second turn moved, and the
+// cache just built was thrown away). A vendor that keeps a prompt cached
+// without reporting it — OpenAI's automatic prefix cache, Gemini — says
+// neither of a turn that read nothing, and what its cache holds then is
+// the prompt that turn was sent: that counts as written too, so its next
+// turn stays rather than building the cache afresh elsewhere.
 //
 // Who answered is kept on disk as well (affinity.json, next to the
 // providers), so a restart — an update's included — doesn't hand a
@@ -37,12 +44,17 @@ import (
 )
 
 const (
-	// cacheWorth is how many tokens read from the vendor's cache make a
-	// conversation worth keeping where it is across turns.
+	// cacheWorth is how many tokens read from the vendor's cache, or
+	// written to it — or, from a vendor that reports neither, sent — make
+	// a conversation worth keeping where it is across turns.
 	cacheWorth = 1024
 	// cacheCold is how long a vendor keeps a prompt cached without it being
 	// read: five minutes at Anthropic and at OpenAI, the shortest there is.
 	cacheCold = 5 * time.Minute
+	// cacheHour is how long Anthropic keeps what was written with
+	// cache_control's ttl "1h" (cache_creation's ephemeral_1h_input_tokens)
+	// without it being read, as Claude Code asks of a subscription (#2302)
+	cacheHour = time.Hour
 	// stickKeep is how long a conversation's last answerer is remembered.
 	stickKeep = 24 * time.Hour
 	// sticksKept is how many conversations, the latest, are kept on disk.
@@ -52,29 +64,63 @@ const (
 // Affinity is what the trace tells of a request's conversation and whether
 // it stayed with who answered it last.
 type Affinity struct {
-	Mode      string    `json:"mode"`             // the provider's or group's: "", session, turn, off
-	Turn      int       `json:"turn"`             // the user's turns in the conversation so far
-	Within    bool      `json:"within,omitempty"` // the agent sending tool results back: mid-turn
-	Last      string    `json:"last,omitempty"`   // who answered the conversation last
-	LastTurn  int       `json:"lastTurn,omitempty"`
-	At        time.Time `json:"at,omitempty"`        // when
-	CacheRead int       `json:"cacheRead,omitempty"` // tokens that answer read from the vendor's cache
-	Kept      bool      `json:"kept,omitempty"`      // Last was put first for it
+	Mode       string    `json:"mode"`             // the provider's or group's: "", session, turn, off
+	Turn       int       `json:"turn"`             // the user's turns in the conversation so far
+	Within     bool      `json:"within,omitempty"` // the agent sending tool results back: mid-turn
+	Last       string    `json:"last,omitempty"`   // who answered the conversation last
+	LastTurn   int       `json:"lastTurn,omitempty"`
+	At         time.Time `json:"at,omitempty"`         // when
+	CacheRead  int       `json:"cacheRead,omitempty"`  // tokens that answer read from the vendor's cache
+	CacheWrite int       `json:"cacheWrite,omitempty"` // and wrote to it, or was sent where none is
+	Kept       bool      `json:"kept,omitempty"`       // Last was put first for it
 	// Why it was kept — "session", "turn", "cache" — or not: "off", "first"
 	// (nobody has answered it yet), "new-turn", "no-cache" (the vendor
-	// read too little from its cache to keep), "cold" (too long ago),
-	// "resting", "spent", "gone" (no longer one to route to).
+	// read and wrote too little of its cache to keep, or was sent too
+	// little for a cache it keeps without saying so), "cold" (too long
+	// ago), "resting", "spent", "gone" (no longer one to route to).
 	Why string `json:"why"`
 }
 
 type stick struct {
-	rest      string
-	who       string // the key or account, however many were on
-	model     string // the model it answered as: a group may have several on one account
-	effort    string // the effort the group's member it answered as is fixed at
-	turn      int
-	at        time.Time
-	cacheRead int
+	rest       string
+	who        string // the key or account, however many were on
+	model      string // the model it answered as: a group may have several on one account
+	effort     string // the effort the group's member it answered as is fixed at
+	turn       int
+	at         time.Time
+	cacheRead  int
+	cacheWrite int
+	hour       hourCache
+}
+
+// hourCache is the part of a conversation's prompt the vendor said it keeps
+// for an hour: Anthropic's ephemeral_1h_input_tokens, with what was read
+// before them, since its 1-hour breakpoints come before any 5-minute one.
+// It stays warm past cacheCold, until an hour after it was last written or
+// read (#2302: Stays: Auto moved a conversation as "cold" 5 minutes after
+// a 1-hour write). Vendors that report no 1-hour write never have one.
+type hourCache struct {
+	tokens int
+	at     time.Time
+}
+
+// after is what is kept for an hour once a reply with usage u came at now.
+// A reply that wrote for an hour keeps all it read and that; one that read
+// the whole of what was kept refreshes it; one that read less no longer
+// starts with it (moved, compacted), and it is gone.
+func (h hourCache) after(u Usage, now time.Time) hourCache {
+	switch {
+	case u.CacheWrite1h > 0:
+		return hourCache{tokens: u.CacheRead + u.CacheWrite1h, at: now}
+	case h.tokens > 0 && now.Sub(h.at) <= cacheHour && u.CacheRead >= h.tokens:
+		return hourCache{tokens: h.tokens, at: now}
+	}
+	return hourCache{}
+}
+
+// warm is whether enough is still kept at now to stay for.
+func (h hourCache) warm(now time.Time) bool {
+	return h.tokens >= cacheWorth && now.Sub(h.at) <= cacheHour
 }
 
 var sticks = struct {
@@ -104,6 +150,13 @@ type savedStick struct {
 	Turn      int       `json:"turn,omitempty"`
 	At        time.Time `json:"at"`
 	CacheRead int       `json:"cacheRead,omitempty"`
+	// CacheWrite is absent from a file written before it was kept, and
+	// reads as 0: such a stick is judged by what was read, as it was then
+	CacheWrite int `json:"cacheWrite,omitempty"`
+	// CacheHour and CacheHourAt are its hourCache, absent where none was
+	// written for an hour
+	CacheHour   int       `json:"cacheHour,omitempty"`
+	CacheHourAt time.Time `json:"cacheHourAt,omitzero"`
 }
 
 func sticksPath() string { return filepath.Join(filepath.Dir(provider.Path()), "affinity.json") }
@@ -136,7 +189,8 @@ func stickOf(key string) (stick, bool) {
 		if st, ok := sticks.m[k]; ok && !st.at.Before(v.At) {
 			continue
 		}
-		sticks.m[k] = stick{rest: v.Rest, who: v.Who, model: v.Model, effort: v.Effort, turn: v.Turn, at: v.At, cacheRead: v.CacheRead}
+		sticks.m[k] = stick{rest: v.Rest, who: v.Who, model: v.Model, effort: v.Effort, turn: v.Turn, at: v.At, cacheRead: v.CacheRead, cacheWrite: v.CacheWrite,
+			hour: hourCache{tokens: v.CacheHour, at: v.CacheHourAt}}
 	}
 	st, ok := sticks.m[key]
 	return st, ok
@@ -156,7 +210,7 @@ func saveSticks() {
 	sticks.Lock()
 	for k, st := range sticks.m {
 		if now.Sub(st.at) <= stickKeep {
-			ks = append(ks, kept{k, savedStick{st.rest, st.who, st.model, st.effort, st.turn, st.at, st.cacheRead}})
+			ks = append(ks, kept{k, savedStick{st.rest, st.who, st.model, st.effort, st.turn, st.at, st.cacheRead, st.cacheWrite, st.hour.tokens, st.hour.at}})
 		}
 	}
 	sticks.Unlock()
@@ -345,7 +399,7 @@ func affine(scope, mode string, rotate bool, in http.Header, from provider.Proto
 		had = false
 	}
 	if had {
-		a.Last, a.LastTurn, a.At, a.CacheRead = st.rest, st.turn, st.at, st.cacheRead
+		a.Last, a.LastTurn, a.At, a.CacheRead, a.CacheWrite = st.rest, st.turn, st.at, st.cacheRead, st.cacheWrite
 	}
 	// the account and the model that answered: a group with Opus and
 	// Sonnet both on one Claude account, a rule sending the turn to Opus,
@@ -387,9 +441,13 @@ func affine(scope, mode string, rotate bool, in http.Header, from provider.Proto
 		a.Why = "turn"
 	case mode == provider.AffinityTurn, rotate:
 		a.Why = "new-turn"
-	case st.cacheRead < cacheWorth:
+	case st.cacheRead+st.cacheWrite < cacheWorth:
+		// what it wrote counts with what it read: the cache a first turn
+		// built is there for the next to read
 		a.Why = "no-cache"
-	case time.Since(st.at) > cacheCold:
+	case time.Since(st.at) > cacheCold && !st.hour.warm(time.Now()):
+		// past five minutes, kept still where the vendor said it
+		// keeps enough for an hour (#2302)
 		a.Why = "cold"
 	default:
 		a.Why = "cache"
@@ -513,11 +571,26 @@ func after(cs []candidate, pl planned, at int) ([]candidate, planned) {
 }
 
 // answered remembers who answered a conversation, and what it read from
-// the vendor's cache doing so.
-func answered(key string, c candidate, turn, cacheRead int) {
+// the vendor's cache and wrote to it doing so — u. A vendor that keeps a
+// prompt cached without reporting it — OpenAI's automatic prefix cache,
+// Gemini — says neither of a turn that read none: what its cache holds
+// then is the prompt that turn was sent, and that stands for the write, so
+// the next turn stays to read it rather than moving as no-cache and
+// building it afresh elsewhere. A reply that reports no usage at all
+// (Input 0) counts as no cache, as it did.
+func answered(key string, c candidate, turn int, u Usage) {
+	cacheRead, cacheWrite := u.CacheRead, u.CacheWrite
+	if cacheRead == 0 && cacheWrite == 0 {
+		cacheWrite = u.Input
+	}
 	now := time.Now()
 	sticks.Lock()
-	sticks.m[key] = stick{rest: c.rest, who: c.who(), model: c.model, effort: c.effort, turn: turn, at: now, cacheRead: cacheRead}
+	var hour hourCache
+	if st, ok := sticks.m[key]; ok && st.who == c.who() && st.model == c.model {
+		hour = st.hour // a cache is the account's, of the model
+	}
+	hour = hour.after(u, now)
+	sticks.m[key] = stick{rest: c.rest, who: c.who(), model: c.model, effort: c.effort, turn: turn, at: now, cacheRead: cacheRead, cacheWrite: cacheWrite, hour: hour}
 	delete(sticks.opening, key)
 	if len(sticks.m) > 4096 {
 		for k, st := range sticks.m {

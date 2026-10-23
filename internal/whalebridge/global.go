@@ -6,7 +6,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
+	"regexp"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -25,7 +29,7 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/usageapi"
 )
 
-var globalSettingKeys = strings.Fields("proxy currency chineseUnits searcher searcherEffort searchFirst vision visionEffort imageGen redact redactPersonal redactKinds redactWords redactRules noAccountDiscovery quotaReads noLoopGuard refusalRetries codexPredictions plainNames plainOwnNames memberModel fullContext compactAt quotaLeft usageAlert balanceAlert resetReminder requestArchive requestArchiveMaxMB")
+var globalSettingKeys = strings.Fields("proxy currency chineseUnits searcher searcherEffort searchFirst vision visionEffort imageGen redact redactPersonal redactKinds redactWords redactRules noAccountDiscovery quotaReads noLoopGuard refusalRetries codexPredictions plainNames plainOwnNames memberModel fullContext compactAt quotaLeft usageAlert balanceAlert resetReminder requestArchive requestArchiveMaxMB fetchPrivate")
 
 func globalState() map[string]any {
 	s := settings.Load()
@@ -159,6 +163,9 @@ func saveGlobalSettings(r *http.Request) error {
 		}
 	}
 	s.OTel.Sessions = false
+	if s.FetchPrivate, err = cleanFetchPrivate(s.FetchPrivate); err != nil {
+		return err
+	}
 	if s.RefusalRetries != nil && *s.RefusalRetries < 0 {
 		return fmt.Errorf("拒绝重试次数不能小于 0")
 	}
@@ -177,6 +184,41 @@ func saveGlobalSettings(r *http.Request) error {
 	gateway.WakeWhaleBridgeQuotaAlerts()
 	return nil
 }
+
+// cleanFetchPrivate checks the private hosts and ranges a URL the gateway
+// didn't choose may be downloaded from, as the gateway reads them
+// (gateway.allowFor): an IP, a CIDR range, a host name or host:port.
+func cleanFetchPrivate(in []string) ([]string, error) {
+	out := []string{}
+	for _, e := range in {
+		e = strings.ToLower(strings.TrimSpace(e))
+		if e == "" || slices.Contains(out, e) {
+			continue
+		}
+		if _, err := netip.ParsePrefix(e); err == nil {
+			out = append(out, e)
+			continue
+		}
+		if _, err := netip.ParseAddr(strings.Trim(e, "[]")); err == nil {
+			out = append(out, e)
+			continue
+		}
+		host, port, err := net.SplitHostPort(e)
+		if err != nil {
+			host, port = e, ""
+		}
+		if n, err := strconv.Atoi(port); port != "" && (err != nil || n < 1 || n > 65535) {
+			return nil, fmt.Errorf("内网地址 %q 的端口无效", e)
+		}
+		if !hostName.MatchString(host) {
+			return nil, fmt.Errorf("内网地址 %q 应为主机名、主机名:端口、IP 或 CIDR 网段", e)
+		}
+		out = append(out, e)
+	}
+	return out, nil
+}
+
+var hostName = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$`)
 
 func requestFilter(r *http.Request) usage.Filter {
 	f := usageapi.FilterOf(r.URL.Query())

@@ -70,8 +70,10 @@ func TestClaudeTierNamesGoWithTheirModel(t *testing.T) {
 			if err := a.Apply("model", "opencode-go/deepseek-flash"); err != nil {
 				t.Fatal(err)
 			}
-			if v, _ := edit.GetJSON(path, "env.ANTHROPIC_DEFAULT_FABLE_MODEL"); v != "opencode-go/deepseek-flash" {
-				t.Fatalf("fable not on magpie's model:\n%s", readFile(path))
+			// the user's own fable model goes too, and on a model that is
+			// no Fable magpie leaves the tier unset (#2090)
+			if v, has := edit.GetJSON(path, "env.ANTHROPIC_DEFAULT_FABLE_MODEL"); has {
+				t.Fatalf("fable left on %q:\n%s", v, readFile(path))
 			}
 			if left := claudeAboutLeft(path); len(left) > 0 {
 				t.Fatalf("the user's own models' names left on magpie's: %v", left)

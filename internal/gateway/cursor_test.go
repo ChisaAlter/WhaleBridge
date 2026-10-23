@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -103,6 +104,53 @@ func TestCursorDecodesTextAndCalls(t *testing.T) {
 	}
 	if cursorCallID("call_a__fc_1") != "call_a\nfc_1" || cursorCallID("toolu_x__fc_1") != "toolu_x__fc_1" {
 		t.Fatal("call ids don't come back")
+	}
+}
+
+// cursorCaptured is a frame of real Cursor's Run, as captured (without its
+// envelope) on 2026-10-15, model auto, for plugins #142.
+func cursorCaptured(t *testing.T, h string) []byte {
+	t.Helper()
+	b, err := hex.DecodeString(h)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return cursorFrame(pb(b))
+}
+
+// Cursor's count of a step's calls (update 27, sent after them) takes in
+// the execs answered here: its get_mcp_tools, and a tool of its own refused
+// (plugins #142). Real Cursor's frames: get_mcp_tools, a WebSearch call, a
+// count of 2. Counting only the call, the step never ended while Cursor
+// waited for WebSearch's result.
+func TestCursorCountTakesAnsweredExecs(t *testing.T) {
+	evs, sent, _ := cursorDecoded(t, nil,
+		cursorCaptured(t, "123f9a01360a2031633366376432386261313531653137303639616231343163626637316165651210653532623935616633363331663934321800a20200b80300"),
+		cursorCaptured(t, "12f80108015a91010a106d61677069652d576562536561726368120b0a047061746812031a01781a5563616c6c2d35653434356466642d636438612d343238642d623561352d6562656137313838376435392d310a66635f61633833643337622d666536362d393964622d623036652d3736613663633562616564325f3122066d61677069652a095765625365617263684a066d61677069657a2462616465343834312d366230342d346464632d626330392d3936313763306635343666389a01360a2031633366376432386261313531653137303639616231343163626637316165651210333632323535313938666465653532321800b80301"),
+		cursorCaptured(t, "0a05da01020802"),
+		cursorUpdate(1, pb{}.str(1, "never read")),
+	)
+	want := `|call:call-5e445dfd-cd8a-428d-b5a5-ebea71887d59-1__fc_ac83d37b-fe66-99db-b06e-76a6cc5baed2_1/WebSearch|args:{"path":"x"}|stop:tool`
+	if got := said(evs); got != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
+	}
+	if len(sent) == 0 || sent[0][0].num != 2 {
+		t.Fatalf("get_mcp_tools not answered: %v", sent)
+	}
+
+	// a step whose calls were all answered here spends its count: the
+	// next step's two calls both go to the caller, not the first alone
+	evs, _, _ = cursorDecoded(t, nil,
+		cursorCaptured(t, "123f9a01360a2031633366376432386261313531653137303639616231343163626637316165651210653532623935616633363331663934321800a20200b80300"),
+		cursorUpdate(27, pb{}.varint(1, 1)),
+		cursorCallFrame(3, "call_a", "get_weather", "Paris"),
+		cursorCallFrame(4, "call_b", "get_weather", "Lima"),
+		cursorUpdate(27, pb{}.varint(1, 2)),
+		cursorUpdate(1, pb{}.str(1, "never read")),
+	)
+	want = `|call:call_a/get_weather|args:{"city":"Paris"}|call:call_b/get_weather|args:{"city":"Lima"}|stop:tool`
+	if got := said(evs); got != want {
+		t.Fatalf("got  %s\nwant %s", got, want)
 	}
 }
 

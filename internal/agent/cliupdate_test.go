@@ -570,3 +570,51 @@ func TestGrokBrewCask(t *testing.T) {
 		t.Errorf("installer only: %+v", c)
 	}
 }
+
+// bunxOf is a .bunx as bun 1.4.3 wrote it beside its Windows shims, on the
+// Windows box after bun add -g opencode-ai @oh-my-pi/pi-coding-agent: the
+// program's path from bun's folder in UTF-16, a quote, then bun's own
+// bytes (omp's names bun as its runner).
+func bunxOf(t *testing.T, path string, tail []byte) string {
+	t.Helper()
+	var b []byte
+	for _, r := range path + `"` {
+		b = append(b, byte(r), 0)
+	}
+	return string(append(append(b, 0, 0), tail...))
+}
+
+// opencode and omp bun installed on Windows are updated with bun: bun's
+// shim there is an .exe naming no package, and the .bunx beside it names
+// it (#2192, xiaozhu1337: opencode 2.0.24 and omp 18.6.1 with newer out,
+// no update offered). omp's own -Binary install updates itself.
+func TestHowInstalledBunWindowsShim(t *testing.T) {
+	bunDir := filepath.Join(t.TempDir(), "bun-home") // a BUN_INSTALL with no .bun in it
+	bun := file(t, filepath.Join(bunDir, "bin", exe("bun")), "MZ")
+	file(t, filepath.Join(bunDir, "install/global/node_modules/opencode-ai/bin/opencode.exe"), "MZ")
+	file(t, filepath.Join(bunDir, "install/global/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js"), "")
+	opencode := file(t, filepath.Join(bunDir, "bin/opencode.exe"), "MZ\x90\x00 node_modules") // bun's 8 KB shim
+	file(t, filepath.Join(bunDir, "bin/opencode.bunx"), bunxOf(t, `install\global\node_modules\opencode-ai\bin\opencode.exe`, []byte{0x30, 0xab}))
+	omp := file(t, filepath.Join(bunDir, "bin/omp.exe"), "MZ\x90\x00 node_modules")
+	file(t, filepath.Join(bunDir, "bin/omp.bunx"), bunxOf(t, `install\global\node_modules\@oh-my-pi\pi-coding-agent\dist\cli.js`,
+		[]byte{'b', 0, 'u', 0, 'n', 0, ' ', 0, 0x82, 0, 0, 0, 8, 0, 0, 0, 0x35, 0xab}))
+	if u := howInstalled(cliSpecs["opencode"], opencode); u == nil || u.via != "bun" || !reflect.DeepEqual(u.cmd, []string{bun, "add", "-g", "opencode-ai@latest"}) {
+		t.Errorf("opencode's bun shim: %+v", u)
+	}
+	if u := howInstalled(cliSpecs["omp"], omp); u == nil || u.via != "bun" || !reflect.DeepEqual(u.cmd, []string{bun, "add", "-g", "@oh-my-pi/pi-coding-agent@latest"}) {
+		t.Errorf("omp's bun shim: %+v", u)
+	}
+	// a .bunx naming another package is not this one's
+	if u := howInstalled(cliSpecs["omp"], opencode); u != nil {
+		t.Errorf("opencode's shim taken as omp's: %+v", u)
+	}
+
+	// omp.sh's binary install: %LOCALAPPDATA%\omp\omp.exe, ~/.local/bin/omp
+	home := t.TempDir()
+	for _, p := range []string{"AppData/Local/omp/omp.exe", ".local/bin/omp"} {
+		bin := file(t, filepath.Join(home, p), "MZ")
+		if u := howInstalled(cliSpecs["omp"], bin); u == nil || u.via != "self" || !reflect.DeepEqual(u.cmd, []string{bin, "update"}) || u.pkg != "@oh-my-pi/pi-coding-agent" {
+			t.Errorf("omp's binary at %s: %+v", p, u)
+		}
+	}
+}

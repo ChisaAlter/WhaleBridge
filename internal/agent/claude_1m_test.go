@@ -41,7 +41,9 @@ func TestClaude1MMarked(t *testing.T) {
 	}
 	names := []string{"model", "env.ANTHROPIC_SMALL_FAST_MODEL"}
 	for _, tier := range claudeTiers {
-		names = append(names, "env."+tierEnv(tier))
+		if tier != "fable" { // left unset on a model that is no Fable (#2090)
+			names = append(names, "env."+tierEnv(tier))
+		}
 	}
 
 	for _, v := range []string{"v/big", "v/big[1m]"} {

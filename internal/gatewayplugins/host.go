@@ -15,7 +15,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/gwbudget"
 	"github.com/ChisaAlter/WhaleBridge/internal/gwmw"
+	"github.com/ChisaAlter/WhaleBridge/internal/gwtool"
 	"github.com/ChisaAlter/WhaleBridge/internal/middleware"
 	"github.com/ChisaAlter/WhaleBridge/internal/pluginrt"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
@@ -42,6 +44,7 @@ type Host struct {
 	done                     chan struct{}
 	removeRefresh            func()
 	removeManaged            func()
+	removePoints             func()
 	quiesce                  sync.Once
 	stop                     sync.Once
 }
@@ -56,7 +59,17 @@ type Status struct {
 // Start applies the complete finite assembly before the caller publishes
 // readiness or starts either HTTP listener. No failed first apply is advertised.
 func Start() (*Host, error) {
-	return start(Manifests(), []string{pluginrt.Path(), provider.Path(), settings.Path(), settings.Dir() + string(os.PathSeparator) + "plugins.json"}, time.Second)
+	h, err := start(Manifests(), []string{pluginrt.Path(), provider.Path(), settings.Path(), settings.Dir() + string(os.PathSeparator) + "plugins.json"}, time.Second)
+	if err != nil {
+		return nil, err
+	}
+	// Keep all optional gateway points under the same admission/drain owner.
+	// Refresh callbacks schedule work; they never reconcile inside a request.
+	groups := provider.GateGroups(h.ScheduleRefresh)
+	tools := gwtool.Gate()
+	budgets := gwbudget.Refresh(h.ScheduleRefresh)
+	h.removePoints = func() { budgets(); tools(); groups() }
+	return h, nil
 }
 
 func start(ms []pluginrt.Manifest, paths []string, every time.Duration) (*Host, error) {
@@ -242,6 +255,9 @@ func (h *Host) Stop() {
 		}
 		if h.removeManaged != nil {
 			h.removeManaged()
+		}
+		if h.removePoints != nil {
+			h.removePoints()
 		}
 	})
 }

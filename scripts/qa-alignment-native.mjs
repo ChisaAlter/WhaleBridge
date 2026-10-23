@@ -1,0 +1,11 @@
+import { spawn } from 'node:child_process';
+import { existsSync, readFileSync } from 'node:fs';
+import { resolve, dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
+const repo=resolve(dirname(fileURLToPath(import.meta.url)),'..');
+const electron=process.env.ELECTRON_PATH||join(repo,'node_modules/electron/dist',process.platform==='win32'?'electron.exe':'electron');
+if(!existsSync(electron))throw new Error('Install the local Electron UI test dependency first');
+const env={...process.env};delete env.ELECTRON_RUN_AS_NODE;
+const child=spawn(electron,[join(repo,'scripts/qa-alignment-native.cjs')],{cwd:repo,env,stdio:'inherit'});
+child.on('error',e=>{console.error(e.message);process.exitCode=1});
+child.on('exit',code=>{process.exitCode=code||0;const file=join(resolve(env.WHALEBRIDGE_QA_ALIGN||join(repo,'.tmp/alignment-review')),'alignment-report.json');if(!existsSync(file)){console.error('Alignment review did not produce a report');process.exitCode=1;return}const r=JSON.parse(readFileSync(file,'utf8'));if(r.status!=='passed'&&env.WHALEBRIDGE_QA_ALLOW_ISSUES!=='1')process.exitCode=1});

@@ -225,7 +225,7 @@ func TestWhaleBridgeUpstreamCodexCredentialWriteIsDurable(t *testing.T) {
 
 	path, before := upstreamDueCodexAuth(t)
 	steady.Sync = func(*os.File) error { return errors.New("fixture disk offline") }
-	if tok, id, err := codexToken(t.Context(), path); err != nil || tok != freshAccess || id != "acct-fixture" {
+	if tok, id, err := codexToken(t.Context(), filepath.Dir(path)); err != nil || tok != freshAccess || id != "acct-fixture" {
 		t.Fatalf("fresh token cannot serve after persistence failed: id=%q err=%v", id, err)
 	}
 	if got, err := os.ReadFile(path); err != nil || !bytes.Equal(got, before) {
@@ -258,7 +258,7 @@ func TestWhaleBridgeUpstreamCodexCredentialWriteIsDurable(t *testing.T) {
 		flushed = true
 		return f.Sync()
 	}
-	if _, _, err := codexToken(t.Context(), path); err != nil {
+	if _, _, err := codexToken(t.Context(), filepath.Dir(path)); err != nil {
 		t.Fatal(err)
 	}
 	got, err := os.ReadFile(path)

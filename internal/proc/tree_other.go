@@ -59,6 +59,10 @@ func (group) kill(cmd *exec.Cmd) <-chan struct{} {
 	return gone
 }
 
+// term asks the command alone to end: what it started is ended with the
+// group once it has.
+func (group) term(cmd *exec.Cmd) error { return cmd.Process.Signal(syscall.SIGTERM) }
+
 // signalGroup kills the group pgid leads; a var so a test can have it miss.
 // Readers take it once at kill's entry, never from the loop's goroutine.
 var signalGroup = func(pgid int) error { return syscall.Kill(-pgid, syscall.SIGKILL) }

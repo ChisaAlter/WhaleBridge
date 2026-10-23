@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/gwmw"
+	"github.com/ChisaAlter/WhaleBridge/internal/otlp"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"github.com/ChisaAlter/WhaleBridge/internal/routes"
 	"github.com/ChisaAlter/WhaleBridge/internal/testenv"
@@ -38,7 +39,7 @@ func TestWhaleBridgeRuntimeComponentChild(t *testing.T) {
 		return
 	}
 	testenv.Offline()
-	usage.OTelEvery = 20 * time.Millisecond
+	otlp.OTelEvery = 20 * time.Millisecond
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	watchDone := make(chan struct{})
@@ -78,9 +79,6 @@ func TestWhaleBridgeRuntimeComponentChild(t *testing.T) {
 	}
 	if n := len(usage.Observers()); n != 0 {
 		t.Errorf("%d observers survived RunContext", n)
-	}
-	if usage.OTelEnabled() {
-		t.Error("exporter survived RunContext with export still configured on")
 	}
 }
 
@@ -203,6 +201,82 @@ func TestWhaleBridgeRuntimeLifecycle(t *testing.T) {
 	}
 }
 
+// A busy or malformed DSH profile is a recoverable publication error. The
+// actual component stays ready, serves its gateway, retries after the profile
+// is repaired, and joins the retry worker when its owner cancels.
+func TestWhaleBridgeRuntimeDSHStartupFailureRecovers(t *testing.T) {
+	componentHTTPTestOffline.Do(testenv.Offline)
+	for _, kind := range []string{"held-lock", "invalid-yaml", "cancel-pending-retry"} {
+		t.Run(kind, func(t *testing.T) {
+			vendor := newRuntimeVendor(t)
+			var profile, lock string
+			p := startRuntimeComponent(t, vendor.server.URL, vendor.server.URL, func(_ *runtimeComponent, dsh string) {
+				profile = profilePath(dsh)
+				if err := os.MkdirAll(filepath.Dir(profile), 0700); err != nil {
+					t.Fatal(err)
+				}
+				if kind == "invalid-yaml" {
+					if err := os.WriteFile(profile, []byte("[invalid: yaml"), 0600); err != nil {
+						t.Fatal(err)
+					}
+					return
+				}
+				lock = filepath.Join(dsh, "cordis.patch.yml.lock")
+				if err := os.WriteFile(lock, []byte(fmt.Sprintf("%d\n", os.Getpid())), 0600); err != nil {
+					t.Fatal(err)
+				}
+			})
+			syncError := func() string {
+				t.Helper()
+				r := p.request(http.MethodGet, p.origin+"/api/agents", nil, false)
+				r.requireOK(t)
+				var state struct{ Agents []agentRow }
+				if err := json.Unmarshal(r.body, &state); err != nil {
+					t.Fatal(err)
+				}
+				for _, row := range state.Agents {
+					if row.ID == "dsh" {
+						return row.SyncError
+					}
+				}
+				t.Fatal("ready management page did not include the DSH channel")
+				return ""
+			}
+			if syncError() == "" {
+				t.Fatal("startup DSH failure was not shown on the ready management page")
+			}
+			p.chat("startup-still-serves", false).requireOK(t)
+			vendor.take(t)
+			if kind != "cancel-pending-retry" {
+				if lock != "" {
+					if err := os.Remove(lock); err != nil {
+						t.Fatal(err)
+					}
+				} else if err := os.WriteFile(profile, []byte("[]\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+				// No management save triggers this: the startup retry publishes it.
+				p.until(t, "DSH startup retry recovery", func() bool {
+					data, err := os.ReadFile(profile)
+					return err == nil && bytes.Contains(data, []byte("relay/echo")) && syncError() == ""
+				})
+			}
+			p.requestStop(t)
+			p.wait(t)
+			if _, err := os.Stat(filepath.Join(p.data, "state.json")); !os.IsNotExist(err) {
+				t.Fatalf("readiness survived owner cancellation: %v", err)
+			}
+			for _, address := range []string{strings.TrimPrefix(p.origin, "http://"), strings.TrimPrefix(p.gateway, "http://")} {
+				conn, err := net.DialTimeout("tcp", address, time.Second)
+				if err == nil {
+					conn.Close()
+					t.Errorf("listener %s survived startup-retry cancellation", address)
+				}
+			}
+		})
+	}
+}
+
 type runtimeStatus struct {
 	Plugins []struct {
 		ID    string `json:"id"`
@@ -258,7 +332,7 @@ type runtimeComponent struct {
 	waitErr                              error
 }
 
-func startRuntimeComponent(t *testing.T, vendor, collector string) *runtimeComponent {
+func startRuntimeComponent(t *testing.T, vendor, collector string, prepare ...func(*runtimeComponent, string)) *runtimeComponent {
 	t.Helper()
 	root := t.TempDir()
 	p := &runtimeComponent{data: filepath.Join(root, "component"), stop: filepath.Join(root, "stop"), logPath: filepath.Join(root, "component.log"), done: make(chan struct{})}
@@ -273,12 +347,15 @@ func startRuntimeComponent(t *testing.T, vendor, collector string) *runtimeCompo
 	p.write(t, "gateway.key", []byte(runtimePrivateKey))
 	p.write(t, "cache/models.json", []byte(`{}`))
 	p.writeJSON(t, "cache/models/relay.json", map[string]any{"base": vendor + "/v1", "fetched": time.Now(), "models": []map[string]any{{"id": "echo", "name": "Echo", "context": 8192, "output": 4096}}})
-	p.writeJSON(t, "settings.json", map[string]any{"noAccountDiscovery": true, "quotaReads": "off", "redactWords": []string{runtimeSecret}, "otel": map[string]any{"enabled": true, "endpoint": collector, "sessions": false}})
+	p.writeJSON(t, "settings.json", map[string]any{"noAccountDiscovery": true, "quotaReads": "asked", "redactWords": []string{runtimeSecret}, "otel": map[string]any{"enabled": true, "endpoint": collector, "sessions": false}})
 	module := filepath.Join(root, "fixture.middleware.js")
 	if err := os.WriteFile(module, []byte(`export function onRequest(body) { body.messages[0].content += " middleware-ready"; return body; }`), 0600); err != nil {
 		t.Fatal(err)
 	}
 	p.writeJSON(t, "plugins.json", map[string]any{"plugins": []map[string]any{{"spec": module}}})
+	for _, setup := range prepare {
+		setup(p, dsh)
+	}
 	// Run publishes gateway.URL(), so reserve a concrete loopback port rather
 	// than publishing :0. Only this child ever changes its MAGPIE_ADDR.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -467,13 +544,17 @@ func (p *runtimeComponent) refresh(t *testing.T, status int) {
 }
 func (p *runtimeComponent) wantStates(t *testing.T, expected map[string]string) {
 	t.Helper()
+	all := map[string]string{"budget": "active", "groups": "active", "search": "active", "tools": "active"}
+	for id, state := range expected {
+		all[id] = state
+	}
 	s := p.status(t)
-	if len(s.Plugins) != len(expected) {
+	if len(s.Plugins) != len(all) {
 		t.Fatalf("assembly is not finite: %+v", s)
 	}
 	for _, plugin := range s.Plugins {
-		if expected[plugin.ID] != plugin.State {
-			t.Fatalf("runtime %s=%s, expected %s: %s", plugin.ID, plugin.State, expected[plugin.ID], plugin.Why)
+		if all[plugin.ID] != plugin.State {
+			t.Fatalf("runtime %s=%s, expected %s: %s", plugin.ID, plugin.State, all[plugin.ID], plugin.Why)
 		}
 	}
 }

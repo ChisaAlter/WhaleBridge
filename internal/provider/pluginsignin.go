@@ -35,7 +35,7 @@ func StartPluginSignInWith(id string, method int, inputs map[string]string, o Si
 		return SignInState{}, err
 	}
 	s.st = SignInState{ID: randomToken(9), Agent: PluginID(id), State: "waiting", Proxy: s.proxy}
-	cli, install := missingPluginCLI(id)
+	cli, install := pluginCLI(id)
 	var installing context.Context
 	if install {
 		s.st.State, s.st.Installing = "installing", cli.Name
@@ -74,8 +74,11 @@ func StartPluginSignInWith(id string, method int, inputs map[string]string, o Si
 // has no shell to run; its CLI is installed first, as a moved one's is.
 var pluginRunsCLI = map[string]bool{"grok": true}
 
-func missingPluginCLI(id string) (agentCLI, bool) {
-	// No vendor CLI probe or installer belongs to the component's sign-in.
+// pluginCLI is the vendor CLI a plugin's sign-in (OpenCode's id) runs
+// through and this machine lacks: a moved built-in's, or one in
+// pluginRunsCLI.
+func pluginCLI(id string) (agentCLI, bool) {
+	// The component never probes or installs a vendor CLI.
 	if os.Getenv("LAUNCHER_COMPONENT_ID") == "whalebridge" {
 		return agentCLI{}, false
 	}
@@ -87,6 +90,37 @@ func missingPluginCLI(id string) (agentCLI, bool) {
 	}
 	return agentCLI{}, false
 }
+
+// PluginCLIMissing is the name of the vendor CLI a plugin's sign-in runs
+// through and this machine lacks (Grok Build for Grok's), "" when there is
+// none to install. The command line's sign-in installs it first, as
+// StartPluginSignIn does; without it, `magpie plugin login grok` in Docker
+// said "install Grok Build first: curl … | bash", which the image has no
+// curl to run (#2223).
+func PluginCLIMissing(id string) string {
+	c, ok := pluginCLI(id)
+	if !ok {
+		return ""
+	}
+	return c.Name
+}
+
+// InstallPluginCLI installs the CLI PluginCLIMissing names, with its
+// vendor's installer or, where that can't run, as it installs it.
+func InstallPluginCLI(ctx context.Context, id string) error {
+	c, ok := pluginCLI(id)
+	if !ok {
+		return nil
+	}
+	if err := installCLI(ctx, c); err != nil {
+		return err
+	}
+	forgetAccountCaches()
+	return nil
+}
+
+// missingPluginCLI retains the internal component test seam.
+func missingPluginCLI(id string) (agentCLI, bool) { return pluginCLI(id) }
 
 // pluginBegin asks the plugin for the page to open and waits for the
 // sign-in to finish there, or for the code the page shows.
@@ -114,6 +148,10 @@ func (s *signInFlow) pluginBegin(id string, method int, inputs map[string]string
 		// a browser that can't reach the plugin's port here ends on a page
 		// that won't load: its address finishes it
 		s.st.PasteCallback, s.pluginPorts = true, loopbackPorts(a.URL)
+	} else if m, keys, ok := pluginKeyMethod(id); ok && m != method {
+		// its page posts where nothing can be pasted: a key made on the
+		// keys page finishes it
+		s.st.PasteKey, s.st.KeysURL, s.pluginKey = true, keys, &pluginKeyWay{id: id, method: m}
 	}
 	s.mu.Unlock()
 	if a.Method == "code" {

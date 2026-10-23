@@ -8,15 +8,27 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
 )
 
-// LeftRecord keeps a removed plugin's model picks without presenting them
-// as a subscription which still needs signing in on this computer.
+// A plugin's provider leaves a record in providers.json once the user picks
+// its models or changes a setting on it: its id, and no endpoint or key of
+// its own (OnlyPicks). Removing the plugin left that record behind, where
+// nothing listed it and `magpie provider rm` couldn't find it, and a sync
+// or a backup then asked for a sign-in to it on every run (#2057, dawn1095).
+// So removing a plugin sets its records aside, and adding it again puts
+// them back.
+
+// LeftRecord is a record set aside when the plugin it was one of was
+// removed: Package is the plugin's package name, as plugin.PackageName
+// gives it.
 type LeftRecord struct {
 	Package  string   `json:"package"`
 	Provider Provider `json:"provider"`
 }
 
-// pluginRecordIDs reads the complete cached listing, including disabled
-// plugins, without starting the host during removal.
+// pluginRecordIDs are the ids the records in providers.json that the
+// plugin spec made have: its providers' ids as magpie lists them, apart
+// from a built-in's (whose picks are the built-in's own) and one another
+// installed plugin serves too. false when the plugins' listing isn't
+// known, which sets nothing aside.
 func pluginRecordIDs(spec string) ([]string, bool) {
 	listed, ok := plugin.Listed()
 	if !ok {
@@ -43,6 +55,8 @@ func pluginRecordIDs(spec string) ([]string, bool) {
 	return ids, true
 }
 
+// installedSpec is the spec of the installed plugin named (by its spec or
+// its name, as plugin.Remove takes it), "" for none.
 func installedSpec(name string) string {
 	es := plugin.Load().Plugins
 	if i := slices.IndexFunc(es, func(e plugin.Entry) bool { return e.Spec == name }); i >= 0 {
@@ -54,8 +68,10 @@ func installedSpec(name string) string {
 	return ""
 }
 
-// setAside preserves only records with no endpoint or key of their own.
-// User-created providers which reused a plugin's id stay in place.
+// setAside moves the records with the ids given that hold only picks out
+// of providers.json's providers into its pluginLeft, under pkg. A record
+// with an endpoint or a key is the user's own provider, never the
+// plugin's, and stays where it is.
 func setAside(pkg string, ids []string) error {
 	if len(ids) == 0 {
 		return nil
@@ -82,6 +98,9 @@ func setAside(pkg string, ids []string) error {
 	return store(f)
 }
 
+// takeBackLeft puts the records set aside for the plugin spec back among the
+// providers, each one whose id has no record now; one that has (the user
+// gave the id to a provider since) stays aside.
 func takeBackLeft(spec string) error {
 	pkg := plugin.PackageName(spec)
 	f, err := read()

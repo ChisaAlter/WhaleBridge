@@ -393,13 +393,37 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 			fail(404, fmt.Sprintf("magpie knows no model %q to draw with", d.Model))
 			return
 		}
-		if keyWho, held := keyHolds(r); held && named && !modelAllowed(keyWho, p, model) {
+		g, ms, isGroup := drawingGroup(d.Model, p, model)
+		keyWho, keyHeld := keyHolds(r)
+		if keyHeld && named && (isGroup && !groupAllowed(keyWho, g, ms) || !isGroup && !modelAllowed(keyWho, p, model)) {
 			fail(403, keyModelError(keyWho, d.Model))
 			return
 		}
 		if msg, off := modelOff(p, model, d.Model); off { // disabled by the user (#1867)
 			fail(403, msg)
 			return
+		}
+		// the models to draw on, the next asked while one fails: a routing
+		// group's members in its routing's order (#2005), else the one
+		tries := []provider.Member{{Provider: p, Model: model}}
+		if isGroup {
+			var paused []provider.Paused
+			if ms, paused = provider.PausedOut(g.Live(), ms, agentOf(r), "", ruleClock()); len(ms) == 0 && len(paused) > 0 {
+				fail(503, pausedError(d.Model, paused))
+				return
+			}
+			var keeps map[string]bool
+			if keyHeld {
+				keeps = groupKeeps(keyWho, g, ms)
+			}
+			t := s.drawingTries(g, ms, keeps)
+			if len(t) == 0 && keeps != nil {
+				fail(403, keyModelError(keyWho, d.Model))
+				return
+			}
+			if len(t) > 0 {
+				tries = t
+			}
 		}
 		var unmask func()
 		w, d.Prompt, unmask, err = redactedPrompt(w, d.Prompt)
@@ -408,12 +432,34 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 			return
 		}
 		defer unmask()
+		if err != nil {
+			fail(http.StatusServiceUnavailable, err.Error())
+			return
+		}
 		call.Provider, call.To = p.ID, provider.Chat
 		ctx, cancel := context.WithTimeout(r.Context(), drawTimeout)
 		defer cancel()
 		// the account that drew, or refused last, is the one recorded
-		drew, out, code, capBack, err := s.drawOnAccounts(ctx, r, p, model, d)
+		var (
+			drew    provider.Provider
+			out     drawn
+			code    int
+			capBack time.Time
+			skipped []string
+		)
+		for i, m := range tries {
+			call.Provider, model = m.Provider.ID, m.Model
+			drew, out, code, capBack, err = s.drawOnAccounts(ctx, r, m.Provider, m.Model, d)
+			// a group's next member is asked as a chat's would be: while
+			// this one's vendor fails, is out of quota or doesn't serve the
+			// model; a refusal of the request itself is the request's
+			if err == nil || ctx.Err() != nil || i+1 == len(tries) || !retryable(code, []byte(err.Error())) {
+				break
+			}
+			skipped = append(skipped, m.Provider.ID+"/"+m.Model+": "+err.Error())
+		}
 		p = drew
+		call.Fallback = strings.Join(skipped, "; ")
 		call.Millis = time.Since(start).Milliseconds()
 		call.Status, call.Usage.Input, call.Usage.Output = code, out.Input, out.Output
 		if err == nil && len(out.Images) == 0 {
@@ -432,7 +478,11 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 			if d := time.Until(capBack); d > 0 {
 				w.Header().Set("Retry-After", strconv.Itoa(int(d.Seconds())+1))
 			}
-			writeError(w, provider.Chat, code, err.Error())
+			msg := err.Error()
+			if len(skipped) > 0 {
+				msg += " (tried first: " + call.Fallback + ")"
+			}
+			writeError(w, provider.Chat, code, msg)
 			return
 		}
 		s.record(call)
@@ -470,6 +520,62 @@ func (s *Server) images(edit bool) http.HandlerFunc {
 		}
 		writeJSON(w, 200, res)
 	}
+}
+
+// drawingGroup is the routing group a drawing names, with its members
+// ready now: by its id ("group/<id>"), or by a bare model id the group
+// goes by (provider.GroupFor) that resolved to one of its members. Any
+// other names a model on its own.
+func drawingGroup(asked string, p provider.Provider, model string) (provider.Group, []provider.Member, bool) {
+	ref := asked
+	if !strings.HasPrefix(ref, provider.GroupPrefix) {
+		gid, ok := provider.GroupFor(ref)
+		if !ok {
+			return provider.Group{}, nil, false
+		}
+		ref = gid
+	}
+	g, ms, ok := provider.FindGroup(ref)
+	if !ok || len(ms) == 0 {
+		return provider.Group{}, nil, false
+	}
+	if ref != asked && !slices.ContainsFunc(ms, func(m provider.Member) bool { return m.Provider.ID == p.ID && m.Model == model }) {
+		return provider.Group{}, nil, false
+	}
+	return g, ms, true
+}
+
+// drawingTries are a group's members to draw on, once each, in the order
+// its routing tries them for a chat (planGroup); each is gone over on its
+// own keys or accounts by drawOnAccounts. A member planning leaves out (all
+// its keys barred, say) goes last, so its refusal is the one told only
+// when every other failed too; one a calling key may not use (keeps, when
+// not nil) is never asked.
+func (s *Server) drawingTries(g provider.Group, ms []provider.Member, keeps map[string]bool) []provider.Member {
+	byRef := map[string]provider.Member{}
+	for _, m := range ms {
+		if ref := m.Provider.ID + "/" + m.Model; byRef[ref].Model == "" {
+			byRef[ref] = m
+		}
+	}
+	var out []provider.Member
+	seen := map[string]bool{}
+	add := func(ref string) {
+		m, ok := byRef[ref]
+		if !ok || seen[ref] || keeps != nil && !keeps[ref] {
+			return
+		}
+		seen[ref] = true
+		out = append(out, m)
+	}
+	cs, _ := s.planGroup(g.Live(), ms, provider.Chat)
+	for _, c := range cs {
+		add(c.p.ID + "/" + c.model)
+	}
+	for _, m := range ms {
+		add(m.Provider.ID + "/" + m.Model)
+	}
+	return out
 }
 
 func vendorSaid(text string) string {
@@ -978,6 +1084,9 @@ func (s *Server) drawImages(ctx context.Context, p provider.Provider, model stri
 	}
 	if isModelScope(p) {
 		return s.drawModelScope(ctx, p, model, d)
+	}
+	if isArk(p) {
+		return s.drawArk(ctx, p, model, d)
 	}
 	base := strings.TrimRight(p.Base(provider.Chat), "/")
 	if base == "" {

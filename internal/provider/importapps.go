@@ -1,7 +1,7 @@
 package provider
 
 // Providers another app has already set up — CC Switch, Alma, Claude Code's
-// own settings — offered for the user to bring over: each source is read
+// own settings, OpenCode's sign-ins — offered for the user to bring over: each source is read
 // (never written), every entry turned into the provider magpie would add,
 // and matched against what is already here, so the picker can say which are
 // new, which are already in, and which would take an id that is in use.
@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"io/fs"
 	"maps"
 	"net"
 	"net/url"
@@ -24,8 +25,8 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"github.com/ChisaAlter/WhaleBridge/internal/plugin"
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
+	_ "github.com/ChisaAlter/WhaleBridge/internal/sqlitedb"
 	"github.com/tidwall/jsonc"
-	_ "modernc.org/sqlite"
 )
 
 // AppSource is one app magpie can import from, with what it holds.
@@ -72,23 +73,37 @@ type AppPick struct {
 }
 
 // appReaders are the apps magpie knows, by name as the picker lists them.
+// One asked is read only when the user opens the import, never by the
+// Providers page's own look for configurations (DiscoverSources):
+// OpenCode's auth.json holds every sign-in OpenCode has, not only keys.
 var appReaders = []struct {
 	id, name string
 	path     func() string
 	read     func(path string) ([]AppImport, error)
+	asked    bool
 }{
-	{"alma", "Alma", almaPath, readAlma},
-	{"cc-switch", "CC Switch", ccSwitchPath, readCCSwitch},
-	{"claude-code", "Claude Code", claudeSettingsPath, readClaudeSettings},
-	{"codex", "Codex", codexConfigPath, readCodexConfig},
+	{"alma", "Alma", almaPath, readAlma, false},
+	{"cc-switch", "CC Switch", ccSwitchPath, readCCSwitch, false},
+	{"claude-code", "Claude Code", claudeSettingsPath, readClaudeSettings, false},
+	{"codex", "Codex", codexConfigPath, readCodexConfig, false},
+	{"opencode", "OpenCode", openCodeAuthPath, readOpenCodeAuth, true},
 }
 
-// ImportSources reads every app magpie can import from.
-func ImportSources() []AppSource {
+// ImportSources reads every app magpie can import from, as the user asked.
+func ImportSources() []AppSource { return importSources(true) }
+
+// DiscoverSources reads the apps the Providers page looks in by itself:
+// those not read only when asked.
+func DiscoverSources() []AppSource { return importSources(false) }
+
+func importSources(asked bool) []AppSource {
 	have := load().Providers
 	used := map[string]bool{} // ids across all sources, so two never collide
 	var out []AppSource
 	for _, r := range appReaders {
+		if r.asked && !asked {
+			continue
+		}
 		s := AppSource{ID: r.id, Name: r.name, Path: r.path(), Items: []AppImport{}}
 		if _, err := os.Stat(s.Path); err == nil {
 			s.Found = true
@@ -97,6 +112,10 @@ func ImportSources() []AppSource {
 				s.Error = err.Error()
 			}
 			s.Items = append(s.Items, settle(items, have, used)...) // [] rather than null when there is nothing
+		} else if !errors.Is(err, fs.ErrNotExist) {
+			// there, as far as anyone can tell, but not to be looked at: not
+			// "not found", which would say the app has nothing
+			s.Found, s.Error = true, err.Error()
 		}
 		out = append(out, s)
 	}
@@ -148,7 +167,7 @@ func ImportFromApps(picks []AppPick) ([]string, error) {
 			}
 			// a key joins a provider only at its own address: one taken
 			// to another host would be sent there
-			if h.Account != nil || !sameProvider(Provider{Key: p.Key, Chat: h.Chat, Responses: h.Responses, Anthropic: h.Anthropic, Headers: h.Headers}, p) {
+			if h.Account != nil || !sameProvider(Provider{Key: p.Key, Chat: h.Chat, Responses: h.Responses, Anthropic: h.Anthropic, Gemini: h.Gemini, Headers: h.Headers}, p) {
 				return added, errorf("%s: %s isn't at %s; add it as a provider of its own", p.Name, h.Name, hostOf(firstURL(p)))
 			}
 			if err := AddKey(it.KeyOf, p.Name, p.Key, ""); err != nil {
@@ -271,7 +290,7 @@ func settle(items []AppImport, have []Provider, used map[string]bool) []AppImpor
 				it.Status, it.Existing = "taken", h.Name
 			}
 			if it.KeyOf == "" && h.Key != "" && sameProvider(Provider{
-				Key: p.Key, Chat: h.Chat, Responses: h.Responses, Anthropic: h.Anthropic, Headers: h.Headers,
+				Key: p.Key, Chat: h.Chat, Responses: h.Responses, Anthropic: h.Anthropic, Gemini: h.Gemini, Headers: h.Headers,
 			}, *p) {
 				it.KeyOf = h.ID
 			}
@@ -435,6 +454,10 @@ func presetAt(e endpoints) (*PresetDef, *Region, bool) {
 		}
 		return hit, exact
 	}
+	// a preset whose endpoints the entry uses wins over an earlier one at
+	// the same host: OpenCode Zen's are on opencode.ai beside OpenCode Go's
+	var first *PresetDef
+	var firstNear *Region
 	for i := range presets {
 		pr := &presets[i]
 		if pr.Kind == KindLocal {
@@ -456,14 +479,13 @@ func presetAt(e endpoints) (*PresetDef, *Region, bool) {
 				near = r
 			}
 		}
-		if hit {
-			return pr, nil, false
-		}
-		if near != nil {
-			return pr, near, false
+		if first == nil && hit {
+			first = pr
+		} else if first == nil && near != nil {
+			first, firstNear = pr, near
 		}
 	}
-	return nil, nil, false
+	return first, firstNear, false
 }
 
 // ---- CC Switch -------------------------------------------------------------
@@ -509,7 +531,16 @@ func readClaudeSettings(path string) ([]AppImport, error) {
 			if b, err := os.ReadFile(filepath.Join(filepath.Dir(Path()), "stash.json")); err == nil {
 				json.Unmarshal(b, &st)
 			}
+			// what routing put aside is what stepping out would put back:
+			// the endpoint, token and main model, and with them the
+			// models of the user's own the tiers and subagents ran on
+			// (claude.env.<VAR>, internal/agent/claude.go)
 			env = map[string]any{"ANTHROPIC_BASE_URL": st["claude.base_url"], "ANTHROPIC_AUTH_TOKEN": st["claude.auth_token"], "ANTHROPIC_MODEL": st["claude.model"]}
+			for k, v := range st {
+				if name, ok := strings.CutPrefix(k, "claude.env."); ok && v != "" {
+					env[name] = v
+				}
+			}
 		}
 	}
 	base, _ := env["ANTHROPIC_BASE_URL"].(string)

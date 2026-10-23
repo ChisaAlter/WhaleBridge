@@ -177,3 +177,69 @@ func TestClaudeOwnTierStaysThroughTheMainModel(t *testing.T) {
 		})
 	}
 }
+
+// Every tier given a model of its own keeps it when the main model moves
+// onto that model and on again, picked in magpie or in Claude Code's
+// /model, whatever the tier would follow there (#2257, luokinging): a
+// fable tier given GPT-6.1 Sol, with the main model moved from K2.8
+// Preview onto GPT-6.1 Sol, read as "Same as main model", since fable
+// follows no model that is no Fable, and the main model's next move
+// took it off. A haiku tier given Opus, the main model moved onto Opus,
+// was lost the same way (haiku follows a Claude model on its Haiku).
+func TestClaudeOwnTierOnTheNewMainModelStays(t *testing.T) {
+	for _, own := range []string{"oa/gpt-6.1-sol", "anth/claude-opus-5-5"} {
+		for _, tier := range claudeTiers {
+			for _, via := range []string{"magpie", "/model"} {
+				t.Run(own+"/"+tier+"/"+via, func(t *testing.T) {
+					home, _ := codexHome(t, "", "")
+					a := claude(home)
+					if err := provider.Save(provider.Provider{ID: "anth", Name: "Anthropic", Chat: "https://api.anthropic.com/v1", Key: "k",
+						Models: []string{"claude-opus-5-5", "claude-haiku-4-5"}}); err != nil {
+						t.Fatal(err)
+					}
+					if err := provider.Save(provider.Provider{ID: "oa", Name: "OA", Chat: "https://oa.example/v1", Key: "k",
+						Models: []string{"gpt-6.1-sol", "k2.8-preview", "glm-6"}}); err != nil {
+						t.Fatal(err)
+					}
+					path := filepath.Join(home, ".claude", "settings.json")
+					bare := func(s string) string { return strings.TrimSuffix(s, "[1m]") }
+					main := func(m string) {
+						t.Helper()
+						if via == "magpie" {
+							if err := a.Apply("model", m); err != nil {
+								t.Fatal(err)
+							}
+						} else {
+							if err := edit.SetJSON(path, edit.KV{Path: "model", Value: m}); err != nil {
+								t.Fatal(err)
+							}
+							if err := a.Follow(); err != nil {
+								t.Fatal(err)
+							}
+						}
+					}
+					if err := a.Apply("model", "oa/k2.8-preview"); err != nil {
+						t.Fatal(err)
+					}
+					if err := a.Apply(tier, own); err != nil {
+						t.Fatal(err)
+					}
+					if v := a.Values(); bare(v[tier]) != own {
+						t.Fatalf("the tier given %s reads %q", own, v[tier])
+					}
+					main(own)
+					if v := a.Values(); bare(v[tier]) != own {
+						t.Fatalf("main model moved onto the tier's model: %s reads %q, not its own %s\n%s", tier, v[tier], own, readFile(path))
+					}
+					main("oa/glm-6")
+					if m, _ := edit.GetJSON(path, "env."+tierEnv(tier)); bare(m) != own {
+						t.Fatalf("main model moved on again: %s is %q, not its own %s\n%s", tier, m, own, readFile(path))
+					}
+					if v := a.Values(); bare(v[tier]) != own {
+						t.Fatalf("main model moved on again: %s reads %q", tier, v[tier])
+					}
+				})
+			}
+		}
+	}
+}

@@ -8,9 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
-	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
+	"github.com/ChisaAlter/WhaleBridge/internal/lastgood"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 )
 
@@ -47,7 +47,13 @@ func stashWrite(m map[string]string) error {
 	if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
 	}
-	keepUnreadStash(p)
+	// stashLoad reads a file that doesn't unmarshal into the stash (a JSON
+	// array too, not only one cut short) as empty: it is copied aside, and
+	// one that can't be copied isn't written over
+	if err := lastgood.KeepUnparsed(p, lastgood.Into[map[string]string]); err != nil {
+		log.Printf("stash.json wasn't written over: %v", err)
+		return err
+	}
 	// made 0600 first: WriteAtomic keeps a file's mode, and the stash holds
 	// keys
 	if f, err := os.OpenFile(p, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600); err == nil {
@@ -56,21 +62,6 @@ func stashWrite(m map[string]string) error {
 		return err
 	}
 	return edit.WriteAtomic(p, b)
-}
-
-// keepUnreadStash copies a stash.json that doesn't parse aside before it is
-// written over.
-func keepUnreadStash(path string) {
-	b, err := os.ReadFile(path)
-	if err != nil || len(b) == 0 || json.Valid(b) {
-		return
-	}
-	bad := path + ".bad-" + time.Now().Format("20060102-150405.000000000")
-	if err := os.WriteFile(bad, b, 0o600); err != nil {
-		log.Printf("stash.json doesn't parse and couldn't be kept: %v", err)
-		return
-	}
-	log.Printf("stash.json didn't parse; it is kept as %s", filepath.Base(bad))
 }
 
 func stash(kv map[string]string) {

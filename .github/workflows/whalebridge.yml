@@ -22,8 +22,10 @@ jobs:
         with:
           go-version-file: go.mod
           cache-dependency-path: go.sum
+      - run: npm install --global bun@1.4.2
       - run: node scripts/build.mjs
       - run: go test -mod=readonly ./internal/catalog ./internal/settings ./internal/provider ./internal/usage ./internal/gateway ./internal/whalebridge
+      - run: go test -mod=readonly ./internal/plugin ./internal/pluginrt ./internal/gatewayplugins ./internal/routes ./internal/gwmw ./internal/middleware ./internal/masking ./internal/netguard ./internal/backup ./internal/davsync ./internal/otlp
       - run: go test -mod=readonly ./internal/agent -run '^(TestReasonixGatewayAndRestore|TestReasonixRestoreKeepsLaterUserEdits|TestReasonixConflictsAndReadErrorsLeaveFiles|TestReasonixRestoresAbsentAndEmptyDefault|TestAsideOfflineDisconnectRestoresWithoutDaemon|TestAsideOfflineImageRestoresFullSavedObject|TestAsideBrokenProviderFileIsNeverOverwritten)$'
       - run: node scripts/qa-native.mjs
       - run: node --test scripts/sync-cnb.test.mjs
@@ -59,5 +61,9 @@ jobs:
             echo "Component version already published"
             exit 0
           fi
-          printf '鲸桥 %s。默认接入鲸屿，也支持其他 Agent；源码、版本和组件发布独立维护。\n' "$version" > component-notes.txt
-          gh release create "$tag" component/WhaleBridge-win32-x64.exe component/WhaleBridge-component.json --target "$GITHUB_SHA" --title "鲸桥 $version" --notes-file component-notes.txt
+          notes="docs/releases/$version.md"
+          if [ ! -f "$notes" ]; then
+            printf '鲸Bridge %s。默认接入鲸屿，也支持其他 Agent；源码、版本和组件发布独立维护。\n' "$version" > component-notes.txt
+            notes=component-notes.txt
+          fi
+          gh release create "$tag" component/WhaleBridge-win32-x64.exe component/WhaleBridge-component.json --target "$GITHUB_SHA" --title "鲸Bridge $version" --notes-file "$notes"

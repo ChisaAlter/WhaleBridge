@@ -121,7 +121,7 @@ func Snapshot() (*Setup, error) {
 		return nil, err
 	}
 	s := &Setup{
-		Instructions: SetupInstructions{Set: l.active(), Shared: readText(l.sharedPath()), Agents: slices.Clone(l.Instructions.Agents), Extra: extras()},
+		Instructions: SetupInstructions{Set: l.active(), Shared: setText(l.sharedPath()), Agents: slices.Clone(l.Instructions.Agents), Extra: extras()},
 		MCP:          map[string][]string{},
 		Skills:       map[string][]string{},
 	}
@@ -154,7 +154,7 @@ func Holds(s *Setup) bool {
 	if l.hasSet(s.Instructions.Set) && l.active() != s.Instructions.Set {
 		return false
 	}
-	if readText(l.sharedPath()) != strings.TrimSpace(s.Instructions.Shared) {
+	if setText(l.sharedPath()) != strings.TrimSpace(s.Instructions.Shared) {
 		return false
 	}
 	for id, text := range extras() {

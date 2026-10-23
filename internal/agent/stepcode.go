@@ -313,6 +313,8 @@ func stepcodeIn(at place) *Agent {
 	authPath := filepath.Join(dir, "auth.json")
 
 	block := theirsKept(modelsPath, "providers."+magpieID, func() any { return stepcodeProvider(at) }, "models")
+	// the entries of enabledModels a sync took out (scope_gone.go)
+	gone := at.key("stepcode.scope.gone")
 
 	startup := func() string {
 		curTOML, err := readStepcodeTOML(path)
@@ -422,6 +424,7 @@ func stepcodeIn(at place) *Agent {
 			}
 		}
 
+		forget(gone)
 		return stepcodeStoreState(at, nil)
 	}
 
@@ -469,11 +472,17 @@ func stepcodeIn(at place) *Agent {
 			if err := stepcodeValidateModels(modelsPath); err != nil {
 				return err
 			}
-			return syncJSON(modelsPath, "providers."+magpieID, block)
+			if err := syncJSON(modelsPath, "providers."+magpieID, block); err != nil {
+				return err
+			}
+			// an entry on a model magpie no longer gives StepCode names
+			// nothing (#2055, scope_gone.go)
+			return stepcodeScopeSynced(at, path, modelsPath, gone)
 		},
 		// enabledModels names models beyond the one field, as omp's list
 		// does: a provider renamed has to take those entries with it
 		RenameRefs: func(from, to string) (bool, error) {
+			scopeGoneRename(gone, from, to)
 			return stepcodeRenameRefs(at, path, from, to)
 		},
 		Fields: []Field{

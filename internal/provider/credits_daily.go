@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/filememo"
+	"github.com/ChisaAlter/WhaleBridge/internal/lastgood"
 )
 
 // DailyCredits is what an account's credits went to day by day.
@@ -170,6 +171,11 @@ func noteDailyCredits(qs []SubscriptionQuota, now time.Time) {
 	}
 	b, err := json.MarshalIndent(accts, "", "  ")
 	if err != nil {
+		return
+	}
+	// parseCredits reads a file that doesn't parse as no days: it is kept
+	// aside before it is written over, and not written over when it can't be
+	if lastgood.KeepUnparsed(path, lastgood.Into[map[string]*creditsAccount]) != nil {
 		return
 	}
 	_ = os.MkdirAll(filepath.Dir(path), 0o700)

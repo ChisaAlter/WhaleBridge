@@ -3,12 +3,15 @@ package sessions
 import (
 	"bytes"
 	"encoding/json"
+	"log"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/lastgood"
 )
 
 // Sessions in WSL. On Windows an agent installed in a WSL distro keeps its
@@ -243,7 +246,12 @@ func wslList(gen uint64, done chan struct{}) {
 	}
 	if b != nil && !bytes.Equal(b, wslSess.kept) {
 		p := wslListPath()
-		if os.MkdirAll(filepath.Dir(p), 0o755) == nil {
+		// wslFiles reads a file that doesn't parse as no listing: it is
+		// copied aside before this one goes over it, and one that can't be
+		// copied isn't written over (#2263)
+		if err := lastgood.KeepUnparsed(p, lastgood.Into[map[string]*wslListing]); err != nil {
+			log.Printf("sessions-wsl.json wasn't written over: %v", err)
+		} else if os.MkdirAll(filepath.Dir(p), 0o755) == nil {
 			tmp := p + ".tmp"
 			if os.WriteFile(tmp, b, 0o644) == nil && os.Rename(tmp, p) == nil {
 				wslSess.kept = b

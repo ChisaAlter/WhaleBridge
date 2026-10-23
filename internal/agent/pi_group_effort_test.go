@@ -15,9 +15,9 @@ import (
 // Plan's deepseek-v4-pro-202606 that nothing magpie reads knows) was
 // written the group without reasoning, so its /thinking offered off alone,
 // while magpie's thinking field offered every level and showed max — which
-// Pi clamped to off, sending no reasoning_effort. The group now has its
-// known member's levels, Pi's entry offers them, and magpie's field offers
-// what Pi offers for the model and shows the level Pi runs it at.
+// Pi clamped to off, sending no reasoning_effort. The group now gets the
+// levels verified for TokenHub's model, so Pi and magpie offer the same
+// levels instead of borrowing DeepSeek's unverified off level.
 func TestPiGroupThinkingIsWhatPiRuns(t *testing.T) {
 	home := syncHome(t)
 	if err := os.WriteFile(catalog.CachePath(), []byte(`{

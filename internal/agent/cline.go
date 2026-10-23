@@ -177,7 +177,7 @@ func clineIn(at place) *Agent {
 					return err
 				}
 			}
-			return syncJSON(models, "providers."+clineSlot, func() any { return clineModelsAt(get(slot+".settings.model"), at.v1()) })
+			return syncJSON(models, "providers."+clineSlot, func() any { return clineKept(models, clineModelsAt(get(slot+".settings.model"), at.v1())) })
 		},
 		Notice: func() string {
 			if runtime.GOOS == "windows" {
@@ -233,7 +233,7 @@ func clineIn(at place) *Agent {
 						})
 					}
 					if err := clineWrite(models, `{"version":1,"providers":{}}`,
-						edit.KV{Path: "providers." + clineSlot, Value: clineModelsAt(ref, at.v1())}); err != nil {
+						edit.KV{Path: "providers." + clineSlot, Value: clineKept(models, clineModelsAt(ref, at.v1()))}); err != nil {
 						return err
 					}
 					if err := wireState(ref); err != nil {
@@ -396,6 +396,39 @@ func clineModelsAt(model, v1 string) map[string]any {
 		"provider": map[string]any{"name": "magpie", "baseUrl": v1, "defaultModelId": model},
 		"models":   ms,
 	}
+}
+
+// clineKept is magpie's entry want laid over the one in Cline's models.json
+// at path. What the user set there stays (#2030): a key of the provider's
+// beside its name, address and default model (protocol, client,
+// capabilities, modelsSourceUrl), and on each of magpie's models what
+// magpie doesn't write, such as an override from the VS Code extension's
+// model editor (temperature, prices, apiFormat, supportsVision;
+// sdk/packages/core/src/services/providers/local-provider-registry.ts). A
+// model magpie no longer lists goes, with what was set on it.
+func clineKept(path string, want map[string]any) any {
+	cur, ok := edit.GetJSON(path, "providers."+clineSlot)
+	if !ok {
+		return want
+	}
+	var have map[string]any
+	if json.Unmarshal([]byte(cur), &have) != nil || have == nil {
+		return want
+	}
+	hm, _ := have["models"].(map[string]any)
+	wm, _ := want["models"].(map[string]any)
+	ms := make(map[string]any, len(wm))
+	for id, w := range wm {
+		h, _ := hm[id].(map[string]any)
+		if h == nil {
+			ms[id] = w
+			continue
+		}
+		ms[id] = mergeKept(h, w.(map[string]any), nil)
+	}
+	out := mergeKept(have, want, []string{"models"})
+	out["models"] = ms
+	return out
 }
 
 // providersEmpty is a providers.json with nothing in it.

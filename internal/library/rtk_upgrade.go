@@ -347,7 +347,10 @@ func rtkUpgrader(bin string) []string {
 		}
 	case dir == filepath.Join(home(), ".cargo", "bin"):
 		if have("cargo") {
-			return []string{"cargo", "install", "--git", "https://github.com/rtk-ai/rtk", "--force"}
+			// the package named: rtk-ai/rtk keeps proxy/ (rtk-proxy) beside
+			// rtk, and cargo install --git scans every Cargo.toml in the
+			// repository and won't choose between their binaries (#2328)
+			return []string{"cargo", "install", "--git", "https://github.com/rtk-ai/rtk", "rtk", "--force"}
 		}
 	case !rtkOnWindows:
 		// its own script, told the folder it is in (RTK_INSTALL_DIR): the

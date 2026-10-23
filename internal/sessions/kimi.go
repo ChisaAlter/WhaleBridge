@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -20,7 +21,9 @@ import (
 //
 //   - title, a name the user gave when isCustomTitle is true (or titleKind
 //     is "custom", or an old customTitle is set), else Kimi's own;
-//   - cwd, or workDir before protocol 1.5;
+//   - cwd, or workDir before protocol 1.5; a state.json with neither (an
+//     early 1.4 session, one migrated from the Python kimi-cli) has its
+//     folder in session_index.jsonl at the root of Kimi's home (#2103);
 //   - createdAt and updatedAt, epoch milliseconds from 1.5 on, RFC 3339
 //     strings before;
 //   - forkedFrom, the session a fork was made from.
@@ -101,6 +104,46 @@ func kimiStateOf(wire string) (kimiState, bool) {
 	return st, err == nil && json.Unmarshal(b, &st) == nil
 }
 
+// kimiIndex is Kimi Code's session_index.jsonl, read again only when it
+// changes. Kimi documents it (docs/en/configuration/data-locations.md): a
+// line a session, {"sessionId","sessionDir","workDir"}, at the root of its
+// home beside sessions/.
+var kimiIndex struct {
+	sync.Mutex
+	path     string
+	size     int64
+	modified time.Time
+	workDirs map[string]string
+}
+
+// kimiIndexedWorkDir is the folder session_index.jsonl gives the session a
+// main wire file is in, for a state.json that names none (#2103,
+// infinitr0us). "" when the index has no line for it.
+func kimiIndexedWorkDir(wire string) string {
+	dir := filepath.Dir(filepath.Dir(filepath.Dir(wire)))
+	path := filepath.Join(filepath.Dir(filepath.Dir(filepath.Dir(dir))), "session_index.jsonl")
+	fi, err := os.Stat(path)
+	if err != nil {
+		return ""
+	}
+	kimiIndex.Lock()
+	defer kimiIndex.Unlock()
+	if kimiIndex.path != path || kimiIndex.size != fi.Size() || !kimiIndex.modified.Equal(fi.ModTime()) {
+		workDirs := map[string]string{}
+		scan(path, 0, func(b []byte) {
+			var l struct {
+				SessionID string `json:"sessionId"`
+				WorkDir   string `json:"workDir"`
+			}
+			if json.Unmarshal(b, &l) == nil && l.SessionID != "" && l.WorkDir != "" {
+				workDirs[l.SessionID] = l.WorkDir
+			}
+		})
+		kimiIndex.path, kimiIndex.size, kimiIndex.modified, kimiIndex.workDirs = path, fi.Size(), fi.ModTime(), workDirs
+	}
+	return kimiIndex.workDirs[filepath.Base(dir)]
+}
+
 // names are the user's name for the session and Kimi's own, as Kimi's
 // normalizeSessionTitle tells them apart.
 func (st kimiState) names() (custom, named string) {
@@ -166,7 +209,7 @@ func parseKimi(f file) *state {
 			since = created
 		}
 		if f.main {
-			s.Cwd = cmp.Or(st.Cwd, st.WorkDir)
+			s.Cwd = cmp.Or(st.Cwd, st.WorkDir, kimiIndexedWorkDir(f.path))
 			s.Custom, s.Named = st.names()
 			s.Custom, s.Named = title(s.Custom), title(s.Named)
 			s.saw(created, true)

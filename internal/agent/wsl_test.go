@@ -185,6 +185,7 @@ func fakeWSL(t *testing.T, installed, running string, probes, roots map[string]s
 	run, root := wslRun, wslRoot
 	reset := func() {
 		wsl.seen, wsl.at, wsl.runAt, wsl.names, wsl.running, wsl.dirty = nil, time.Time{}, time.Time{}, nil, nil, false
+		wsl.runOK = false
 	}
 	t.Cleanup(func() { wslRun, wslRoot = run, root; reset() })
 	reset()
@@ -317,6 +318,46 @@ func TestWSLListFails(t *testing.T) {
 // (wsl --shutdown): its fields shown, the catalog synced, its check, the
 // requests it made. None of them opens the stopped distro, which would
 // start it: its fields read as last seen, and the next look neither probes
+// #2341: wsl.exe failing to say which distros run (a hung WSL times out
+// after 10s, under wsl's lock) is asked again only after
+// wslRunningFailedAge, not every wslRunningAge; an answer still lasts only
+// wslRunningAge.
+func TestWSLRunningFailedKept(t *testing.T) {
+	fakeWSL(t, "Ubuntu\r\n", "", nil, nil)
+	asks := 0
+	var err error
+	wslRun = func(_ time.Duration, args ...string) ([]byte, error) {
+		if strings.Join(args, " ") != "-l --running -q" {
+			t.Fatalf("wsl.exe %v", args)
+		}
+		asks++
+		return utf16le("Ubuntu\r\n", true), err
+	}
+	aged := func(d time.Duration) {
+		wsl.Lock()
+		wsl.runAt = time.Now().Add(-d)
+		wsl.Unlock()
+	}
+	err = errors.New("timed out")
+	if wslUp("Ubuntu") || asks != 1 {
+		t.Fatalf("failed: up, %d asks", asks)
+	}
+	aged(wslRunningAge + time.Second)
+	if wslUp("Ubuntu") || asks != 1 {
+		t.Fatalf("a failure was asked again after %v: %d asks", wslRunningAge, asks)
+	}
+	aged(wslRunningFailedAge + time.Second)
+	err = nil
+	if !wslUp("Ubuntu") || asks != 2 {
+		t.Fatalf("after %v: %d asks", wslRunningFailedAge, asks)
+	}
+	aged(wslRunningAge + time.Second)
+	wslUp("Ubuntu")
+	if asks != 3 {
+		t.Fatalf("an answer was kept past %v: %d asks", wslRunningAge, asks)
+	}
+}
+
 // nor opens it.
 func TestWSLStoppedSinceNotOpened(t *testing.T) {
 	codexHome(t, "", "")

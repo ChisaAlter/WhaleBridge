@@ -52,7 +52,7 @@ const mcodeGateway = "custom_provider:magpie"
 // its message_id, and Calls counts an id once.
 func minimaxCallFiles() []file {
 	var out []file
-	filepath.WalkDir(minimaxSessions(), func(p string, d os.DirEntry, err error) error {
+	walkLinked(minimaxSessions(), func(p string, d os.DirEntry, err error) error {
 		if err != nil || d.IsDir() {
 			return nil
 		}

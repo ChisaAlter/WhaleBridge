@@ -3,9 +3,14 @@ package gatewayplugins
 import (
 	"path/filepath"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/access"
+	"github.com/ChisaAlter/WhaleBridge/internal/budget"
+	"github.com/ChisaAlter/WhaleBridge/internal/gwbudget"
 	"github.com/ChisaAlter/WhaleBridge/internal/gwmw"
+	"github.com/ChisaAlter/WhaleBridge/internal/gwtool"
 	"github.com/ChisaAlter/WhaleBridge/internal/masking"
 	"github.com/ChisaAlter/WhaleBridge/internal/middleware"
+	"github.com/ChisaAlter/WhaleBridge/internal/otlp"
 	"github.com/ChisaAlter/WhaleBridge/internal/pluginrt"
 	"github.com/ChisaAlter/WhaleBridge/internal/provider"
 	"github.com/ChisaAlter/WhaleBridge/internal/routes"
@@ -17,6 +22,28 @@ import (
 // no upstream GUI, LAN listener, native account switcher or blanket plugins/all.
 func Manifests() []pluginrt.Manifest {
 	return []pluginrt.Manifest{
+		{ID: "groups", API: "^1", Requires: []string{"gateway", "providers"}, Essential: true,
+			InUse: provider.NamedGroups,
+			Apply: func(c *pluginrt.Ctx) error { c.OnRetire(provider.ServeGroups()); return nil }},
+		{ID: "search", API: "^1", Requires: []string{"gateway"}, Essential: true,
+			Apply: func(c *pluginrt.Ctx) error { c.OnRetire(gwtool.Serve(gwtool.WebSearch)); return nil }},
+		{ID: "tools", API: "^1", Requires: []string{"gateway"}, Essential: true,
+			Apply: func(c *pluginrt.Ctx) error { c.OnRetire(gwtool.Serve(gwtool.PluginTools)); return nil }},
+		{ID: "budget", API: "^1", Requires: []string{"gateway"}, Essential: true,
+			InUse: func() (int, error) {
+				keys, err := access.List()
+				if err != nil {
+					return 0, err
+				}
+				n := 0
+				for _, key := range keys {
+					if len(key.Limits()) > 0 {
+						n++
+					}
+				}
+				return n, nil
+			},
+			Apply: func(c *pluginrt.Ctx) error { c.OnRetire(gwbudget.Limit(budget.Limiter{})); return nil }},
 		{ID: "rotation", API: "^1", Requires: []string{"gateway", "providers"}, Essential: true,
 			InUse: func() (int, error) {
 				names, err := provider.Routings()
@@ -72,6 +99,6 @@ func Manifests() []pluginrt.Manifest {
 				}
 				return 0, nil
 			},
-			Apply: func(c *pluginrt.Ctx) error { c.OnDispose(usage.StartOTel()); return nil }},
+			Apply: func(c *pluginrt.Ctx) error { c.OnRetire(usage.Observe(otlp.New())); return nil }},
 	}
 }

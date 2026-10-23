@@ -133,7 +133,6 @@ func TestVolcengineEmbeddingResponses(t *testing.T) {
 	}
 }
 
-
 func TestRerankGoesToTheModelsProvider(t *testing.T) {
 	s, l := shelved(t)
 	code, raw := postRetrieval(t, s, "/v1/rerank", `{"model":"lib/rerank-1","query":"magpie","documents":["a crow","a magpie"],"top_n":2,"return_documents":true}`)

@@ -109,6 +109,15 @@ func captureMasking(ctx context.Context) (context.Context, error) {
 	}
 	return context.WithValue(ctx, maskingContextKey{}, capturedMasker{m}), nil
 }
+
+func maskTextWith(m gwmw.Masker, text string) (string, int, error) {
+	if m == nil {
+		return text, 0, nil
+	}
+	out, err := gwmw.Safely(func() maskingOutput[string] { value, count := m.Text(text); return maskingOutput[string]{value, count} })
+	return out.value, out.count, err
+}
+
 func maskedQuery(query string, p *provider.Provider) (string, error) {
 	return maskedQueryIn(context.Background(), query, p)
 }

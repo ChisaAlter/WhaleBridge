@@ -127,6 +127,35 @@ func Keep(path string, valid Valid, perm fs.FileMode) error {
 	return err
 }
 
+// Into is a file that unmarshals into a T: what a reader that takes any
+// other file as empty can read. `[]` is valid JSON but not a map, so a
+// reader of a map would see nothing in it.
+func Into[T any](b []byte) bool {
+	var v T
+	return json.Unmarshal(b, &v) == nil
+}
+
+// KeepUnparsed is called before path is written over, by a writer whose
+// reader takes a file that doesn't parse (parses false) as empty: such a
+// file is copied aside (KeepBad) first, so the write of what was read as
+// empty doesn't lose what it held. A file not there, or empty, needs
+// nothing. An error stops the write: the file there couldn't be read, or
+// couldn't be kept.
+func KeepUnparsed(path string, parses Valid) error {
+	b, err := steady.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if len(bytes.TrimSpace(b)) == 0 || parses(b) {
+		return nil
+	}
+	_, err = KeepBad(path, b)
+	return err
+}
+
 // now is time.Now; a test stands in for it.
 var now = time.Now
 

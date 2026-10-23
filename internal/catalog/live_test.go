@@ -269,3 +269,43 @@ func TestFetchOpenRouterNames(t *testing.T) {
 		}
 	}
 }
+
+// A relay names Gemini's image models for what they are called, not for
+// what Google ships: "Nano Banana 2.1" and its spellings draw, though no
+// word of Google's own ids is in them (#2071). A model the list says
+// nothing of stays in the chat list, where the user marks what it makes
+// (#1399).
+func TestFetchRelayDrawerNames(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `{"data":[
+			{"id":"Nano Banana 2.1"},
+			{"id":"nano-banana-pro"},
+			{"id":"NanoBanana2"},
+			{"id":"gemini-3-pro-image-preview"},
+			{"id":"omni_flash-10s"},
+			{"id":"claude-sonnet-4-5"}]}`)
+	}))
+	defer srv.Close()
+	ms, err := FetchURL(context.Background(), srv.URL+"/v1/models", "", false, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	draws, chat := map[string]bool{}, map[string]bool{}
+	for _, m := range ms {
+		if m.Films {
+			t.Errorf("%s: films, which nothing here said", m.ID)
+		} else if m.Draws {
+			draws[m.ID] = true
+		} else {
+			chat[m.ID] = true
+		}
+	}
+	for _, id := range []string{"gemini-3-pro-image-preview", "Nano Banana 2.1", "nano-banana-pro", "NanoBanana2"} {
+		if !draws[id] {
+			t.Errorf("%s: not a drawer", id)
+		}
+	}
+	if !chat["omni_flash-10s"] || !chat["claude-sonnet-4-5"] {
+		t.Errorf("the chat list lost a model: omni_flash-10s %v, claude-sonnet-4-5 %v", chat["omni_flash-10s"], chat["claude-sonnet-4-5"])
+	}
+}

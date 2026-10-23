@@ -217,7 +217,9 @@ func mimoSignedInWith(ctx context.Context, p mimoPassed, deviceID string) (strin
 	if err != nil {
 		return "", err
 	}
-	if err := addSideLogin(savedLogin{Agent: MiMoID, User: who, Auth: auth}, "", func(savedLogin) {}); err != nil {
+	if err := keepLogin(ctx, func() error {
+		return addSideLogin(savedLogin{Agent: MiMoID, User: who, Auth: auth}, "", func(savedLogin) {})
+	}); err != nil {
 		return "", err
 	}
 	// signed in again: whatever Xiaomi refused before is over

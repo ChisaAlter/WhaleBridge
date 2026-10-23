@@ -129,9 +129,30 @@ func (s *Server) serveDecisionGroup(w http.ResponseWriter, r *http.Request, body
 		writeError(w, provider.Chat, http.StatusServiceUnavailable, fmt.Sprintf("no key or account of the group %s's decision models may serve them now", g.Name))
 		return
 	}
+	s.serveDecideTries(w, r, body, asked, start, cs, pl, groupRef(g, ms))
+}
+
+// decideKeys are a decision provider's keys or accounts that may be asked
+// model, in its own routing's order (Smart, In order, In turn…), those
+// resting after a failure behind the rest — planned as a chat's are, its
+// fallbacks left out: a provider of several keys asked by itself, as a
+// group's classifier or at /v1/systemone, fails over among them as a
+// decision group's members do (fflake33 on Discord: a TypeSafe Jev key
+// out of quota was asked on every turn, the next never).
+func (s *Server) decideKeys(p provider.Provider, model string) ([]candidate, planned) {
+	p.Fallback = nil
+	return s.plan(p, model, provider.Chat)
+}
+
+// serveDecideTries answers a System One request with cs, a decision
+// group's keys and accounts or one decision provider's, each in turn until
+// one answers, the last one's answer passed on: one that fails as a chat's
+// try would rests, and every try is a Try of one route (group is the
+// group it was asked by, nil for a provider).
+func (s *Server) serveDecideTries(w http.ResponseWriter, r *http.Request, body []byte, asked string, start time.Time, cs []candidate, pl planned, group *GroupRef) {
 	who := callerOf(r)
 	tr := s.trace.beginFor(r, Route{Time: start, Agent: who.agent, Session: sessionOf(r.Header), Model: asked, Provider: cs[0].p.ID,
-		Group: groupRef(g, ms), Order: pl.order, Left: pl.left})
+		Group: group, Order: pl.order, Left: pl.left})
 	var skipped []string
 	for i, c := range cs {
 		last := i == len(cs)-1
@@ -255,10 +276,30 @@ func (s *Server) askDecisionGroup(model string, intents []string, prev before, e
 	if len(cs) == 0 {
 		return verdict{}, true, fmt.Errorf("no decision model of the group %s can be asked now", g.Name)
 	}
+	v, err = s.askDecideTries(cs, intents, prev, effort, text)
+	return v, true, err
+}
+
+// askDecider is askClassifier for one decision provider's model: its keys
+// or accounts in its routing's order (decideKeys), each asked until one
+// answers, as a decision group's are.
+func (s *Server) askDecider(p provider.Provider, model string, intents []string, prev before, effort bool, text string) (verdict, error) {
+	cs, _ := s.decideKeys(p, model)
+	cs = probeOne(cs) // of those resting, only the one back soonest (#1799)
+	if len(cs) == 0 {
+		return verdict{}, fmt.Errorf("no key or account of %s may be asked %s now", p.Name, model)
+	}
+	return s.askDecideTries(cs, intents, prev, effort, text)
+}
+
+// askDecideTries asks each of cs as Jev is (askJev) until one answers, the
+// one that failed resting as it would for a chat; the last one's error
+// when none does.
+func (s *Server) askDecideTries(cs []candidate, intents []string, prev before, effort bool, text string) (v verdict, err error) {
 	for _, c := range cs {
 		if v, err = s.askJev(c.p, c.model, intents, prev, effort, text); err == nil {
 			servedCandidate(c, 0)
-			return v, true, nil
+			return v, nil
 		}
 		var refused decideRefused
 		var answer answerError
@@ -271,5 +312,5 @@ func (s *Server) askDecisionGroup(model string, intents []string, prev before, e
 			s.decideFailed(c, http.StatusBadGateway, nil, []byte(err.Error()))
 		}
 	}
-	return verdict{}, true, err
+	return verdict{}, err
 }

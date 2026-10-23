@@ -46,6 +46,7 @@ var bunSums = map[string]string{
 	"bun-linux-aarch64-musl.zip":         "71760b6c8ea30623b81a4907cb815d48e2ea266f2e73e751534a44a0607950df",
 	"bun-linux-x64-musl-baseline.zip":    "76e1db84e98f22f78de0a87e309bfbbf297732847f9720db36750646c85c8c18",
 	"bun-windows-x64-baseline.zip":       "78c221c2376f79731ccf4e4af0b3bb46d81fefa3296c5abee09ad8a1b21e68c6",
+	"bun-windows-aarch64.zip":            "a7a16b876a305fd1029c66dbd27007b4f6112ae896532f675878731a21e50cfd",
 	"bun-linux-aarch64-android.zip":      "a1c7e2983f1bb65146beb256a4d72449f23042412bc2cf278aa6397ba27e0274",
 	"bun-linux-x64-android-baseline.zip": "fe36d8d4795e0eadc22fb6696d44d168491c2e5b9b7cbb12b8c96b0c0c40a4f9",
 }
@@ -71,7 +72,8 @@ var bunPlatform = func() (goos, goarch string, musl bool) {
 
 // bunTarget is the name of Bun's build for this machine: bun-darwin-aarch64
 // and the like. x64 Linux and Windows get the baseline build, which runs
-// on CPUs without AVX2 as well; a musl Linux gets the musl build.
+// on CPUs without AVX2 as well; arm64 has no baseline build, on Windows
+// either; a musl Linux gets the musl build.
 func bunTarget() (string, error) {
 	return bunTargetFor(bunPlatform())
 }
@@ -99,9 +101,7 @@ func bunTargetFor(goos, goarch string, musl bool) (string, error) {
 		}
 		return t, nil
 	case "windows":
-		if arch != "x64" {
-			return "", fmt.Errorf("Bun has no build for windows/%s", goarch)
-		}
+		// Windows on ARM has Bun's native bun-windows-aarch64 (#2183)
 	default:
 		return "", fmt.Errorf("Bun has no build for %s", goos)
 	}

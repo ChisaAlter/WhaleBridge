@@ -26,13 +26,20 @@ func deepseekToolPatterns(p provider.Provider, to provider.Protocol, body []byte
 	if !bytes.Contains(body, []byte(`\\0`)) {
 		return body
 	}
+	return toolPatterns(body, unicodeNullEscape)
+}
+
+// toolPatterns is body with fix applied to every "pattern" of its tools'
+// schemas, each spliced in place so the rest of the body stays byte for
+// byte as it came.
+func toolPatterns(body []byte, fix func(string) string) []byte {
 	toolsRes := gjson.GetBytes(body, "tools")
 	if !toolsRes.Exists() || toolsRes.Index <= 0 || !toolsRes.IsArray() {
 		return body
 	}
 
 	var targets []patternTarget
-	collectNullPatterns(toolsRes, false, &targets)
+	collectPatterns(toolsRes, false, fix, &targets)
 	if len(targets) == 0 {
 		return body
 	}
@@ -63,7 +70,7 @@ type patternTarget struct {
 	replacement string
 }
 
-func collectNullPatterns(node gjson.Result, inSchema bool, targets *[]patternTarget) {
+func collectPatterns(node gjson.Result, inSchema bool, fix func(string) string, targets *[]patternTarget) {
 	if !node.Exists() {
 		return
 	}
@@ -74,7 +81,7 @@ func collectNullPatterns(node gjson.Result, inSchema bool, targets *[]patternTar
 				if k == "pattern" && value.Type == gjson.String && value.Index > 0 {
 					var pattern string
 					if err := json.Unmarshal([]byte(value.Raw), &pattern); err == nil {
-						if norm := unicodeNullEscape(pattern); norm != pattern {
+						if norm := fix(pattern); norm != pattern {
 							*targets = append(*targets, patternTarget{
 								index:       value.Index,
 								rawLen:      len(value.Raw),
@@ -87,25 +94,25 @@ func collectNullPatterns(node gjson.Result, inSchema bool, targets *[]patternTar
 				case "properties", "$defs", "definitions", "dependentSchemas", "patternProperties":
 					if value.IsObject() {
 						value.ForEach(func(_, schema gjson.Result) bool {
-							collectNullPatterns(schema, true, targets)
+							collectPatterns(schema, true, fix, targets)
 							return true
 						})
 					}
 				case "items", "additionalProperties", "contains", "propertyNames", "not", "if", "then", "else", "allOf", "anyOf", "oneOf", "prefixItems", "unevaluatedProperties", "unevaluatedItems", "contentSchema":
-					collectNullPatterns(value, true, targets)
+					collectPatterns(value, true, fix, targets)
 				}
 			} else {
 				if k == "input_schema" || k == "parameters" {
-					collectNullPatterns(value, true, targets)
+					collectPatterns(value, true, fix, targets)
 				} else if k == "function" {
-					collectNullPatterns(value, false, targets)
+					collectPatterns(value, false, fix, targets)
 				}
 			}
 			return true
 		})
 	} else if node.IsArray() {
 		node.ForEach(func(_, item gjson.Result) bool {
-			collectNullPatterns(item, inSchema, targets)
+			collectPatterns(item, inSchema, fix, targets)
 			return true
 		})
 	}
@@ -138,29 +145,6 @@ func encodeJSONStringNoHTMLEscape(s string) string {
 	return b.String()
 }
 
-// deepseekTokenField renames the top-level output key DeepSeek otherwise
-// ignores, preserving all other bytes, including mentions in user messages.
-func deepseekTokenField(p provider.Provider, to provider.Protocol, body []byte) []byte {
-	if to != provider.Chat || p.Preset != "deepseek" && provider.HostOf(p.Base(to)) != "api.deepseek.com" {
-		return body
-	}
-	if !bytes.Contains(body, []byte(`"max_completion_tokens"`)) || gjson.GetBytes(body, "max_tokens").Exists() {
-		return body
-	}
-	v := gjson.GetBytes(body, "max_completion_tokens")
-	if !v.Exists() || v.Index <= 0 {
-		return body
-	}
-	key := bytes.LastIndex(body[:v.Index], []byte(`"max_completion_tokens"`))
-	if key < 0 || strings.Trim(string(body[key+len(`"max_completion_tokens"`):v.Index]), " \t\r\n:") != "" {
-		return body
-	}
-	out := make([]byte, 0, len(body))
-	out = append(out, body[:key]...)
-	out = append(out, `"max_tokens"`...)
-	return append(out, body[key+len(`"max_completion_tokens"`):]...)
-}
-
 func unicodeNullEscape(pattern string) string {
 	var out strings.Builder
 	for i := 0; i < len(pattern); i++ {
@@ -180,4 +164,35 @@ func unicodeNullEscape(pattern string) string {
 		i++
 	}
 	return out.String()
+}
+
+// deepseekTokenField names a chat request's reply length max_tokens, the
+// field DeepSeek's chat API reads: it has no max_completion_tokens and
+// ignores one, so a client that asks OpenAI's way (DSH's pi-ai with a
+// custom provider) got DeepSeek's default, 8K without thinking (#2355).
+// Only the key is renamed, in place, so the rest of the body keeps its
+// bytes. A request that names max_tokens too goes as it is, since
+// DeepSeek reads that one. Another vendor's chat API is left alone:
+// OpenAI's and Azure's want max_completion_tokens.
+func deepseekTokenField(p provider.Provider, to provider.Protocol, body []byte) []byte {
+	if to != provider.Chat || p.Preset != "deepseek" && provider.HostOf(p.Base(to)) != "api.deepseek.com" {
+		return body
+	}
+	if !bytes.Contains(body, []byte(`"max_completion_tokens"`)) || gjson.GetBytes(body, "max_tokens").Exists() {
+		return body
+	}
+	v := gjson.GetBytes(body, "max_completion_tokens")
+	if !v.Exists() || v.Index <= 0 {
+		return body
+	}
+	// the key is the last string before its value: only a colon and
+	// spaces lie between them
+	key := bytes.LastIndex(body[:v.Index], []byte(`"max_completion_tokens"`))
+	if key < 0 || strings.Trim(string(body[key+len(`"max_completion_tokens"`):v.Index]), " \t\r\n:") != "" {
+		return body
+	}
+	out := make([]byte, 0, len(body))
+	out = append(out, body[:key]...)
+	out = append(out, `"max_tokens"`...)
+	return append(out, body[key+len(`"max_completion_tokens"`):]...)
 }

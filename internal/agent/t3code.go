@@ -31,15 +31,18 @@ package agent
 // The settings environment (~/.claude/settings.json's env) is applied over
 // the process', so a Claude Code routed elsewhere in its own settings
 // takes its requests there; one routed through magpie or not routed at all
-// asks the gateway.
+// asks the gateway. A provider switch on there (CLAUDE_CODE_USE_BEDROCK, …)
+// takes it to that cloud, which Check says.
 
 import (
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strings"
 
+	"github.com/ChisaAlter/WhaleBridge/internal/agentenv"
 	"github.com/ChisaAlter/WhaleBridge/internal/appdir"
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
@@ -66,18 +69,26 @@ func t3code(home string) *Agent {
 		// found by its bundle. No command: `t3` is a common name.
 		detect: func() bool { return isDir(base) || t3App(home) },
 		Sync: func() error {
-			return syncJSON(path, t3Instance, func() any { return t3InstanceJSON(path, gateway.URL()) })
+			return syncJSON(path, t3Instance, func() any { return t3Merged(path, gateway.URL()) })
 		},
+		// its custom models are the models picked for it (#1508)
+		ListsModels: true,
+		// magpie's instance still on the gateway, as for every agent with
+		// a Check (TestDriftUnwiredEveryAgent, TestPortMovesEveryAgent).
+		// The user's ~/.claude settings env is put over the instance's, so
+		// a provider switch on there (or in the shell T3 was started from)
+		// takes magpie's instance to that cloud too; magpie only says so,
+		// as that file is Claude Code's, wired or not
 		Check: func() string {
 			if !wired() {
 				return ""
 			}
-			return wiringOff("T3 Code", path, func(name string) (string, bool) {
-				return edit.GetJSON(path, t3Instance+`.environment.#(name="`+name+`").value`)
-			}, "ANTHROPIC_BASE_URL", gateway.URL(), "ANTHROPIC_AUTH_TOKEN", gateway.Token)
+			if why := wiringOff("T3 Code", path, func(k string) (string, bool) { return t3EnvOf(path, k) }, "ANTHROPIC_BASE_URL", gateway.URL(), "ANTHROPIC_AUTH_TOKEN", gateway.Token); why != "" {
+				return why
+			}
+			at := here(home)
+			return claudeCloud(at, filepath.Join(at.claudeDir(), "settings.json"))
 		},
-		// its custom models are the models picked for it (#1508)
-		ListsModels: true,
 		Fields: []Field{{
 			Key: "provider", Label: "provider",
 			Get: func() string {
@@ -90,7 +101,7 @@ func t3code(home string) *Agent {
 				if v == "" {
 					return edit.DelJSON(path, t3Instance)
 				}
-				return edit.SetJSON(path, edit.KV{Path: t3Instance, Value: t3InstanceJSON(path, gateway.URL())})
+				return edit.SetJSON(path, edit.KV{Path: t3Instance, Value: t3Merged(path, gateway.URL())})
 			},
 			Options: func(map[string]string) []Option {
 				return []Option{{Value: magpieID, Label: "magpie", Icon: "magpie", Note: "every magpie model as a provider in T3 Code, on Claude Code"}}
@@ -157,6 +168,78 @@ func t3InstanceJSON(path, gw string) map[string]any {
 		"environment": environment,
 		"config":      config,
 	}
+}
+
+// t3Env is the environment variables of magpie's instance that magpie
+// sets: the gateway's address and key, and auto mode's review.
+var t3Env = []string{"ANTHROPIC_BASE_URL", "ANTHROPIC_AUTH_TOKEN", claudeReviewEnv}
+
+// t3EnvOf is the value of the environment variable named k on magpie's
+// instance in the T3 settings at path.
+func t3EnvOf(path, k string) (string, bool) {
+	cur, ok := edit.GetJSON(path, t3Instance+".environment")
+	if !ok {
+		return "", false
+	}
+	var env []map[string]any
+	if json.Unmarshal([]byte(cur), &env) != nil {
+		return "", false
+	}
+	for _, v := range env {
+		if n, _ := v["name"].(string); n == k {
+			s, _ := v["value"].(string)
+			return s, true
+		}
+	}
+	return "", false
+}
+
+// t3Merged is magpie's instance as t3InstanceJSON writes it, merged into
+// the one at path: what the user set on it in T3 Code's own settings
+// stays (#2030, Kanscape: its name and Auto-compact after were reset on
+// every start). Its name, whether it is on, and every key magpie doesn't
+// write (config.autoCompactWindow, config.launchArgs, accentColor) are
+// theirs, as are the environment variables besides magpie's own. The
+// custom models and the gateway's variables are magpie's, and so is a
+// binary path or Claude home while T3's own Claude has one to carry over.
+// Only magpie's instance is read: another, such as T3's own Claude, lends
+// it nothing of the user's.
+func t3Merged(path, gw string) any {
+	want := t3InstanceJSON(path, gw)
+	cur, ok := edit.GetJSON(path, t3Instance)
+	if !ok {
+		return want
+	}
+	var have map[string]json.RawMessage
+	if json.Unmarshal([]byte(cur), &have) != nil || have == nil {
+		return want
+	}
+	var name string
+	if json.Unmarshal(have["displayName"], &name) == nil && strings.TrimSpace(name) != "" {
+		want["displayName"] = name
+	}
+	var on bool
+	if json.Unmarshal(have["enabled"], &on) == nil {
+		want["enabled"] = on
+	}
+	var theirs []map[string]any
+	if json.Unmarshal(have["environment"], &theirs) == nil {
+		env := want["environment"].([]map[string]any)
+		for _, v := range theirs {
+			// a provider switch would take magpie's instance past the
+			// gateway (claudeClouds), so it doesn't stay on magpie's
+			if n, _ := v["name"].(string); n != "" && !slices.Contains(t3Env, n) && !slices.Contains(agentenv.ClaudeProviders, n) {
+				env = append(env, v)
+			}
+		}
+		want["environment"] = env
+	}
+	b, err := json.Marshal(want)
+	var w map[string]json.RawMessage
+	if err != nil || json.Unmarshal(b, &w) != nil {
+		return want
+	}
+	return mergeTheirs(have, w, []string{"environment"})
 }
 
 // t3EffortLabels are T3 Code's names for Claude Code's levels, as its own

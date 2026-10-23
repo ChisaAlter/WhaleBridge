@@ -2,7 +2,6 @@ package proc
 
 import (
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -59,7 +58,7 @@ func LookPath(name string) (string, error) {
 // answer kept while the PATH folders are unchanged.
 func Look(name string) (string, error) {
 	a := looked("look\x00"+name, func() lookAnswer {
-		p, err := exec.LookPath(name)
+		p, err := lookPath(name)
 		return lookAnswer{p, err}
 	})
 	return a.path, a.err
@@ -72,6 +71,7 @@ func Forget() {
 	looks.m, looks.env, looks.stamp, looks.checked = nil, "", "", time.Time{}
 	looks.gen++
 	looks.Unlock()
+	forgetListings()
 }
 
 // looked is the answer kept for key, or ask's, kept.
@@ -108,7 +108,7 @@ func looked(key string, ask func() lookAnswer) lookAnswer {
 
 // lookWindow is lookFresh, or lookFreshInTests in a test binary.
 func lookWindow() time.Duration {
-	if os.Getenv(sandboxVar) != "" {
+	if Isolated() {
 		return lookFreshInTests
 	}
 	return lookFresh

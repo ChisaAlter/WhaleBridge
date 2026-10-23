@@ -29,6 +29,9 @@ type Library struct {
 	// Hooks are commands the agents ticked for each run at a point of
 	// their turn (hooks.go, #1790)
 	Hooks []*Hook `json:"hooks,omitempty"`
+	// Subagents are agents of their own the agents ticked for each can
+	// hand a task to (subagents.go, #2283)
+	Subagents []*Subagent `json:"subagents,omitempty"`
 	// Applied is what magpie wrote into each agent, so that what it takes
 	// away is only ever its own.
 	Applied map[string]*Applied `json:"applied,omitempty"`
@@ -98,6 +101,9 @@ type Applied struct {
 	// Hooks are the entries magpie wrote into the agent's hooks, each
 	// exactly as written: one changed since is the user's (hooks.go)
 	Hooks []HookEntry `json:"hooks,omitempty"`
+	// Subagents are the files magpie wrote for the subagents, each with
+	// the hash of what it wrote: one changed since is the user's
+	Subagents []SubagentFile `json:"subagents,omitempty"`
 }
 
 var mu lock // one change at a time, from the page or the CLI's process
@@ -144,6 +150,10 @@ func (l *Library) save() error {
 	sort.Slice(l.Hooks, func(i, j int) bool { return l.Hooks[i].Name < l.Hooks[j].Name })
 	for _, h := range l.Hooks {
 		h.Agents = orNone(h.Agents)
+	}
+	sort.Slice(l.Subagents, func(i, j int) bool { return l.Subagents[i].Name < l.Subagents[j].Name })
+	for _, s := range l.Subagents {
+		s.Agents = orNone(s.Agents)
 	}
 	for _, a := range l.Applied {
 		sort.Strings(a.MCP)

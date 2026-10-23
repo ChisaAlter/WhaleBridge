@@ -49,6 +49,11 @@ func TestAsideOfflineDisconnectRestoresWithoutDaemon(t *testing.T) {
 	if proc.FindTool(a.Bin) != "" {
 		t.Fatal("fixture must have no Aside executable")
 	}
+	// On Windows a folder dsh's desktop app reads is never taken for gone
+	// (cliHeld, #2300); the fixture judges a missing CLI as elsewhere.
+	was := goneOS
+	goneOS = "linux"
+	t.Cleanup(func() { goneOS = was })
 	missing := &Agent{ID: "dsh", Name: "Native fixture", Bin: "magpie-test-missing-native", Dir: a.Dir, Path: a.Path, Native: a.Native}
 	if !missing.CLIMissing() {
 		t.Fatal("native fixture must report missing CLI")

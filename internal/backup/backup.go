@@ -195,7 +195,7 @@ func Collect(keys bool, app string) (Bundle, error) {
 	}
 	b.Searches = &searches
 	// Unknown settings must not be carried as defaults to a backup or
-	// every computer it is synced to. Only a missing file is no settings.
+	// every computer it is synced to (#2269). Only a missing file is no settings.
 	if _, err := os.Stat(settings.Path()); err == nil {
 		s, err := settings.LoadChecked()
 		if err != nil {

@@ -194,6 +194,13 @@ type kiroUser struct {
 	Origin  string       `json:"origin"`
 	Images  []kiroImage  `json:"images,omitempty"`
 	Context *kiroUserCtx `json:"userInputMessageContext,omitempty"`
+	// Bedrock's cache point: Kiro caches the prompt up to the end of this
+	// message (the CodeWhisperer streaming model's UserInputMessage.cachePoint)
+	CachePoint *kiroCachePoint `json:"cachePoint,omitempty"`
+}
+
+type kiroCachePoint struct {
+	Type string `json:"type"`
 }
 
 type kiroUserCtx struct {
@@ -471,6 +478,15 @@ func buildKiro(r *Request, model, profile string, thinking bool) []byte {
 	if system != "" {
 		entries[0].User.Content = system + "\n\n" + entries[0].User.Content
 	}
+	// Kiro caches a prompt only up to a message marked for it, as Anthropic
+	// does (buildAnthropic): the first message, which holds the
+	// instructions, the same every turn, and the message being answered, so
+	// the next turn, which only adds to the conversation, reads it from the
+	// cache (magpie-community/plugins#110: a cache rate of 0)
+	if r.System != "" {
+		entries[0].User.CachePoint = &kiroCachePoint{Type: "default"}
+	}
+	entries[len(entries)-1].User.CachePoint = &kiroCachePoint{Type: "default"}
 
 	// the caller's tools, and any the conversation used that it no longer
 	// offers — Kiro rejects a history naming a tool it wasn't given

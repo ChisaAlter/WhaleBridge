@@ -151,7 +151,7 @@ func MergeExternalStats(st Stats, days []ExternalDayUsage, external []ExternalSe
 		if e.ID == "" || e.Agent == "" {
 			continue
 		}
-		s := Summary{Key: e.Agent + ":" + e.ID, Agent: e.Agent, ID: e.ID, Title: cmp.Or(names[e.Agent+"|"+e.ID], e.Title), Last: e.Last, Tokens: e.Tokens, Cost: e.Cost, Priced: true, Models: []string{}, Days: []int{}, perDay: map[int]*summaryDay{}}
+		s := Summary{Key: e.Agent + ":" + e.ID, Agent: e.Agent, ID: e.ID, Title: cmp.Or(names[e.Agent+"|"+e.ID], e.Title), Gateway: true, Last: e.Last, Tokens: e.Tokens, Cost: e.Cost, Priced: true, Models: []string{}, Days: []int{}, perDay: map[int]*summaryDay{}}
 		for _, u := range e.Daily {
 			day, err := time.ParseInLocation(time.DateOnly, u.Date, time.Local)
 			if err != nil {

@@ -182,3 +182,15 @@ func TestCodexWindowsStoreAppVersion(t *testing.T) {
 		t.Fatalf("WSL twin: %q", v)
 	}
 }
+
+// A test binary testenv isolated never reads the machine's Store apps, in
+// whatever package it is: on a Windows machine with the Codex app installed,
+// library's tests saw it and codex's CLI was never gone (#2254, ggbdpq).
+func TestStorePackagesNotTheMachinesInTests(t *testing.T) {
+	if !proc.Isolated() {
+		t.Fatal("agent's tests run outside testenv's home")
+	}
+	if got := storePackages(); len(got) != 0 {
+		t.Fatalf("a test read this machine's Store packages: %d of them, %v", len(got), got[:min(len(got), 3)])
+	}
+}

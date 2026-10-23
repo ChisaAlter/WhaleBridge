@@ -6,6 +6,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { startFixture } = require('./lib/ui-native-fixture.cjs');
+const { inspectAlignment } = require('./lib/ui-alignment.cjs');
 app.disableHardwareAcceleration();
 const repo = path.resolve(__dirname, '..');
 const evidence = path.resolve(process.env.WHALEBRIDGE_QA_LAYOUT || path.join(repo, '.tmp/ui-layout-audit'));
@@ -21,11 +22,12 @@ const js = async source => {
   catch (error) { throw new Error(`${error.message}\n${source.slice(0, 250)}`); }
 };
 async function wait(expression, label = expression) {
-  const until = Date.now() + 18000;
+  const until = Date.now() + (/agents-page|agent-target|data-profile-delete/.test(expression)?45000:18000);
   while (Date.now() < until) {
     if (await js(`Boolean(${expression})`)) return;
     await sleep(30);
   }
+  report.unsettled=await js(`({label:${JSON.stringify(label)},page:tab,editor:editor?.type,contentBusy:document.querySelector('#content').getAttribute('aria-busy'),agentBusy:document.querySelector('#agents-page')?.getAttribute('aria-busy'),message:document.querySelector('#message-text').textContent,requests:performance.getEntriesByType('resource').filter(e=>e.name.includes('/api/')).slice(-12).map(e=>({path:new URL(e.name).pathname,ms:e.duration}))})`);
   throw new Error('Unsettled ' + label);
 }
 async function settle() {
@@ -88,19 +90,20 @@ function geometry() {
   const main=document.querySelector('#main');
   return {width:innerWidth,height:innerHeight,dpr:devicePixelRatio,theme:matchMedia('(prefers-color-scheme: dark)').matches?'dark':'light',page:document.querySelector('#page-label').textContent,dialog,main:{width:main.clientWidth,height:main.clientHeight,scrollHeight:main.scrollHeight,scrollWidth:main.scrollWidth},issues:clipped};
 }
+async function snapshot(){return js(`(()=>{const layout=(${geometry.toString()})();const alignment=(${inspectAlignment.toString()})();return {...layout,alignment,issues:[...layout.issues,...alignment.issues]};})()`);}
 let condition;
 async function audit(name, { shot = true, bottom = false, expand = false } = {}) {
   await settle();
   console.log('LAYOUT_VIEW '+condition.name+' '+name);
   if(expand)await js(`document.querySelectorAll('#content details:not(.menu),#fields details:not(.menu)').forEach(e=>e.open=true)`);
-  const g = await js(`(${geometry.toString()})()`);
+  const g = await snapshot();
   const id=`${condition.name}-${name}`;
   report.views.push({id,...g});
   if(g.issues.length){report.failures.push({id,issues:g.issues});console.log('LAYOUT_ISSUES '+id+' '+JSON.stringify(g.issues));}
   report.coverage[name]=(report.coverage[name]||0)+1;
   fs.writeFileSync(path.join(evidence,'layout-report.json'),JSON.stringify(report,null,2)+'\n');
   if(shot && (condition.shots || g.issues.length))await screenshot(id);
-  if(bottom){await js(`(()=>{const e=document.querySelector('#editor[open] .editor-content')||document.querySelector('#main');e.scrollTop=e.scrollHeight;})()`);await settle();const b=await js(`(${geometry.toString()})()`);report.views.push({id:id+'-bottom',...b});if(b.issues.length)report.failures.push({id:id+'-bottom',issues:b.issues});if(shot&&condition.shots)await screenshot(id+'-bottom');}
+  if(bottom){await js(`(()=>{const e=document.querySelector('#editor[open] .editor-content')||document.querySelector('#main');e.scrollTop=e.scrollHeight;})()`);await settle();const b=await snapshot();report.views.push({id:id+'-bottom',...b});if(b.issues.length)report.failures.push({id:id+'-bottom',issues:b.issues});if(shot&&condition.shots)await screenshot(id+'-bottom');}
 }
 async function optional(name, work) {
   try { await work(); }
@@ -114,7 +117,7 @@ async function runViews() {
   const targets=await js(`[...document.querySelector('#agent-target').options].map(o=>o.value)`);
   for(const target of ['codex','claude','cline','cherry-studio'].filter(t=>targets.includes(t))){await input('#agent-target',target,'change');await wait(`document.querySelector('#agent-target').value===${JSON.stringify(target)}&&!document.querySelector('#agents-page')?.hasAttribute('aria-busy')&&document.querySelector('#agent-name')?.textContent!=='鲸屿'`);await settle();await audit('agents-'+target,{bottom:true,expand:true});}
   const agentRows=(await fixture.api('/api/agents')).agents;
-  const pickAgent=async id=>{await input('#agent-target',id,'change');await wait(`document.querySelector('#agent-target').value===${JSON.stringify(id)}&&!document.querySelector('#agents-page')?.hasAttribute('aria-busy')`);await settle();};
+  const pickAgent=async id=>{await wait(`!document.querySelector('#agent-target').disabled&&!document.querySelector('#agents-page')?.hasAttribute('aria-busy')`);await input('#agent-target',id,'change');await wait(`document.querySelector('#agent-target').value===${JSON.stringify(id)}&&!document.querySelector('#agent-target').disabled&&!document.querySelector('#agents-page')?.hasAttribute('aria-busy')`);await settle();};
   await pickAgent('codex');
   if(await js(`!!document.querySelector('[data-agent-action="connect"]')`)){await click('[data-agent-action="connect"]');await wait(`!document.querySelector('#agents-page')?.hasAttribute('aria-busy')&&!document.querySelector('[data-agent-action="connect"]')`);}
   await audit('agents-connected',{bottom:true});

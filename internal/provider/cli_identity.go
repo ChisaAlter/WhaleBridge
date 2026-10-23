@@ -112,7 +112,8 @@ func (c *cliIdentity) get() (user, plan string, ok bool) {
 		}
 	}
 	if leftAlone(c.name) {
-		// Serve the last identity without asking a provider left alone.
+		// switched off or removed: the CLI isn't asked, what it said last
+		// is served
 		return c.user, c.plan, c.ok
 	}
 	if c.at.IsZero() {

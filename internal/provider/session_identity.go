@@ -94,6 +94,18 @@ func codexSessionIdentity(b []byte) (SessionIdentity, bool) {
 		UserID: cmp.Or(claimString(claims, "https://api.openai.com/auth", "chatgpt_user_id"), claimString(claims, "https://api.openai.com/auth", "user_id")), User: user}, id != "" && user != ""
 }
 
+// CodexSignedInAccount is the ChatGPT account id (chatgpt-account-id)
+// Codex's auth.json is signed in to now; "" when it is signed in to none,
+// on an API key, or can't be read.
+func CodexSignedInAccount() string {
+	b, err := readAccountFile(codexAuthPath())
+	if err != nil {
+		return ""
+	}
+	id, _ := codexSessionIdentity(b)
+	return id.AccountID
+}
+
 func claudeSessionIdentity(b []byte) (SessionIdentity, bool) {
 	var a struct {
 		Account string `json:"accountUuid"`
@@ -113,13 +125,21 @@ func currentSessionIdentities(codexDir string) []SessionIdentity {
 	}
 	var out []SessionIdentity
 	// Cache only the identity parse, not another copy of the credential blob.
-	current, _ := filememo.Read("session codex identity", filepath.Join(codexDir, "auth.json"), func(b []byte) ([]SessionIdentity, error) {
+	if b, st, err := readCodexLogin(codexDir, false); err == nil && st.keychain {
+		// Codex keeps its sign-in in the keychain item (#2367); one
+		// auth.json left beside it isn't the one Codex goes by
 		if id, ok := codexSessionIdentity(b); ok {
-			return []SessionIdentity{id}, nil
+			out = append(out, id)
 		}
-		return nil, nil
-	})
-	out = append(out, current...)
+	} else {
+		current, _ := filememo.Read("session codex identity", filepath.Join(codexDir, "auth.json"), func(b []byte) ([]SessionIdentity, error) {
+			if id, ok := codexSessionIdentity(b); ok {
+				return []SessionIdentity{id}, nil
+			}
+			return nil, nil
+		})
+		out = append(out, current...)
+	}
 	if acct, ok := claudeProfileAccount(); ok {
 		b, _ := json.Marshal(acct)
 		if id, ok := claudeSessionIdentity(b); ok {

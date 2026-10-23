@@ -46,9 +46,9 @@ func TestLedgerObserverLifecycleNoDuplicateAccounting(t *testing.T) {
 	unpanic := Observe(panicObserver)
 	defer unpanic()
 	cost := 0.25
-	Append(Record{Time: time.Now(), Provider: "fixture", Model: "m", Input: 3, Status: 200, OwnCost: &cost, BodyIn: "body in", BodyOut: "body out", OTel: &OTelSpan{TraceID: "secret"}, SkipOTel: true})
+	Append(Record{Time: time.Now(), Provider: "fixture", Model: "m", Input: 3, Status: 200, OwnCost: &cost, BodyIn: "body in", BodyOut: "body out", Watched: true})
 	got := <-o.last
-	if got.BodyIn != "" || got.BodyOut != "" || got.OTel != nil || cost != 0.25 {
+	if got.BodyIn != "" || got.BodyOut != "" || cost != 0.25 {
 		t.Fatal("ledger observer shared telemetry or cost ownership")
 	}
 	if rows := Load(time.Time{}); len(rows) != 1 || rows[0].Input != 3 || rows[0].OwnCost == nil || *rows[0].OwnCost != 0.25 {
@@ -77,32 +77,46 @@ func TestLedgerObserverLifecycleNoDuplicateAccounting(t *testing.T) {
 	}
 }
 
+type requestObserver struct {
+	ledgerObserver
+	watched chan Record
+}
+
+func (o *requestObserver) Bodies() Bodies      { return CapturedBodies }
+func (o *requestObserver) Begin(Request) Watch { return nil }
+func (o *requestObserver) Ledger(r Record) {
+	o.ledgerObserver.Ledger(r)
+	if !r.Watched {
+		o.watched <- r
+	}
+}
+
 func TestLedgerObserverDoesNotDuplicateOTel(t *testing.T) {
 	sessionHome(t)
-	for name, value := range map[string]string{"MAGPIE_OTEL_ENABLED": "true", "MAGPIE_OTEL_ENDPOINT": "http://127.0.0.1:1", "MAGPIE_OTEL_BODIES": "false", "MAGPIE_OTEL_METRICS": "false", "MAGPIE_OTEL_HEADERS": ""} {
-		t.Setenv(name, value)
-	}
-	// No exporter worker or network starts. Inspect exactly what Append offers
-	// to the existing OTel queue versus ExportOTel's ledger-independent path.
-	e := newOTelExporter()
-	previous := otel.Swap(e)
-	defer func() { otel.Store(previous); e.cancel() }()
-	o := &ledgerObserver{}
-	remove := Observe(o)
+	// OTLP now owns its exporter in internal/otlp. A request-aware observer
+	// receives each ledger row once, skips rows already watched as spans, and
+	// has the opt-in capture available without exposing it to metadata plugins.
+	exporter := &requestObserver{watched: make(chan Record, 2)}
+	removeExporter := Observe(exporter)
+	defer removeExporter()
+	metadata := &ledgerObserver{last: make(chan Record, 2)}
+	remove := Observe(metadata)
 	defer remove()
 	stop := ServeObservers()
 	defer stop()
-	Append(Record{Provider: "fixture", Model: "one", Status: 200})
-	if len(e.queue) != 1 || o.rows.Load() != 1 {
+	Append(Record{Provider: "fixture", Model: "one", Status: 200, BodyIn: "opt-in input"})
+	if len(exporter.watched) != 1 || exporter.rows.Load() != 1 || metadata.rows.Load() != 1 {
 		t.Fatal("Append duplicate export or missing ledger notification")
 	}
-	ExportOTel(Record{Provider: "fixture", Model: "trace-only", Status: 200})
-	if len(e.queue) != 2 || o.rows.Load() != 1 {
-		t.Fatal("trace-only export was counted as a ledger row")
+	if got := <-exporter.watched; got.BodyIn != "opt-in input" {
+		t.Fatal("request observer lost opted-in capture")
 	}
-	Append(Record{Provider: "fixture", Model: "skip-export", Status: 200, SkipOTel: true})
-	if len(e.queue) != 2 || o.rows.Load() != 2 || len(Load(time.Time{})) != 2 {
-		t.Fatal("SkipOTel contract changed")
+	if got := <-metadata.last; got.BodyIn != "" {
+		t.Fatal("metadata observer received captured body")
+	}
+	Append(Record{Provider: "fixture", Model: "watched-spans", Status: 200, Watched: true})
+	if len(exporter.watched) != 0 || exporter.rows.Load() != 2 || metadata.rows.Load() != 2 || len(Load(time.Time{})) != 2 {
+		t.Fatal("watched request was exported or accounted twice")
 	}
 }
 

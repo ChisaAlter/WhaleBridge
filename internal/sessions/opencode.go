@@ -161,7 +161,8 @@ func ocRoots(out []file, parent map[string]string) []file {
 			root = parent[root]
 		}
 		out[i].key = out[i].agent + ":" + root
-		out[i].main = parent[out[i].sid] == ""
+		out[i].parent = parent[out[i].sid]
+		out[i].main = out[i].parent == ""
 	}
 	return out
 }

@@ -362,7 +362,7 @@ var codexRestarting sync.Mutex
 // be found or timed, or a restart already under way, is left as it is.
 func KeepCodexDaemonCurrent(ctx context.Context, home string, changed time.Time) CodexDaemonCheck {
 	var c CodexDaemonCheck
-	if changed.IsZero() {
+	if changed.IsZero() || !pidFileBehind(home, changed) {
 		return c
 	}
 	ps, err := listProcesses(ctx)
@@ -388,6 +388,20 @@ func KeepCodexDaemonCurrent(ctx context.Context, home string, changed time.Time)
 		c.Restarted = true
 	}
 	return c
+}
+
+// pidFileBehind reports whether a pid file of home's was written before
+// changed: only a daemon one names can be found behind (daemonStarted), so
+// with none the processes aren't listed at all. Listing them is a
+// PowerShell run on Windows, which every look did every codexDaemonEvery
+// for as long as magpie ran (#2341).
+func pidFileBehind(home string, changed time.Time) bool {
+	for _, pid := range daemonPIDs(home) {
+		if since, ok := daemonStarted(home, pid); ok && since.Before(changed.Add(-time.Second)) {
+			return true
+		}
+	}
+	return false
 }
 
 // daemonStarted is when the daemon pid started: the time Codex wrote its

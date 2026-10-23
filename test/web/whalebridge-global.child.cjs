@@ -109,8 +109,8 @@ async function run() {
     assert.equal(writes.find(w => w.path === '/api/model-price').body.price.tiers[0].output, 2.5);
     assert.equal('cache_write_1h' in writes.find(w => w.path === '/api/model-price').body.price.tiers[0], false);
     await click('[data-tab="usage"]'); await ready(); await fill('#usage-trend', 'tokens', 'change'); await ready();
-    assert.equal(await js(`document.querySelector('.usage-bar-item span').textContent`), '40');
-    await fill('#usage-trend', 'cost', 'change'); await ready(); assert.equal(await js(`document.querySelector('.usage-bar-item span').textContent`), '$0.250');
+    assert.ok(await js(`document.querySelector('.usage-chart-detail strong').textContent.includes('40 Token')`));
+    await fill('#usage-trend', 'cost', 'change'); await ready(); assert.ok(await js(`document.querySelector('.usage-chart-detail strong').textContent.includes('$0.250')`));
     await section('ledger');
     for (const [name, value] of Object.entries({ model: 'exact-model', route: '42', purpose: 'search', computer: 'this' })) await fill(`#ledger-filter [name=${name}]`, value);
     await click('#ledger-filter [type=submit]'); await ready();

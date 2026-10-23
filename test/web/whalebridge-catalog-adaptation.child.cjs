@@ -11,7 +11,7 @@ const fixture = {
  id:'relay',name:'Fixture Relay',chat:'https://fixture.test/v1',models:['claude-only'],chosen:['claude-only'],defaultModels:['chat-only','unknown'],speaks:['chat'],
  available:[{id:'claude-only',name:'Claude (Messages only)',auto:['anthropic'],noAPI:true,efforts:['low','high'],price:{input:1,output:5}},{id:'chat-only',name:'Chat model',auto:['chat'],free:true,efforts:['low','high'],serviceTiers:['priority']},{id:'unknown',name:'Model with unknown API'}]
 };
-let providerFixture=structuredClone(fixture),unmoved=false,installed=false,dropUnselected=false,newCatalog=false;
+let providerFixture=structuredClone(fixture),unmoved=false,installed=false,dropUnselected=false,newCatalog=false,ruleAdd=false;
 const writes=[];
 const subscriptions=()=>installed?[{id:'cursor',pid:'cursor',name:'Cursor',retired:true,plugin:true,methods:[{type:'api',label:'Use native login',keyless:true},{type:'api',label:'API key'}]}]:[{id:'cursor',pid:'cursor',name:'Cursor',retired:true,plugin:false,package:'@fixture/cursor'}];
 const server=http.createServer(async(req,res)=>{
@@ -27,7 +27,8 @@ const server=http.createServer(async(req,res)=>{
   if(url.pathname==='/api/signin')return json({state:'done'});
   if(url.pathname==='/api/subscription/adapters')return json({installed:[],available:[],moves:[{id:'cursor',package:'@fixture/cursor',moved:true,retired:true,state:'plugin'},{id:'zed',package:'@fixture/zed',signedIn:true,accounts:1,retired:true,nativeSkipped:true,canMove:false,error:'Native login stays at source',why:{code:'native'}}]});
   if(url.pathname==='/api/provider/models'){
-   if(newCatalog){const expanded={...providerFixture,models:['a','b'],chosen:['a','b','new','messages'],delisted:[],available:[{id:'a',name:'A',auto:['chat']},{id:'b',name:'B',auto:['chat']},{id:'new',name:'New',auto:['chat']},{id:'messages',name:'Messages',auto:['anthropic']}]};providerFixture=expanded;return json({provider:expanded,dropped:[],count:4});}
+   if(ruleAdd){const ruled={...providerFixture,models:['a','new-rule','new-messages'],chosen:['a','new-rule','new-messages'],delisted:[],available:[{id:'a',name:'A',auto:['chat']},{id:'b',name:'B',auto:['chat']},{id:'new-rule',name:'New rule match',auto:['chat']},{id:'new-messages',name:'Incompatible rule match',auto:['anthropic']}]};providerFixture=ruled;return json({provider:ruled,dropped:[],taken:['new-rule','new-messages'],count:4});}
+    if(newCatalog){const expanded={...providerFixture,models:['a','b'],chosen:['a','b','new','messages'],delisted:[],available:[{id:'a',name:'A',auto:['chat']},{id:'b',name:'B',auto:['chat']},{id:'new',name:'New',auto:['chat']},{id:'messages',name:'Messages',auto:['anthropic']}]};providerFixture=expanded;return json({provider:expanded,dropped:[],count:4});}
    if(dropUnselected){const shorter={...providerFixture,models:['a'],chosen:['a'],delisted:['b'],available:[{id:'a',name:'A',auto:['chat']}]};providerFixture=shorter;return json({provider:shorter,dropped:['b'],count:1});}
    const restored={...providerFixture,delisted:[],models:['returned'],chosen:['returned'],available:[{id:'returned',name:'Restored model',auto:['chat']},{id:'available',name:'Unselected model',auto:['chat']}]};
    providerFixture=restored;return json({provider:restored,dropped:[],count:2});
@@ -99,7 +100,20 @@ const server=http.createServer(async(req,res)=>{
   assert.deepEqual(await js(`lines(document.querySelector('#f-models').value)`),['a','b','new'],'all-compatible selection accepts new usable model and leaves incompatible one out');
   await click('#save');await wait(`!document.querySelector('#editor').open`);
   assert.deepEqual(writes.findLast(x=>x.path==='/api/provider').body.models,['a','b','new']);
-  unmoved=true;await js(`load()`);await js(`tab='providers';render()`);assert.match(await js(`document.querySelector('#content').textContent`),/自动迁移已跳过/);
+  providerFixture={id:'relay',name:'Rule selection',chat:'https://fixture.test/v1',models:['a'],chosen:['a'],pickedFrom:['a','b'],autoInclude:['new-*'],available:[{id:'a',name:'A',auto:['chat']},{id:'b',name:'B',auto:['chat']}]};
+   await js(`load()`);await js(`openProvider('relay');activateEditorSection('models')`);ruleAdd=true;
+   await click('[data-action="fetch-edit-models"]');await wait(`editor.available.length===4`);
+   assert.deepEqual(await js(`lines(document.querySelector('#f-models').value)`),['a','new-rule'],'partial selection takes new rule matches but keeps existing deselections and skips incompatible protocols');
+   await click('#save');await wait(`!document.querySelector('#editor').open`);
+   assert.deepEqual(writes.findLast(x=>x.path==='/api/provider').body.models,['a','new-rule'],'saving the refreshed draft retains rule additions');
+   await js(`openProvider('relay');activateEditorSection('models')`);await click('[data-action="models-none"]');
+   await click('[data-action="fetch-edit-models"]');await wait(`!document.querySelector('[data-action="fetch-edit-models"]').disabled`);
+   assert.equal(await js(`editor.modelSelection`),'none','rule additions do not undo an unsaved all-none choice');
+   assert.deepEqual(await js(`configuredProviderModelIds()`),[]);
+   await click('#save');await wait(`!document.querySelector('#editor').open`);
+   assert.equal(writes.findLast(x=>x.path==='/api/provider').body.noModels,true);
+   ruleAdd=false;
+   unmoved=true;await js(`load()`);await js(`tab='providers';render()`);assert.match(await js(`document.querySelector('#content').textContent`),/自动迁移已跳过/);
   await js(`openSubscription('cursor')`);assert.equal(await js(`document.querySelector('#save').hidden`),true,'retired placeholder cannot call builtin login');
   await click('[data-action="install-adapter"]');await wait(`document.querySelector('#f-method')`);
   assert.equal(await js(`document.querySelector('#f-key')===null`),true,'keyless method asks for no key');

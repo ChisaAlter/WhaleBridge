@@ -40,7 +40,7 @@ func (s *Server) autoReset(ctx context.Context, cands []candidate, c candidate, 
 	seen := map[string]bool{}
 	for _, x := range append(append([]candidate{c}, cands...), held...) {
 		a := x.p.Account
-		if a == nil || a.User == "" || seen[x.restKey()] || !provider.AutoResets(a.Agent, a.User) {
+		if a == nil || a.User == "" || seen[x.restKey()] || !provider.AutoResetsWeek(a.Agent, a.User) {
 			continue
 		}
 		seen[x.restKey()] = true
@@ -57,7 +57,7 @@ func (s *Server) autoReset(ctx context.Context, cands []candidate, c candidate, 
 // sign-in, the only account there is.
 func (s *Server) autoResetSignedIn(ctx context.Context) (string, provider.ResetOutcome, bool) {
 	who, ok := provider.CodexSignedIn()
-	if !ok || !provider.CodexAutoReset(who) {
+	if !ok || !provider.AutoResetsWeek("codex", who) {
 		return "", provider.ResetOutcome{}, false
 	}
 	out, ok := autoResetOf(ctx, "codex", who)

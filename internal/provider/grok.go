@@ -964,7 +964,16 @@ func runCLISignIn(s *signInFlow, what string, env []string, using bool, failed f
 		err := tree.Wait()
 		forgetAccountCaches()
 		if err == nil {
-			if user, plan, ok := identity(); ok {
+			// a second account's identity is its keeping (addGrokLogin):
+			// not once the sign-in is canceled
+			var user, plan string
+			if s.keep(func() error {
+				var ok bool
+				if user, plan, ok = identity(); !ok {
+					return fmt.Errorf("%s finished without an account", what)
+				}
+				return nil
+			}) == nil {
 				s.finish(SignInState{State: "done", User: user, Plan: plan, Using: using})
 				return
 			}

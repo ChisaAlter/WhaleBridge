@@ -30,7 +30,7 @@ var ErrNoTranscript = errors.New("this agent's conversations can't be shown")
 // transcript.
 func HasTranscript(agent string) bool {
 	switch agent {
-	case "claude", "qoder", "qoder-cn", "codex", "pi", "omp", "cursor", "opencode":
+	case "claude", "qoder", "qoder-cn", "codex", "pi", "omp", "cursor", "opencode", "kimi":
 		return true
 	}
 	return false
@@ -67,7 +67,7 @@ func readTranscript(s Session, add func(bool, Part) bool) error {
 }
 
 // readTranscriptOf is readTranscript decoding only the lines keep says yes
-// to, where a line stands alone (Claude's, Codex's); Pi's lines are a tree,
+// to, where a line stands alone (Claude's, Codex's, Kimi's); Pi's lines are a tree,
 // read whole.
 func readTranscriptOf(s Session, keep func([]byte) bool, add func(bool, Part) bool) error {
 	whole := Call{Agent: s.Agent, File: s.Path, To: math.MaxInt64}
@@ -80,6 +80,8 @@ func readTranscriptOf(s Session, keep func([]byte) bool, add func(bool, Part) bo
 		return codexContentOf(whole, keep, add)
 	case "pi", "omp":
 		return piTranscript(s.Path, add)
+	case "kimi":
+		return kimiTranscript(s.Path, keep, add)
 	default:
 		return claudeContentOf(whole, keep, add)
 	}
@@ -94,6 +96,7 @@ type piEntry struct {
 	Message  *struct {
 		Role     string          `json:"role"`
 		ToolName string          `json:"toolName"`
+		Model    string          `json:"model"` // an assistant's: the one it was answered by (#2253)
 		Content  json.RawMessage `json:"content"`
 	} `json:"message"`
 }
@@ -132,6 +135,9 @@ func piTranscript(path string, add func(bool, Part) bool) error {
 	}
 	for i := len(branch) - 1; i >= 0; i-- {
 		for _, p := range piParts(branch[i]) {
+			if p.Role == "assistant" && branch[i].Message != nil {
+				p.Model = branch[i].Message.Model
+			}
 			if !add(p.Role != "assistant", p) {
 				return nil
 			}

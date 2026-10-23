@@ -1,5 +1,6 @@
 'use strict';
 const { app, BrowserWindow, nativeTheme } = require('electron');
+const { inspectAlignment } = require('../../scripts/lib/ui-alignment.cjs');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const http = require('node:http');
@@ -174,8 +175,11 @@ async function run() {
     // The supplier model browser keeps long names readable and selection separate from editing.
     providerFixture = { ...providerFixture, models: [], defaultModels: ['long'], available: [providerFixture.available[0], ...Array.from({length:36},(_,i)=>({id:`vendor/model-${i}-long-identifier`,name:i===0?'可识别的模型名称 / Long readable model name':'Catalog Model '+i,context:128000,images:i%2===0,price:i===2?{input:0,output:0}:{input:0.5,output:2},...(i===2?{list:{input:0,output:0}}:{})}))] };
     await click('#refresh'); await wait(`!document.querySelector('#refresh').disabled`);
+    await wait(`state.providers.find(p=>p.id==='qa')?.available.length===37`);
     await click('[data-action="edit-provider"][data-id="qa"]'); await js(`activateEditorSection('models')`);
     assert.equal(await js(`document.querySelectorAll('.provider-model-row').length`),37);
+    await wait(`document.querySelector('[data-pref="api"]').parentElement.classList.contains('select-control')`);
+    assert.deepEqual((await js(`(${inspectAlignment.toString()})()`)).issues.filter(i=>i.kind==='select-icon-center'),[],'model parameter arrows align with their actual select controls');
     assert.equal(await js(`document.querySelector('.provider-model-row strong').textContent`),'Long Context');
     assert.ok(await js(`(()=>{const e=document.querySelector('.provider-model-row strong'),s=getComputedStyle(e);return parseFloat(s.fontSize)>=14&&s.color===getComputedStyle(document.body).color;})()`),'model names use readable primary text');
     assert.ok(await js(`(()=>{const e=document.querySelector('#provider-model-list');return e.scrollHeight>e.clientHeight&&e.clientHeight<=360;})()`),'the catalog has a bounded scrolling viewport');

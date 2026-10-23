@@ -177,8 +177,12 @@ func RunContext(parent context.Context, version string) error {
 		runtime.Stop()
 		stopObservers()
 	}()
+	// Keep the gateway available while another writer holds the DSH profile.
+	// The retry belongs to the same joined maintenance lifecycle as catalog sync.
 	if err := syncDSH(); err != nil {
-		return err
+		setDSHSyncError(err)
+		log.Printf("鲸Bridge启动时 DSH 同步失败，将在后台重试: %v", err)
+		runWorker(func(ctx context.Context) { retryDSHSync(ctx, 5*time.Second, time.Minute) })
 	}
 	syncManagedAgents()
 	stopCatalogSync = watchDSHCatalog(ctx)
@@ -412,6 +416,7 @@ func RunContext(parent context.Context, version string) error {
 	managementHTTP = &http.Server{Handler: auth, ReadHeaderTimeout: 10 * time.Second}
 	go func() { failures <- managementHTTP.Serve(listener) }()
 	runWorker(provider.StartModelRefresh)
+	runWorker(provider.KeepListsFresh)
 	stopSubscriptions = gateway.StartWhaleBridgeSubscriptions(ctx)
 	select {
 	case <-parent.Done():
@@ -608,6 +613,33 @@ func dshSyncError() string {
 	return catalogSyncState.err
 }
 
+func setDSHSyncError(err error) {
+	catalogSyncState.Lock()
+	defer catalogSyncState.Unlock()
+	catalogSyncState.err = ""
+	if err != nil {
+		catalogSyncState.err = err.Error()
+	}
+}
+
+// retryDSHSync writes the DSH channel again with a growing wait until one
+// write succeeds or the component stops.
+func retryDSHSync(ctx context.Context, wait, limit time.Duration) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(wait):
+		}
+		err := syncConfiguration()
+		setDSHSyncError(err)
+		if err == nil {
+			return
+		}
+		wait = min(wait*2, limit)
+	}
+}
+
 // Background supplier refreshes and automatic cloud sync also change the
 // DSH model list. Queue the callback because provider writes can occur inside
 // an API mutation; the worker then sees the latest atomically stored catalog.
@@ -633,13 +665,10 @@ func watchDSHCatalog(parent context.Context) func() {
 				return
 			case <-wake:
 				err := syncConfiguration()
-				catalogSyncState.Lock()
-				catalogSyncState.err = ""
+				setDSHSyncError(err)
 				if err != nil {
-					catalogSyncState.err = err.Error()
 					log.Printf("鲸Bridge后台 DSH 同步失败: %v", err)
 				}
-				catalogSyncState.Unlock()
 			}
 		}
 	}()

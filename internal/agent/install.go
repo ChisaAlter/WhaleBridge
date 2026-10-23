@@ -257,25 +257,32 @@ func installsOf(all []*Agent, goos string, node bool) []Install {
 // Codex app), ~/.claude (Claude Desktop's Code, the editors' extensions),
 // ~/.gemini (Antigravity, Gemini Code Assist), OpenCode's (its desktop
 // app), ~/.cline (Cline's extensions), Goose's (Goose Desktop). Their
-// folder without the CLI is no sign it was uninstalled.
+// folder without the CLI is no sign it was uninstalled while one of those
+// is here (cliHeld).
 var cliShared = map[string]bool{"codex": true, "claude": true, "gemini": true, "opencode": true, "cline": true, "goose": true}
 
 // CLIMissing reports an agent that is here by its settings alone: its
 // folder or config is, its command-line program isn't — not on PATH nor
-// where users' tools go (proc.FindTool), as after an uninstall that left
-// ~/.dsh behind (#843). Only for an agent that is its CLI and that magpie
-// knows an install command for, so the Agents page can offer it again; one
-// whose desktop app is installed (HasApp) is that app's settings, which need
-// no CLI (DeepSeek Harness Desktop, star on Discord).
+// where users' tools go (proc.FindTool) nor where its own installer puts
+// it — and nothing else that reads the folder is either (cliHeld): no
+// desktop app of its (DeepSeek Harness Desktop, star on Discord), no
+// editor extension, no IDE. That is an uninstall that left ~/.dsh (#843),
+// ~/.claude (#2177) or ~/.hermes/config.yaml (#2173) behind. The Agents
+// page shows it as gone, with none of its settings, and Install another
+// agent offers it again where magpie knows how. Only for an agent that is
+// its CLI: one magpie knows an install command for, or cliOnly; never one
+// detected its own way (detect), but for Goose, whose is its folder or its
+// program.
 func (a *Agent) CLIMissing() bool {
-	if a.WSL != "" || a.detect != nil || a.Bin == "" || cliShared[a.ID] {
+	if a.WSL != "" || a.Plugin != "" || a.Bin == "" || a.detect != nil && a.ID != "goose" {
 		return false
 	}
-	if a.HasApp() {
+	if len(installCommands(a.ID, runtime.GOOS, true)) == 0 && !cliOnly[a.ID] {
 		return false
 	}
-	if len(installCommands(a.ID, runtime.GOOS, true)) == 0 {
+	if !a.Detected() {
 		return false
 	}
-	return a.Detected() && proc.FindTool(a.Bin) == ""
+	held, known := a.cliHeld()
+	return known && !held
 }

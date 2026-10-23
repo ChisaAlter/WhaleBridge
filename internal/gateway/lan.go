@@ -86,7 +86,7 @@ func publicURL() string {
 	hasScheme := strings.Contains(u, "://")
 	u = strings.TrimRight(u, "/")
 	if !hasScheme {
-		u = "http://" + u
+		u = Scheme() + "://" + u
 	}
 	parsed, err := url.Parse(u)
 	// A query, a fragment or credentials would be lost or shown when the
@@ -165,7 +165,7 @@ func LANURLs() []string {
 		if ip := net.ParseIP(h); h == "localhost" || ip != nil && ip.IsLoopback() {
 			return nil
 		}
-		return []string{"http://" + net.JoinHostPort(h, Port())}
+		return []string{Scheme() + "://" + net.JoinHostPort(h, Port())}
 	}
 	var out []string
 	ifs, _ := net.Interfaces()
@@ -179,10 +179,20 @@ func LANURLs() []string {
 			if !ok || n.IP.To4() == nil || n.IP.IsLinkLocalUnicast() {
 				continue
 			}
-			out = append(out, "http://"+net.JoinHostPort(n.IP.String(), Port()))
+			out = append(out, Scheme()+"://"+net.JoinHostPort(n.IP.String(), Port()))
 		}
 	}
 	return out
+}
+
+// listen listens on addr, serving TLS to other computers when the gateway
+// does; under lnMu, or before serving.
+func (s *Server) listen(addr string) (net.Listener, error) {
+	ln, err := Listen(addr)
+	if err != nil || s.tls == nil {
+		return ln, err
+	}
+	return newTLSListener(ln, s.tls), nil
 }
 
 // Relisten moves the gateway to where settings now say it listens — onto
@@ -204,7 +214,7 @@ func (s *Server) Relisten() error {
 	// the old one lets go, so one the gateway can't have leaves it serving
 	// where it was
 	if _, p, _ := net.SplitHostPort(was); p != Port() {
-		ln, err := Listen(to)
+		ln, err := s.listen(to)
 		if err != nil {
 			return err
 		}
@@ -215,9 +225,9 @@ func (s *Server) Relisten() error {
 	}
 	// the port is the same, so the old one goes first
 	s.ln.Close()
-	ln, err := Listen(to)
+	ln, err := s.listen(to)
 	if err != nil {
-		if ln, _ = Listen(was); ln == nil {
+		if ln, _ = s.listen(was); ln == nil {
 			return err
 		}
 		s.ln = ln
@@ -354,13 +364,15 @@ func fromBrowser(r *http.Request) bool {
 var containerHostNames = []string{"host.docker.internal", "gateway.docker.internal", "host.containers.internal", "host.orb.internal", "docker.for.mac.localhost"}
 
 // ownHost: host (a Host header) names this computer — an IP, localhost,
-// *.localhost, or one of the names above.
+// or one of the names above. A subdomain of localhost doesn't (#2256):
+// Safari and other WebKit views ask the DNS for it, so a page served at
+// one from anywhere can have it turned to 127.0.0.1 after it loads.
 func ownHost(host string) bool {
 	if h, _, err := net.SplitHostPort(host); err == nil {
 		host = h
 	}
 	host = strings.TrimSuffix(strings.ToLower(strings.Trim(host, "[]")), ".")
-	if host == "" || net.ParseIP(host) != nil || host == "localhost" || strings.HasSuffix(host, ".localhost") || slices.Contains(containerHostNames, host) {
+	if host == "" || net.ParseIP(host) != nil || host == "localhost" || slices.Contains(containerHostNames, host) {
 		return true
 	}
 	if strings.EqualFold(host, PublicHost()) {
@@ -453,8 +465,8 @@ func appendUsage(r *http.Request, rec usage.Record) {
 	who := access.Caller(r.Context())
 	rec.CallerKeyID, rec.CallerKeyName = who.KeyID, who.KeyName
 	rec.Local = local(r)
-	if r.Context().Value(otelRequestKey{}) != nil {
-		rec.SkipOTel = true
+	if r.Context().Value(observedKey{}) != nil {
+		rec.Watched = true
 	}
 	budget.Append(rec)
 }

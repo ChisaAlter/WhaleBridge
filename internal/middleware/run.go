@@ -9,24 +9,17 @@ import (
 	"time"
 
 	"github.com/Calcium-Ion/moejs"
+
+	"github.com/ChisaAlter/WhaleBridge/internal/gwmw"
 )
 
 func jsonMarshal(v any) ([]byte, error) { return json.Marshal(v) }
 
 // Info is what a request's hooks are told of it, in ctx.
-type Info struct {
-	Protocol string `json:"protocol"` // the agent's API: anthropic, chat, responses, gemini
-	Model    string `json:"model"`
-	Stream   bool   `json:"stream"`
-	Path     string `json:"path"`
-	Agent    string `json:"agent,omitempty"`
-}
+type Info = gwmw.Info
 
 // Reject is a request a middleware turned away (ctx.reject).
-type Reject struct {
-	Status  int
-	Message string
-}
+type Reject = gwmw.Reject
 
 // Run is the middleware of one request. Each middleware's hooks run in
 // one runtime for the whole request, so they share ctx.state.
@@ -43,7 +36,7 @@ type Run struct {
 // Run does nothing.
 func Begin(info Info) *Run {
 	s := current()
-	if s == nil || len(s.list) == 0 {
+	if s == nil || !s.hooked {
 		return nil
 	}
 	hooks := false
@@ -274,6 +267,18 @@ func (rw *writer) Write(p []byte) (int, error) {
 	rw.buf.Write(p)
 	for {
 		b := rw.buf.Bytes()
+		// a comment between two events (": keepalive") goes on as it
+		// comes, as no onEvent sees it: held for the event after it, an
+		// agent behind a proxy heard nothing while its vendor reasoned
+		// silently, and the proxy hung up (#2402)
+		if c := commentLines(b); c > 0 {
+			_, err := rw.w.Write(b[:c])
+			rw.buf.Next(c)
+			if err != nil {
+				return len(p), err
+			}
+			continue
+		}
 		i, n := eventEnd(b)
 		if i < 0 {
 			break
@@ -355,6 +360,21 @@ func (rw *writer) event(ev []byte) error {
 	out := make([]byte, 0, len(pre)+len(data)+len(post))
 	_, err := rw.w.Write(append(append(append(out, pre...), data...), post...))
 	return err
+}
+
+// commentLines is how long the whole comment lines (": keepalive") and
+// blank lines at the start of b are: b starts where an event does, so none
+// of them is part of one.
+func commentLines(b []byte) int {
+	n := 0
+	for n < len(b) && (b[n] == ':' || b[n] == '\n' || b[n] == '\r') {
+		i := bytes.IndexByte(b[n:], '\n')
+		if i < 0 || b[n] == '\r' && i != 1 {
+			break
+		}
+		n += i + 1
+	}
+	return n
 }
 
 // eventEnd is where the first complete event in b ends, and the length of

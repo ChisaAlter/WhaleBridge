@@ -66,7 +66,7 @@ func TestSearchAPIKeysTakeTurns(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := took(); !slices.Equal(got, []string{"tvly-good"}) {
-		t.Errorf("the next search asked with %v, want the key that answered first", got)
+		t.Errorf("the next search asked with %v, want the key that answered, the others resting", got)
 	}
 
 	forgetSearchKeys()

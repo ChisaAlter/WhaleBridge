@@ -16,11 +16,17 @@ package provider
 // as by account (9095: this device is in for today); that is an answer
 // for the day, and magpie doesn't send another device id to get round it.
 // Nor does a claim answered 9074 (当前参与用户太多，请稍后再试) get another
-// try that day: Trae pays out only to a device its own app registered
-// through its device-register service and security SDK, which the
-// plugin's device id isn't, so no retry ever succeeded (#808, ~5 days),
-// and claim after claim from an unknown device may read as abuse. The
-// account is told to check in in the Trae CN app.
+// try that day: no retry ever got past it (#808, ~5 days), and claim
+// after claim may read as abuse. Why Trae refuses isn't known for certain.
+// It isn't that Trae pays only its own app: Buddy Switch checks in
+// accounts that aren't its (#1920). What #808 found is that on one
+// account Trae CN's own client's claim went through while the plugin's,
+// on a device id the plugin had made up, didn't. So since plugin 0.2.14
+// the account this machine's Trae CN client is signed in as checks in on
+// the client's own device id (read, never written); every other account
+// keeps its own, and magpie never makes up or rotates one (#1705). An
+// account refused 9074 is told that Trae CN refused it, and to check in
+// in the Trae CN app.
 
 import (
 	"cmp"
@@ -40,6 +46,11 @@ import (
 	"github.com/ChisaAlter/WhaleBridge/internal/settings"
 )
 
+// TraeRefusedWords is what an account Trae CN refused a claim 9074 is
+// told, in the TUI and CLI (the GUI says it in each language): what Trae
+// did, and where the check-in can still be done.
+const TraeRefusedWords = "Trae CN refused this check-in (9074: too many taking part); check in in the Trae CN app"
+
 // TraeCNID is the Trae CN plugin's provider.
 const TraeCNID = "trae-cn"
 
@@ -49,7 +60,7 @@ var traeCheckinURL = "https://api.trae.cn/trae/api/v2/ug/checkin_credits"
 // Trae CN's check-in answers, the codes it refuses with.
 const (
 	traeSignedOut     = 1001 // the token isn't taken
-	traeOwnAppOnly    = 9074 // a claim from a device Trae's app didn't register; final for the day
+	traeOwnAppOnly    = 9074 // a claim refused (当前参与用户太多); final for the day
 	traeDeviceChecked = 9095 // this device is in for today
 )
 
@@ -114,9 +125,10 @@ func traeCheckin(ctx context.Context, a traeAccount) WorkBuddyCheckin {
 		return wbCheckinFailed(err)
 	}
 	if got.Code == traeOwnAppOnly {
-		// status said on and not in, so the claim itself is refused:
-		// Trae pays only its own app, and asking again won't change it
-		return WorkBuddyCheckin{Outcome: CheckinOwnApp, Msg: orStr(got.Message, "Trae CN gives check-in credits only to its own app")}
+		// status said on and not in, so the claim itself is refused, and
+		// asking again that day never changed it (#808); the account is
+		// told to check in in Trae CN's app
+		return WorkBuddyCheckin{Outcome: CheckinOwnApp, Msg: orStr(got.Message, "Trae CN refused the check-in (9074)")}
 	}
 	if got.Code != 0 {
 		return traeRefused(got.Code, got.Message)

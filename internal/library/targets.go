@@ -47,9 +47,27 @@ type Target struct {
 	// Settings is Claude Code's settings.json, whose permissions.deny
 	// leaves out the tools of a server turned off (mcp_tools_off.go)
 	Settings string
+	// Gone is an agent no longer installed here that still has what magpie
+	// gave it (held): a sync only takes things out of it, as they are
+	// unticked, and gives it nothing.
+	Gone bool
+	// Profile says the instructions file is the user's profile to the
+	// agent, not instructions alone (Alma's USER.md): magpie adds its part
+	// after the user's, but never moves the user's own lines out of it
+	// (ImportInstructions), as the agent reads who its owner is there.
+	Profile bool
 }
 
 func home() string { h, _ := os.UserHomeDir(); return h }
+
+// grokDir is where Grok Build keeps its config.toml: $GROK_HOME, else ~/.grok
+// (internal/agent/grok.go grokIn).
+func grokDir() string {
+	if d := appdir.Getenv("GROK_HOME"); d != "" {
+		return d
+	}
+	return filepath.Join(home(), ".grok")
+}
 
 func claudeDir() string { return appdir.ClaudeDirIn(home()) }
 
@@ -88,6 +106,13 @@ func targetOf(a *agent.Agent) *Target {
 	}
 	h := home()
 	t := &Target{Agent: a}
+	if n := a.SharedName(); n != a.Name {
+		// the files are another app's too (the Cursor editor's ~/.cursor):
+		// named for both, not for the CLI alone
+		named := *a
+		named.Name = n
+		t.Agent = &named
+	}
 	switch a.ID {
 	case "claude":
 		d := claudeDir()
@@ -248,8 +273,16 @@ func targetOf(a *agent.Agent) *Target {
 		// and ~/.agents/skills besides (its skills service, #824). Its MCP
 		// servers are ~/.config/alma/mcp.json's mcpServers, read as Alma
 		// starts and when its MCP settings refresh (0.4.164's
-		// out/main/index.js, #1292). It has no user-wide instructions file,
-		// its prompts being its settings' own
+		// out/main/index.js, #1292). Its main chat puts ~/.config/alma/
+		// USER.md, on every system, in its system prompt as its owner's
+		// profile ("name, preferences, habits"), unless the thread's
+		// workspace has a USER.md of its own (0.4.164's out/main/index.js,
+		// #2315): magpie's part goes after what the user has there. The
+		// file's YAML front matter is where Alma's Telegram and Discord
+		// bots read who the owner is, so it is a Profile: the user's own
+		// lines are never moved out of it
+		t.Instructions = filepath.Join(h, ".config", "alma", "USER.md")
+		t.Profile = true
 		t.Skills = filepath.Join(h, ".config", "alma", "skills")
 		t.MCP = &mcpFile{Path: filepath.Join(h, ".config", "alma", "mcp.json"), Format: fmtAlma}
 		t.SkillsAlso = []string{"claude", "codex"}
@@ -641,16 +674,35 @@ func apps() []*agent.Agent {
 
 // Targets are the agents on this machine that magpie can give any of the
 // three to, in the order the rest of magpie lists them.
-func Targets() []*Target {
+func Targets() []*Target { return targets(false) }
+
+// everyTarget is Targets with the agents gone for their CLI too: a folder
+// an uninstall left behind is still that agent's own, which a project or
+// an instruction set is never kept in.
+func everyTarget() []*Target { return targets(true) }
+
+func targets(gone bool) []*Target {
 	var out []*Target
 	own := map[string]bool{}
 	for _, a := range apps() {
 		own[a.ID] = true
 	}
-	for _, a := range agent.Detected() {
+	for _, a := range agent.All() {
+		// the agents here, and a folder an agent shares with its vendor's
+		// other app when only that app is here: the Cursor editor reads
+		// ~/.cursor's mcp.json and skills with no cursor-agent installed
+		if !a.Detected() && !a.SharedHere() {
+			continue
+		}
 		// an app magpie also sets up as an agent (Claude Desktop) keeps its
 		// MCP servers where apps says, once
 		if own[a.ID] {
+			continue
+		}
+		// an uninstall that left the folder behind (#2177, #2173): the
+		// Agents page calls the agent gone and offers none of its settings,
+		// since nothing reads them; the library gives nothing to it either
+		if !gone && a.CLIMissing() {
 			continue
 		}
 		if t := targetOf(a); t != nil && t.open() {
@@ -658,7 +710,7 @@ func Targets() []*Target {
 		}
 	}
 	for _, a := range apps() {
-		if !a.Detected() {
+		if !a.Detected() && !a.SharedHere() {
 			continue
 		}
 		if t := targetOf(a); t != nil && t.open() {
@@ -666,6 +718,39 @@ func Targets() []*Target {
 		}
 	}
 	readsWith(out)
+	return out
+}
+
+// held are the agents not among have (Targets) — uninstalled, or gone for
+// their CLI — that the library still gives something, or that hold a skill,
+// server or hook magpie put there: each is listed on the rows of what it
+// has, for that to be unticked and taken out of it, and on no other row
+// (@jiahao_jayden on X: an agent that isn't installed was on every row). A
+// sync gives them nothing new (Gone).
+func (l *Library) held(have []*Target) []*Target {
+	in := map[string]bool{}
+	for _, t := range have {
+		in[t.Agent.ID] = true
+	}
+	has := func(id string) bool {
+		if a := l.Applied[id]; a != nil && (len(a.Skills) > 0 || len(a.MCP) > 0 || len(a.Hooks) > 0) {
+			return true
+		}
+		return slices.ContainsFunc(l.Skills, func(s *Skill) bool { return slices.Contains(s.Agents, id) }) ||
+			slices.ContainsFunc(l.MCP, func(s *Server) bool { return slices.Contains(s.Agents, id) }) ||
+			slices.ContainsFunc(l.Hooks, func(h *Hook) bool { return slices.Contains(h.Agents, id) })
+	}
+	var out []*Target
+	for _, a := range append(apps(), agent.All()...) {
+		if in[a.ID] || a.WSL != "" || !has(a.ID) {
+			continue
+		}
+		in[a.ID] = true
+		if t := targetOf(a); t != nil && t.open() {
+			t.Gone = true
+			out = append(out, t)
+		}
+	}
 	return out
 }
 
@@ -704,7 +789,7 @@ func readsWith(ts []*Target) {
 // whether any place is left.
 func (t *Target) open() bool {
 	if t.Instructions != "" && agent.Taken(filepath.Dir(t.Instructions)) {
-		t.Instructions, t.Override, t.Note = "", "", ""
+		t.Instructions, t.Override, t.Note, t.Profile = "", "", "", false
 	}
 	if t.MCP != nil && slices.ContainsFunc(t.MCP.files(), func(p string) bool { return agent.Taken(filepath.Dir(p)) }) {
 		t.MCP, t.MCPVia = nil, ""
@@ -741,9 +826,14 @@ func Takes(q, kind string) (string, error) {
 			return "", err
 		}
 	}
+	what := map[string]string{"instructions": "instructions", "mcp": "MCP servers", "skills": "skills"}[kind]
+	// gone for its CLI, as Targets leaves it out (#2254): told so, not
+	// recorded and then given nothing ("every agent already has it")
+	if a.CLIMissing() {
+		return "", fmt.Errorf("%s's CLI isn't installed here; nothing reads its %s until it is installed again%s", a.Name, what, takenBy(kind, what))
+	}
 	t := targetOf(a)
 	var has bool
-	what := map[string]string{"instructions": "instructions", "mcp": "MCP servers", "skills": "skills"}[kind]
 	if t == nil && a.WSL != "" && (a.Home == "" || !agent.WSLRunning(a.WSL)) {
 		return "", fmt.Errorf("WSL %s isn't running: start it, and %s can be given %s", a.WSL, a.Name, what)
 	}

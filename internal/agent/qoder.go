@@ -33,6 +33,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 
 	"github.com/ChisaAlter/WhaleBridge/internal/edit"
 	"github.com/ChisaAlter/WhaleBridge/internal/gateway"
@@ -69,7 +70,6 @@ func qoderSite(home string, b qoderBuild) *Agent { return qoderAt(here(home), b)
 // qoderAt is a build of Qoder at a place, its provider naming the gateway
 // as it reaches it from there.
 func qoderAt(at place, b qoderBuild) *Agent {
-	qoderProvider := func(agent, model string) map[string]any { return qoderProviderAt(agent, model, at.v1()) }
 	dir := at.getenv(b.env)
 	if dir == "" {
 		dir = filepath.Join(at.home, b.dir)
@@ -77,6 +77,10 @@ func qoderAt(at place, b qoderBuild) *Agent {
 	path := filepath.Join(dir, "settings.json")
 	key := b.id + ":" + path + ":"
 	slot := "providers." + magpieID
+	// magpie's provider, with what the user set on it in Qoder kept
+	qoderProvider := func(agent, model string) any {
+		return qoderKept(path, slot, qoderProviderAt(agent, model, at.v1()))
+	}
 	get := func(k string) string { v, _ := edit.GetJSON(path, k); return v }
 	// effort is what the model in use asks for: its preference, else
 	// reasoningEffort
@@ -129,8 +133,14 @@ func qoderAt(at place, b qoderBuild) *Agent {
 		// the same folder, and writes a settings.json of enabledPlugins
 		// alone, with no CLI installed (#1495): neither is a sign of the
 		// CLI. Its command, or a settings.json with any other key, is.
+		// The Qoder app (Qoder-win-x64-user.exe, Qoder.app, not the IDE)
+		// runs the CLI as its agent with the same folder, so magpie's
+		// provider reaches it too; its settings.json can hold only
+		// enabledPlugins (its bundled qoder-context plugin), and its status
+		// file says it is there (#2138).
 		dirShared: true,
 		pathOwn:   func() bool { return !qoderPluginOnly(path) },
+		sign:      func() bool { return qoderApp(dir) },
 		Sync: func() error {
 			ref, ok := cutMagpie(get("model.name"))
 			if !ok {
@@ -272,6 +282,20 @@ func qoderPreferences(prefs, model, effort string) (out map[string]any, drop boo
 	return out, len(out) == 0
 }
 
+// qoderKept is want, magpie's provider in Qoder's settings.json at path,
+// with what the user set on the one at slot kept: Qoder (1.1.70) reads a
+// provider's routing (the model for compact, summary, subagent …), its
+// firstPayloadTimeoutMs and streamIdleTimeoutMs, type, authType and
+// anthropic block, none of which magpie writes, and a sync wrote them away
+// on every start, as T3 Code's did (#2030). A name the user gave it is
+// theirs too. Its address, key, model and model list are magpie's.
+func qoderKept(path, slot string, want map[string]any) any {
+	if name, ok := edit.GetJSON(path, slot+".displayName"); ok && strings.TrimSpace(name) != "" {
+		want["displayName"] = name
+	}
+	return theirsKept(path, slot, func() any { return want }, "models")()
+}
+
 // qoderLevels are the efforts Qoder can ask for.
 var qoderLevels = []string{"low", "medium", "high", "xhigh", "max"}
 
@@ -321,6 +345,19 @@ func qoderKeyed(key, agent string) bool {
 
 // what Qoder's builds say after a change (notice.go)
 var noticeQoder = newNotice("{agent} reads its settings as a session starts — open sessions keep the model they have; new ones use this.")
+
+// qoderApp reports whether the Qoder app keeps its status in dir: it
+// writes .qoder-app-status.json (-canary-, -dev- for its other channels)
+// into ~/.qoder, or ~/.qoder-cn for the China build, as it signs in, and
+// runs Qoder's CLI as its agent with that folder's settings.
+func qoderApp(dir string) bool {
+	for _, f := range []string{".qoder-app-status.json", ".qoder-app-canary-status.json", ".qoder-app-dev-status.json"} {
+		if fi, err := os.Stat(filepath.Join(dir, f)); err == nil && fi.Mode().IsRegular() {
+			return true
+		}
+	}
+	return false
+}
 
 // qoderPluginOnly reports whether the settings file at path is the one
 // Qoder's JetBrains plugin writes, an object holding enabledPlugins and

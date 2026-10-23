@@ -57,10 +57,9 @@ type mw struct {
 	hasResp               bool
 	// events are the stream events onEvent is called for, by name; nil
 	// is every one
-	events  map[string]bool
-	options []byte // the plugin's options, as JSON
-	pool    sync.Pool
-
+	events                 map[string]bool
+	options                []byte // the plugin's options, as JSON
+	pool                   sync.Pool
 	calls, nanos, failures atomic.Int64
 	lastErr                atomic.Pointer[string]
 	logged                 atomic.Int64 // lines logged this minute, and the minute
@@ -71,6 +70,9 @@ type set struct {
 	stamp string
 	list  []*mw
 	errs  map[string]string // by spec: why it didn't load
+	// hooked: some module of list has onRequest, onEvent or onResponse
+	hooked      bool
+	droppedSaid atomic.Int64
 }
 
 var (
@@ -232,6 +234,7 @@ func load(st string, files []found) *set {
 			continue
 		}
 		s.list = append(s.list, m)
+		s.hooked = s.hooked || m.hasReq || m.hasEv || m.hasResp
 	}
 	return s
 }
@@ -525,6 +528,10 @@ func States() map[string]State {
 				st.Hooks = append(st.Hooks, h.name)
 			}
 		}
+		for _, x := range m.strats {
+			st.Strategies = append(st.Strategies, m.routing(x.name))
+		}
+		st.Orders, st.Usage, st.Rows, st.Dropped = m.orders.Load(), m.hasUse, m.rows.Load(), m.dropped.Load()
 		for n := range m.events {
 			st.Events = append(st.Events, n)
 		}

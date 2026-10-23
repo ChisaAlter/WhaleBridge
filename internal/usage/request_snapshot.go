@@ -62,6 +62,9 @@ func (c *rowChunk) pack() *rowChunk {
 		put(uint64(p.Status))
 		put(uint64(p.Flags))
 		put(uint64(p.Tries))
+		if p.Flags&rowCredits != 0 {
+			put(math.Float64bits(p.Credits))
+		}
 	}
 	archive := s2.Encode(nil, data)
 	if int64(len(archive)) >= c.Bytes {
@@ -70,7 +73,7 @@ func (c *rowChunk) pack() *rowChunk {
 	next := *c
 	next.Rows, next.Strings, next.dict = nil, nil, nil
 	next.Archive, next.Locations = slices.Clip(archive), locations
-	next.Bytes = int64(len(next.Archive) + len(locations)*8)
+	next.Bytes = int64(len(next.Archive)+len(locations)*8) + codexActorBytes(next.codexActors)
 	return &next
 }
 
@@ -111,7 +114,7 @@ func (c *rowChunk) unpackInto(into []packedRow) *rowChunk {
 		next.Rows = make([]packedRow, int(rows))
 	}
 	next.Strings = make([]string, int(strs))
-	next.Bytes = int64(len(next.Rows)) * int64(unsafe.Sizeof(packedRow{}))
+	next.Bytes = int64(len(next.Rows))*int64(unsafe.Sizeof(packedRow{})) + codexActorBytes(next.codexActors)
 	// The strings are copied out in one piece: one allocation a block, not
 	// one a string.
 	at := make([]int, 0, 2*int(strs))
@@ -157,6 +160,10 @@ func (c *rowChunk) unpackInto(into []packedRow) *rowChunk {
 		p.FirstReasoning = int64(take())
 		p.Cost, p.Status, p.Flags = math.Float64frombits(take()), int32(take()), uint16(take())
 		p.Tries = int32(take())
+		p.Credits = 0
+		if p.Flags&rowCredits != 0 {
+			p.Credits = math.Float64frombits(take())
+		}
 	}
 	if !valid || len(data) != 0 {
 		return nil

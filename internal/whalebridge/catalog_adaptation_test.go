@@ -151,6 +151,40 @@ func TestWhaleBridgeCatalogHTTPDelistedAndOldLimits(t *testing.T) {
 	}
 }
 
+// A refresh reports the rule-selected additions separately from relisted picks,
+// so an open editor can retain its draft without undoing the new rules' choices.
+func TestWhaleBridgeCatalogHTTPRefreshReportsRuleAdditions(t *testing.T) {
+	h := newProviderHTTP(t)
+	var expanded atomic.Bool
+	vendor := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if expanded.Load() {
+			io.WriteString(w, `{"data":[{"id":"a"},{"id":"b"},{"id":"new-matched"},{"id":"other-new"}]}`)
+		} else {
+			io.WriteString(w, `{"data":[{"id":"a"},{"id":"b"}]}`)
+		}
+	}))
+	t.Cleanup(vendor.Close)
+	id := h.save(map[string]any{"new": true, "id": "rules", "name": "Rules", "chat": vendor.URL + "/v1", "key": "fixture-rules-key", "models": []string{"a", "b"}})
+	h.save(map[string]any{"id": id, "models": []string{"a"}, "pickedFrom": []string{"a", "b"}, "autoInclude": []string{"new-*", "b*"}})
+	// A model already matched when the rules were set can still be unticked.
+	h.save(map[string]any{"id": id, "models": []string{"a"}, "pickedFrom": []string{"a", "b"}})
+	expanded.Store(true)
+	var response struct {
+		Taken, Dropped []string
+		Provider       struct{ Chosen []string }
+	}
+	if err := json.Unmarshal(h.call("POST", "provider/models", map[string]any{"id": id}, 200), &response); err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(response.Taken, []string{"new-matched"}) || len(response.Dropped) != 0 || !slices.Contains(response.Provider.Chosen, "new-matched") || slices.Contains(response.Provider.Chosen, "b") || slices.Contains(response.Provider.Chosen, "other-new") {
+		t.Fatalf("refresh lost new matches or revived existing unchecked models: %+v", response)
+	}
+	if got := h.provider(id); !slices.Contains(got.Models, "new-matched") || slices.Contains(got.Models, "b") {
+		t.Fatalf("rule additions did not reach saved picks: %v", got.Models)
+	}
+}
+
 func TestWhaleBridgeCatalogHTTPReasonlessBackupAndRename(t *testing.T) {
 	h := newProviderHTTP(t)
 	id := h.save(map[string]any{"new": true, "id": "relay", "name": "Relay", "chat": h.vendor + "/v1", "key": "fixture-key", "models": []string{"test-model"}, "modelPrefs": map[string]any{"test-model": map[string]any{"reasonless": true}}})

@@ -84,18 +84,10 @@ func stateOf(s usage.Summary) Usage {
 		}
 		out.Agents = append(out.Agents, ug)
 	}
-	providers := map[string]provider.Provider{}
-	for _, p := range provider.All() {
-		providers[p.ID] = p
-	}
+	which := providerFaces(provider.All())
 	for _, g := range s.Models {
-		ug := Group{Group: g, Name: g.Model, Sub: g.Provider, Icon: "generic"}
-		if p, ok := providers[g.Provider]; ok {
-			ug.Sub = p.Name
-			if p.Icon != "" {
-				ug.Icon = p.Icon
-			}
-		}
+		p := which(g.Provider)
+		ug := Group{Group: g, Name: g.Model, Sub: p.Name, Icon: p.Icon}
 		if g.Host != "" {
 			ug.Sub += " · " + g.Host
 		}
@@ -105,17 +97,42 @@ func stateOf(s usage.Summary) Usage {
 	// (#557); Name "" is the calls whose record names none, the page
 	// saying "account not recorded"
 	for _, g := range s.Accounts {
-		ug := Group{Group: g, Name: g.Account, Sub: g.Provider, Icon: "generic"}
-		if p, ok := providers[g.Provider]; ok {
-			ug.Sub = p.Name
-			if p.Icon != "" {
-				ug.Icon = p.Icon
-			}
-		}
+		p := which(g.Provider)
+		ug := Group{Group: g, Name: g.Account, Sub: p.Name, Icon: p.Icon}
 		out.Accounts = append(out.Accounts, ug)
 	}
 	out.CallerKeys = callerGroups(s)
 	return out
+}
+
+// providerFaces names a provider id from the usage log as the Usage page
+// shows it: by the provider set up under it (all), by the name magpie
+// knows it by when none is (a Claude Code subscription signed out of, a
+// preset's removed since: provider.KnownFace), and by the id itself only
+// when neither knows it. A session file without route evidence is a local
+// source, not a supplier.
+func providerFaces(all []provider.Provider) func(id string) Named {
+	set := map[string]provider.Provider{}
+	for _, p := range all {
+		set[p.ID] = p
+	}
+	return func(id string) Named {
+		a := Named{ID: id}
+		if p, ok := set[id]; ok && p.Name != "" {
+			a.Name, a.Icon = p.Name, p.Icon
+		} else if id == usage.UnknownProvider {
+			a.Name = "Local session"
+		} else {
+			a.Name, a.Icon = provider.KnownFace(id)
+		}
+		if a.Name == "" {
+			a.Name = id
+		}
+		if a.Icon == "" {
+			a.Icon = "generic"
+		}
+		return a
+	}
 }
 
 func callerGroups(s usage.Summary) []Group {
@@ -238,12 +255,10 @@ func LedgerPage(p usage.Period, f usage.Filter, offset, limit int) Ledger {
 	offset = max(0, min(offset, l.Total))
 	page := l.Rows
 	agents := clients()
-	// A session file without route evidence is a local source, not a supplier.
-	names := map[string]string{usage.UnknownProvider: "Local session"}
-	icons := map[string]string{}
+	all := provider.All()
+	which := providerFaces(all)
 	access := map[string]string{}
-	for _, pr := range provider.All() {
-		names[pr.ID], icons[pr.ID] = pr.Name, pr.Icon
+	for _, pr := range all {
 		if pr.Account != nil {
 			access[pr.ID] = "subscription"
 		} else if pr.Key != "" {
@@ -255,16 +270,6 @@ func LedgerPage(p usage.Period, f usage.Filter, offset, limit int) Ledger {
 			return Named{ID: id, Name: a.Name, Icon: a.Icon}
 		}
 		return Named{ID: id, Name: id, Icon: "generic"}
-	}
-	which := func(id string) Named {
-		a := Named{ID: id, Name: names[id], Icon: icons[id]}
-		if a.Name == "" {
-			a.Name = id
-		}
-		if a.Icon == "" {
-			a.Icon = "generic"
-		}
-		return a
 	}
 	out := Ledger{Period: p, Rows: make([]Row, 0, len(page)), Offset: offset, Total: l.Total, Totals: l.Sum, Agents: []Named{}, Providers: []Named{}, Accounts: []Account{}}
 	out.Through, out.Direct, out.Reported = l.Through, l.Direct, l.Reported
@@ -278,7 +283,7 @@ func LedgerPage(p usage.Period, f usage.Filter, offset, limit int) Ledger {
 	}
 	for _, r := range page {
 		a := who(r.Agent)
-		lr := Row{Row: r, AgentName: a.Name, Icon: a.Icon, ProviderName: names[r.Provider]}
+		lr := Row{Row: r, AgentName: a.Name, Icon: a.Icon, ProviderName: which(r.Provider).Name}
 		if r.Source != "log" && r.Source != usage.SourceReported {
 			lr.Access = access[r.Provider]
 		}
@@ -286,9 +291,6 @@ func LedgerPage(p usage.Period, f usage.Filter, offset, limit int) Ledger {
 			if model := provider.PricedNameFor(r.Provider, r.Model); model != r.Model {
 				lr.PricingModel = model
 			}
-		}
-		if lr.ProviderName == "" {
-			lr.ProviderName = r.Provider
 		}
 		lr.CallerKeyLabel = callerLabels[r.CallerKeyID]
 		if r.Computer != "" {
@@ -339,6 +341,15 @@ func LedgerPage(p usage.Period, f usage.Filter, offset, limit int) Ledger {
 					prov, model, _ := strings.Cut(s.ID, "/")
 					a := which(prov)
 					ls.Name, ls.Icon = model+" · "+a.Name, a.Icon
+				case "callerKey":
+					// the key's own name, as the key filter says it; the
+					// GUI translates the name of the calls with none
+					ls.Name, ls.Icon = callerLabels[s.ID], "generic"
+					if s.ID == usage.NoCallerKey {
+						ls.Name = "No gateway key"
+					} else if ls.Name == "" {
+						ls.Name = s.ID
+					}
 				}
 				shares = append(shares, ls)
 			}
@@ -363,9 +374,16 @@ func LedgerPage(p usage.Period, f usage.Filter, offset, limit int) Ledger {
 // OwnPage is l, a page filtered to the gateway key key's own calls, with
 // its filter lists cut to what those calls had: they are drawn from every
 // call in the period, and so would name the other keys, and the agents,
-// providers and accounts only someone else's calls reached.
+// providers and accounts only someone else's calls reached. The split by
+// key is counted without the key's pick, so it is cut to the key's own
+// share too, or it would tell a holder every other key's calls (#2521).
 func OwnPage(l Ledger, key string) Ledger {
 	l.CallerKeys = slices.DeleteFunc(l.CallerKeys, func(g Group) bool { return g.CallerKeyID != key })
+	for _, by := range []map[string][]Share{l.By, l.ChartBy} {
+		if by != nil {
+			by["callerKey"] = slices.DeleteFunc(by["callerKey"], func(s Share) bool { return s.ID != key })
+		}
+	}
 	had := func(d string) map[string]bool {
 		m := map[string]bool{}
 		for _, s := range l.By[d] {

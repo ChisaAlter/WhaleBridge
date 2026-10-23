@@ -371,7 +371,7 @@ func warmCodexLogin(ctx context.Context, user string) error {
 	l := ls[i]
 	token := func(ctx context.Context) (string, string, error) { return savedLoginToken(ctx, "codex", l.User) }
 	if l.Active {
-		token = func(ctx context.Context) (string, string, error) { return codexToken(ctx, codexAuthPath()) }
+		token = func(ctx context.Context) (string, string, error) { return codexToken(ctx, codexHome()) }
 	}
 	model, effort, err := warmModel(l.User)
 	if err != nil {

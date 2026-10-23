@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -170,5 +171,92 @@ func testQoder(t *testing.T, mk func(string) *Agent, rel string) {
 	}
 	if c, raw = read(); c.Model["name"] != "magpie/deepseek/pro" {
 		t.Fatalf("new file:\n%s", raw)
+	}
+}
+
+// What the user set on magpie's provider in Qoder's settings stays through
+// every sync and pick, as T3 Code's did after #2030: its name, the model
+// routing that picks compact's and subagents' models, its timeouts and auth
+// type. The address, key, model and model list stay magpie's.
+func TestQoderKeepsTheUsersSettings(t *testing.T) {
+	for _, b := range []struct {
+		mk  func(string) *Agent
+		rel string
+	}{{qoder, filepath.Join(".qoder", "settings.json")}, {qoderCN, filepath.Join(".qoder-cn", "settings.json")}} {
+		t.Run(b.rel, func(t *testing.T) {
+			home := syncHome(t)
+			t.Setenv("QODER_CONFIG_DIR", "")
+			t.Setenv("QODERCN_CONFIG_DIR", "")
+			path := filepath.Join(home, b.rel)
+			os.MkdirAll(filepath.Dir(path), 0o700)
+			os.WriteFile(path, []byte(`{"providers":{"mine":{"baseUrl":"https://x/v1","apiKey":"sk-m","model":"m1"}},"model":{"name":"m1"}}`), 0o600)
+			a := b.mk(home)
+			f := a.Field("model")
+			if err := f.Set("magpie/relay/glm-4.6"); err != nil {
+				t.Fatal(err)
+			}
+			// the user edits magpie's provider, as they would Qoder's settings
+			if err := edit.SetJSON(path,
+				edit.KV{Path: "providers.magpie.displayName", Value: "Magpie GW"},
+				edit.KV{Path: "providers.magpie.routing", Value: map[string]any{"compact": "relay/glm-4.6", "subagent": "relay/glm-4.6"}},
+				edit.KV{Path: "providers.magpie.streamIdleTimeoutMs", Value: 600000},
+				edit.KV{Path: "providers.magpie.firstPayloadTimeoutMs", Value: 120000},
+				edit.KV{Path: "providers.magpie.authType", Value: "bearer"},
+				edit.KV{Path: "providers.magpie.baseUrl", Value: "http://127.0.0.1:1/v1"},
+				edit.KV{Path: "providers.magpie.models", Value: []any{map[string]any{"model": "gone/old"}}},
+			); err != nil {
+				t.Fatal(err)
+			}
+			// a provider added since, so the sync has a model list to change
+			if err := provider.Save(provider.Provider{ID: "deepseek", Name: "DeepSeek", Key: "k", Chat: "http://127.0.0.1:1/v1", Models: []string{"pro"}}); err != nil {
+				t.Fatal(err)
+			}
+			for range 3 {
+				if err := a.Sync(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			check := func(when string) {
+				t.Helper()
+				var c struct {
+					Providers map[string]struct {
+						DisplayName           string            `json:"displayName"`
+						Routing               map[string]string `json:"routing"`
+						StreamIdleTimeoutMs   int               `json:"streamIdleTimeoutMs"`
+						FirstPayloadTimeoutMs int               `json:"firstPayloadTimeoutMs"`
+						AuthType              string            `json:"authType"`
+						BaseURL               string            `json:"baseUrl"`
+						APIKey                string            `json:"apiKey"`
+						Models                []struct {
+							Model string `json:"model"`
+						} `json:"models"`
+					} `json:"providers"`
+				}
+				raw := readFile(path)
+				if err := json.Unmarshal([]byte(raw), &c); err != nil {
+					t.Fatalf("%v\n%s", err, raw)
+				}
+				p := c.Providers[magpieID]
+				if p.DisplayName != "Magpie GW" || p.Routing["compact"] != "relay/glm-4.6" || p.Routing["subagent"] != "relay/glm-4.6" ||
+					p.StreamIdleTimeoutMs != 600000 || p.FirstPayloadTimeoutMs != 120000 || p.AuthType != "bearer" {
+					t.Errorf("%s: the user's settings not kept:\n%s", when, raw)
+				}
+				var ids []string
+				for _, m := range p.Models {
+					ids = append(ids, m.Model)
+				}
+				if p.BaseURL == "http://127.0.0.1:1/v1" || p.BaseURL == "" || p.APIKey == "" || slices.Contains(ids, "gone/old") || !slices.Contains(ids, "deepseek/pro") {
+					t.Errorf("%s: magpie's own parts not written: %s %s %v", when, p.BaseURL, p.APIKey, ids)
+				}
+				if c.Providers["mine"].APIKey != "sk-m" {
+					t.Errorf("%s: the user's own provider changed:\n%s", when, raw)
+				}
+			}
+			check("sync")
+			if err := f.Set("magpie/deepseek/pro"); err != nil {
+				t.Fatal(err)
+			}
+			check("pick")
+		})
 	}
 }

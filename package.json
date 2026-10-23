@@ -10,5 +10,5 @@
     "test:ui-native": "node scripts/qa-layout-native.mjs"
   },
   "engines": { "node": ">=24.0.0" },
-  "devDependencies": { "electron": "44.2.0" }
+  "devDependencies": { "electron": "44.5.0" }
 }
